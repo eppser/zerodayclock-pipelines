@@ -1,0 +1,192 @@
+name: Enrichment pipeline
+
+# Fetches EPSS, then rebuilds derived.cve_detail — one row per CVE.
+#
+# CLOCK. GitHub cron is UTC-only with no DST awareness, so we fire on both candidate
+# hours and let a guard check the real Europe/Berlin time. This runs LAST, after every
+# harvester has written what it is going to write:
+#
+#     05:45  CVE registry      (cve-pipeline, once daily)
+#     06:00  KEV catalogues    (kev-pipeline)
+#     06:30  Observations      (obs-pipeline)
+#     07:30  -> this workflow
+#     18:00  KEV catalogues
+#     18:30  Observations
+#     19:30  -> this workflow
+#
+# The evening pass has no fresh CVE registry data by design — the registry syncs once
+# a day — but KEV membership and the 7-day exploitation window both move, so the table
+# is rebuilt anyway.
+#
+# CENSORING. The rebuild does not use the clock. It takes its censoring date from the
+# last successful CVE registry fetch and passes it into the SQL transform as a
+# parameter, so two runs over the same snapshot produce identical output. A collector
+# that has stopped shows up as a growing obs_window_lag_days rather than as a quietly
+# empty "last 7 days" column.
+
+on:
+  schedule:
+    # :50, NOT :30. obs-pipeline runs at '30 4,5,16,17' and this ran at
+    # '30 5,6,17,18', so both fired at 05:30 and 17:30 UTC. The guards below no
+    # longer gate on the Berlin hour (see the comment there), so BOTH proceeded
+    # — two pipelines rebuilding with `delete from` on shared tables at the same
+    # minute. :50 also keeps this last in its hour, after obs (:30) and
+    # honeypot (:40), which is what this workflow's header promises.
+    #
+    # Deliberately NOT a shared concurrency group: GitHub keeps at most one
+    # pending run per group and cancels older ones, so serialising these would
+    # silently DROP a harvest — worse than the contention it prevents.
+    - cron: '50 5,6,17,18 * * *'
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [staging, production]
+        default: staging
+      skip_epss:
+        description: 'Rebuild the detail table without fetching EPSS'
+        type: boolean
+        default: false
+      force_epss:
+        description: 'Fetch EPSS even if it was already fetched today'
+        type: boolean
+        default: false
+      censored_at:
+        description: 'Override the censoring date (YYYY-MM-DD; blank = last CVE fetch)'
+        type: string
+        default: ''
+
+concurrency:
+  group: enrich-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Tests run in their own job with no environment, so neither the test tooling nor
+  # anything it installs can reach the database credentials.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-ci.txt
+      - name: Unit tests
+        run: python -m pytest -q
+
+  enrich:
+    needs: test
+    runs-on: ubuntu-latest
+    # EPSS is a 2.5 MB fetch; the 366k-row upsert and the rebuild took ~60s each
+    # against the staging pooler. Headroom for a slow day.
+    timeout-minutes: 30
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    defaults:
+      run:
+        working-directory: pipeline
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      # THE GUARD USED TO BE ITS OWN JOB. It always returns should_run=true — the
+      # Berlin-hour gate was removed after it dropped 20 of 21 scheduled runs — so all
+      # it still did was compute `mode`, in three seconds, in a job that costs a FULL
+      # BILLED MINUTE. The block below is the guard's, moved and otherwise unchanged.
+      - id: clock
+        name: Decide the run mode
+        working-directory: .
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          HOUR=$(TZ=Europe/Berlin date +%H)
+          # NO EXACT-HOUR TEST. This used to require a specific Europe/Berlin hour, which
+          # assumes cron fires on the hour. GitHub delays scheduled workflows on private
+          # repos by hours: measured 2026-08-28..08-31, only 1 of 21 scheduled runs across
+          # these four workflows reached its ingest step. The other 20 reported SUCCESS
+          # with the job skipped — a dead collector behind a green tick, the exact v1
+          # failure this project exists to avoid. Whatever hour the cron lands on, run.
+          echo "Berlin hour $HOUR — running."
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Mask database connection details
+        working-directory: .
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.parse
+          u = urllib.parse.urlsplit(os.environ.get("DATABASE_URL", ""))
+          for v in {u.hostname, u.username, u.password}:
+              if v:
+                  print(f"::add-mask::{v}")
+                  print(f"::add-mask::{urllib.parse.unquote(v)}")
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-run.txt
+
+      - name: Run pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SKIP_EPSS: ${{ github.event.inputs.skip_epss }}
+          FORCE_EPSS: ${{ github.event.inputs.force_epss }}
+          CENSORED_AT: ${{ github.event.inputs.censored_at }}
+        run: |
+          args=(--trigger "$GITHUB_EVENT_NAME" --report enrich-report.json)
+          if [ "$SKIP_EPSS" = true ]; then args+=(--skip-epss); fi
+          if [ "$FORCE_EPSS" = true ]; then args+=(--force-epss); fi
+          if [ -n "$CENSORED_AT" ]; then args+=(--censored-at "$CENSORED_AT"); fi
+          python -m zdc_enrich.run "${args[@]}"
+
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: enrich-eval-report-${{ github.run_id }}
+          path: pipeline/enrich-report.json
+          retention-days: 14
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### Enrichment pipeline"
+            echo
+            if [ -f enrich-report.json ]; then
+              python - <<'PY'
+          import json
+          r = json.load(open("enrich-report.json"))
+          print(f"**Result:** {'OK' if r['ok'] else 'BLOCKED'}\n")
+          print(f"- `derived.cve_detail`: **{r['detail_rows']:,}** rows")
+          print(f"- censoring date: `{r['censored_at']}` · method `{r['method_version']}`")
+          if r.get("epss_skipped"):
+              print(f"- EPSS: skipped ({r['epss_skipped']})")
+          else:
+              print(f"- EPSS: {r['epss_rows']:,} scores, model `{r['epss_model_version']}`, "
+                    f"score_date `{r['epss_score_date']}`")
+          print("\n| check | severity | passed | summary |")
+          print("|---|---|---|---|")
+          for c in r["checks"]:
+              print(f"| {c['name']} | {c['severity']} | {'yes' if c['passed'] else 'NO'} | {c['summary']} |")
+          PY
+            else
+              echo "No report produced — the run failed before evaluation."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

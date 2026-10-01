@@ -1,0 +1,121 @@
+name: Patch dates
+
+# Dated first-party vendor fix records. Currently one source: MSRC CVRF.
+#
+# NO LOCAL-HOUR GUARD, for the reason recorded in honeypot-pipeline.yml: GitHub delays
+# scheduled workflows on private repos by hours, and a guard requiring an exact Europe/Berlin
+# hour dropped 24 of 25 scheduled runs across the older harvesters. Every write here is an
+# upsert keyed on (cve_id, source_id, patch_date), so the hour it lands does not matter.
+#
+# MSRC REVISES DOCUMENTS AFTER PUBLICATION, so the incremental run re-reads the trailing two
+# months rather than only the current one. That is four requests a day against a public API.
+
+on:
+  schedule:
+    - cron: '20 6 * * *'
+  workflow_dispatch:
+    inputs:
+      backfill_start:
+        description: 'Backfill from YYYY-MM (blank for a normal incremental run)'
+        type: string
+        default: ''
+      months:
+        description: 'Trailing months to re-read on an incremental run'
+        type: string
+        default: '2'
+      environment:
+        type: choice
+        options: [staging, production]
+        default: staging
+
+concurrency:
+  group: patch-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Tests run in their own job with no environment, so neither the test tooling nor
+  # anything it installs can reach the database credentials.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-ci.txt
+      - name: Unit tests
+        run: python -m pytest -q
+
+  harvest:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Mask database connection details
+        working-directory: .
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.parse
+          u = urllib.parse.urlsplit(os.environ.get("DATABASE_URL", ""))
+          for v in {u.hostname, u.username, u.password}:
+              if v:
+                  print(f"::add-mask::{v}")
+                  print(f"::add-mask::{urllib.parse.unquote(v)}")
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-run.txt
+
+      - name: Harvest
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          BACKFILL_START: ${{ inputs.backfill_start }}
+          MONTHS: ${{ github.event.inputs.months || '2' }}
+        run: |
+          if [ -n "$BACKFILL_START" ]; then
+            python -m zdc_patch.run --start "$BACKFILL_START" \
+              --report patch-report.json
+          else
+            python -m zdc_patch.run --months "$MONTHS" \
+              --report patch-report.json
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f patch-report.json ]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r = json.load(open("patch-report.json"))
+          c = r["coverage"]
+          print(f"### Patch dates — {'OK' if r['ok'] else 'NOTHING FETCHED'}\n")
+          print(f"- documents: requested `{r['documents_requested']}`, "
+                f"parsed `{r['documents_parsed']}`\n")
+          print(f"- HTTP: `{r['http_statuses']}`\n")
+          print(f"- records written: `{r['records_written']:,}`\n")
+          print(f"- corpus: `{c['cves']:,}` CVEs carry a fix date "
+                f"(`{c['first']}` .. `{c['last']}`), "
+                f"`{c['explorer_rows_covered']:,}` of them in the Explorer\n")
+          PY
+          fi

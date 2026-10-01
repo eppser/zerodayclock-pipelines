@@ -1,0 +1,107 @@
+name: Pipeline watchdog
+
+# Fails when a pipeline stops running AT ALL.
+#
+# Every other freshness check runs inside the pipeline it watches, so a pipeline that
+# stops firing runs no check and reports nothing — the only signal was a human opening
+# the Actions tab. This is v1's silent-collector death moved up a level, from a source to
+# a whole workflow.
+#
+# IT IS DELIBERATELY ITS OWN WORKFLOW. The alternative was an eval inside the enrichment
+# pipeline, which already runs twice daily and reads everything. That would turn enrich
+# red because PATCH is late, and a pipeline going red for another's absence is the
+# alert-fatigue pattern that let the observation pipeline sit red for four days without
+# anyone looking. This owns its own verdict.
+#
+# 13:00 UTC, once daily. Late enough that every daily pipeline has had its cron plus the
+# measured GitHub delay envelope (worst observed 6h18m; the latest daily cron is 07:40),
+# and it deliberately does NOT run at the same hour as anything it watches — a watchdog
+# contending with its subjects for a runner is a watchdog that reports on itself.
+#
+# NO LOCAL-HOUR GUARD, for the reason recorded on the honeypot workflow: that pattern was
+# measured dropping 20 of 21 scheduled runs. Whatever hour this lands on, it should run.
+
+on:
+  schedule:
+    - cron: '0 13 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: watchdog
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Tests run in their own job with no environment, so neither the test tooling nor
+  # anything it installs can reach the database credentials.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-ci.txt
+      - name: Unit tests
+        run: python -m pytest -q
+
+  watchdog:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: staging
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Mask database connection details
+        working-directory: .
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.parse
+          u = urllib.parse.urlsplit(os.environ.get("DATABASE_URL", ""))
+          for v in {u.hostname, u.username, u.password}:
+              if v:
+                  print(f"::add-mask::{v}")
+                  print(f"::add-mask::{urllib.parse.unquote(v)}")
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        working-directory: pipeline
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-run.txt
+
+      - name: Check every pipeline is still running
+        working-directory: pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m tools.watchdog
+
+      # Written whether or not the check passed, so the record of an alarm survives the
+      # failure that produced it.
+      - name: Report
+        if: always()
+        working-directory: pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m tools.watchdog --json > watchdog-report.json || true
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: watchdog-report
+          path: pipeline/watchdog-report.json
+          retention-days: 14

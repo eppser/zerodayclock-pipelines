@@ -1,0 +1,195 @@
+name: KEV pipeline
+
+# Requirement: run at 06:00 and 18:00 CET, daily.
+#
+# GitHub cron is UTC-only and has no DST awareness, so a fixed "0 5,17 * * *" drifts to
+# 07:00/19:00 local every summer. Instead we fire on both candidate UTC hours and let a
+# guard step decide, using the real Europe/Berlin clock. Two of the four daily triggers
+# exit within seconds; that is far cheaper than being an hour off for half the year.
+#
+#   winter (CET,  UTC+1): 05:00 and 17:00 UTC  ->  06:00 / 18:00 local
+#   summer (CEST, UTC+2): 04:00 and 16:00 UTC  ->  06:00 / 18:00 local
+
+on:
+  schedule:
+    - cron: '0 4,5,16,17 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'incremental (deltas) or full (complete re-pull + withdrawal reconciliation)'
+        type: choice
+        options: [incremental, full]
+        default: incremental
+      environment:
+        description: 'Target environment'
+        type: choice
+        options: [staging, production]
+        default: staging
+      sources:
+        description: 'Comma-separated subset (blank = all enabled)'
+        type: string
+        default: ''
+
+# Never let two ingests overlap: the second would race the first on withdrawal
+# reconciliation and could mark live entries as withdrawn.
+#
+# Scheduled runs use the staging environment.
+concurrency:
+  group: kev-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Tests run in their own job with no environment, so neither the test tooling nor
+  # anything it installs can reach the database credentials.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-ci.txt
+      - name: Unit tests
+        run: python -m pytest -q
+
+  ingest:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    defaults:
+      run:
+        working-directory: pipeline
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      # THE GUARD USED TO BE ITS OWN JOB. It always returns should_run=true — the
+      # Berlin-hour gate was removed after it dropped 20 of 21 scheduled runs — so all
+      # it still did was compute `mode`, in three seconds, in a job that costs a FULL
+      # BILLED MINUTE. Measured 2026-09-02..09-10, the four guard jobs cost 47 billable
+      # minutes to do 2.4 minutes of work: ~188 min/month of pure per-job round-up.
+      #
+      # The logic below is the guard's, moved and otherwise unchanged.
+      - id: clock
+        name: Decide the run mode (no exact-hour gate — see below)
+        working-directory: .
+        env:
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            case "${INPUT_MODE:-incremental}" in incremental|full) ;; *) echo "invalid mode"; exit 1;; esac
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "mode=${INPUT_MODE:-incremental}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # NO EXACT-HOUR TEST. This used to require the Europe/Berlin hour to be exactly
+          # 06 or 18, which assumes cron fires on the hour. GitHub delays scheduled
+          # workflows on private repos by hours: measured across 2026-08-28..08-31, only
+          # 1 of 21 scheduled runs across these four workflows ever reached its ingest
+          # step. The other 20 reported SUCCESS with the job skipped — a dead collector
+          # behind a green tick, which is the exact v1 failure this project exists to
+          # avoid. Whatever hour the delayed cron lands on, run.
+          HOUR=$(TZ=Europe/Berlin date +%H)
+          DOW=$(TZ=Europe/Berlin date +%u)   # 1=Mon .. 7=Sun
+          if [ "$HOUR" -lt 12 ]; then SLOT=am; else SLOT=pm; fi
+          echo "Berlin hour $HOUR — running ($SLOT slot)."
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+
+          # Weekly complete re-pull. Incremental modes can only ever *add*; a full sync
+          # is what detects upstream withdrawals and repairs any missed delta, which is
+          # what "priority is the most comprehensive dataset" requires.
+          if [ "$DOW" = "7" ] && [ "$SLOT" = "am" ]; then
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=incremental" >> "$GITHUB_OUTPUT"
+          fi
+
+
+      - name: Mask database connection details
+        working-directory: .
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.parse
+          u = urllib.parse.urlsplit(os.environ.get("DATABASE_URL", ""))
+          for v in {u.hostname, u.username, u.password}:
+              if v:
+                  print(f"::add-mask::{v}")
+                  print(f"::add-mask::{urllib.parse.unquote(v)}")
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-run.txt
+
+      # The unit suite is cheap and guards the normalisation logic that everything
+      # downstream depends on. A broken adapter must not be allowed to write.
+
+      - name: Run pipeline (${{ steps.clock.outputs.mode }})
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          VULNCHECK_API_TOKEN: ${{ secrets.VULNCHECK_API_TOKEN }}
+          MODE: ${{ steps.clock.outputs.mode }}
+          SOURCES: ${{ github.event.inputs.sources }}
+        run: |
+          python -m zdc_kev.run \
+            --mode "$MODE" \
+            --trigger "$GITHUB_EVENT_NAME" \
+            ${SOURCES:+--sources "$SOURCES"} \
+            --report kev-report.json
+
+      # Uploaded even on failure: the eval report is the diagnosis, and it is most
+      # needed exactly when the run failed.
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: kev-eval-report-${{ github.run_id }}
+          path: pipeline/kev-report.json
+          retention-days: 14
+
+      - name: Summarise
+        if: always()
+        env:
+          MODE: ${{ steps.clock.outputs.mode }}
+        run: |
+          {
+            echo "### KEV pipeline — $MODE"
+            echo
+            if [ -f kev-report.json ]; then
+              python - <<'PY'
+          import json
+          r = json.load(open("kev-report.json"))
+          print(f"**Result:** {'OK' if r['ok'] else 'BLOCKED'} — {r['observations']} observations\n")
+          print("| source | observations | unchanged | complete | error |")
+          print("|---|---:|---|---|---|")
+          for name, s in sorted(r["per_source"].items()):
+              print(f"| {name} | {s['observations']} | {s['unchanged']} | "
+                    f"{s['complete_snapshot']} | {s['error'] or '—'} |")
+          print("\n| check | severity | passed | summary |")
+          print("|---|---|---|---|")
+          for c in r["checks"]:
+              print(f"| {c['name']} | {c['severity']} | {'yes' if c['passed'] else 'NO'} | {c['summary']} |")
+          PY
+            else
+              echo "No report produced — the run failed before evaluation."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

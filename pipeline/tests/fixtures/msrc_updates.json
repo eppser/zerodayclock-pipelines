@@ -1,0 +1,58 @@
+{
+  "value": [
+    {
+      "ID": "1999-Sep",
+      "Alias": "1999-Sep",
+      "DocumentTitle": "Mariner Release Notes",
+      "Severity": null,
+      "InitialReleaseDate": "1999-09-02T00:00:00Z",
+      "CurrentReleaseDate": "2025-10-01T23:10:48Z",
+      "CvrfUrl": "https://api.msrc.microsoft.com/cvrf/v3.0/cvrf/1999-Sep"
+    },
+    {
+      "ID": "2000-Feb",
+      "Alias": "2000-Feb",
+      "DocumentTitle": "Mariner Release Notes",
+      "Severity": null,
+      "InitialReleaseDate": "2000-02-02T00:00:00Z",
+      "CurrentReleaseDate": "2026-02-19T01:07:19Z",
+      "CvrfUrl": "https://api.msrc.microsoft.com/cvrf/v3.0/cvrf/2000-Feb"
+    },
+    {
+      "ID": "2000-Jan",
+      "Alias": "2000-Jan",
+      "DocumentTitle": "Mariner Release Notes",
+      "Severity": null,
+      "InitialReleaseDate": "2000-01-02T00:00:00Z",
+      "CurrentReleaseDate": "2026-02-18T01:04:13Z",
+      "CvrfUrl": "https://api.msrc.microsoft.com/cvrf/v3.0/cvrf/2000-Jan"
+    },
+    {
+      "ID": "2024-Apr",
+      "Alias": "2024-Apr",
+      "DocumentTitle": "April 2024 Security Updates",
+      "Severity": null,
+      "InitialReleaseDate": "2024-04-09T07:00:00Z",
+      "CurrentReleaseDate": "2026-08-13T00:10:53Z",
+      "CvrfUrl": "https://api.msrc.microsoft.com/cvrf/v3.0/cvrf/2024-Apr"
+    },
+    {
+      "ID": "2024-Aug",
+      "Alias": "2024-Aug",
+      "DocumentTitle": "August 2024 Security Updates",
+      "Severity": null,
+      "InitialReleaseDate": "2024-08-13T07:00:00Z",
+      "CurrentReleaseDate": "2026-08-12T23:50:18Z",
+      "CvrfUrl": "https://api.msrc.microsoft.com/cvrf/v3.0/cvrf/2024-Aug"
+    },
+    {
+      "ID": "2024-Dec",
+      "Alias": "2024-Dec",
+      "DocumentTitle": "December 2024 Security Updates",
+      "Severity": null,
+      "InitialReleaseDate": "2024-12-10T00:00:00Z",
+      "CurrentReleaseDate": "2026-08-23T14:42:58Z",
+      "CvrfUrl": "https://api.msrc.microsoft.com/cvrf/v3.0/cvrf/2024-Dec"
+    }
+  ]
+}
