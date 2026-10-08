@@ -27,7 +27,7 @@ build-backend = "hatchling.build"
 # scheduled patch harvest died on ModuleNotFoundError. It ran locally because the
 # working directory supplies the folder; the editable install's import finder only
 # offers what this list names, which is why CI and a laptop disagreed.
-packages = ["zdc_kev", "zdc_obs", "zdc_cve", "zdc_enrich", "zdc_honeypot", "zdc_crowdsec", "zdc_patch", "zdc_export"]
+packages = ["zdc_kev", "zdc_obs", "zdc_cve", "zdc_enrich", "zdc_honeypot", "zdc_crowdsec", "zdc_patch", "zdc_export", "zdc_osm"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
