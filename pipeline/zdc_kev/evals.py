@@ -387,12 +387,24 @@ def check_observer_dependencies_applied(conn) -> EvalResult:
                  where od.dependent_observer = any(k.discounted_sources)
                    and not (od.dominant_observer = any(k.canonical_sources)))""")
         over = cur.fetchone()[0]
-        # The count must equal distinct canonical observers minus those discounted.
+        # The count must equal the distinct canonical observers with a LIVE assertion,
+        # minus those discounted. canonical_sources keeps withdrawn assertions for
+        # provenance, so counting it alone fails on a partially withdrawn row (0083).
         cur.execute("""
-            select count(*) from derived.kev_consolidated
-             where independent_source_count <> (
-                select count(*) from unnest(canonical_sources) cs
-                 where not (cs = any(discounted_sources)))""")
+            with expected as (
+                select k.vuln_id,
+                       count(distinct coalesce(uc.canonical_source, e.upstream_source)) as n
+                  from derived.kev_consolidated k
+                  join core.kev_entries e on e.vuln_id = k.vuln_id
+                  left join core.upstream_canonical uc on uc.upstream_source = e.upstream_source
+                 where e.withdrawn_at is null
+                   and (e.date_added is null or e.date_added <= k.censored_at)
+                   and not (coalesce(uc.canonical_source, e.upstream_source)
+                            = any(k.discounted_sources))
+                 group by k.vuln_id)
+            select count(*) from derived.kev_consolidated k
+              left join expected x on x.vuln_id = k.vuln_id
+             where k.independent_source_count <> coalesce(x.n, 0)""")
         mismatch = cur.fetchone()[0]
         cur.execute("""select count(*) from derived.kev_consolidated
                         where discounted_sources <> '{}'""")
