@@ -10,6 +10,8 @@ from __future__ import annotations
 from datetime import date
 
 from zdc_kev.evals import ERROR, INFO, WARN, EvalReport, EvalResult  # noqa: F401
+# Same contract as the KEV pipeline: a malformed record costs one record, visibly.
+from zdc_kev.evals import check_skipped_records  # noqa: F401
 
 
 def check_no_silent_empty(results) -> EvalResult:

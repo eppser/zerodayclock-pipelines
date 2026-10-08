@@ -19,6 +19,8 @@ import subprocess
 import sys
 from datetime import date, datetime, timezone
 
+from zdc_kev.run import decide_mode
+
 from . import db, evals
 from .evals import EvalReport
 from .models import ObsCollectResult
@@ -69,7 +71,8 @@ def collect_all(source_ids, mode, today, states):
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="zdc-obs")
-    ap.add_argument("--mode", choices=["incremental", "full"], default="incremental")
+    ap.add_argument("--mode", choices=["incremental", "full", "auto"], default="incremental",
+                    help="auto = full if no full run succeeded in the last 7 days")
     ap.add_argument("--trigger", default="manual")
     ap.add_argument("--sources")
     ap.add_argument("--dry-run", action="store_true")
@@ -86,11 +89,14 @@ def main(argv: list[str] | None = None) -> int:
     report = EvalReport()
 
     if args.dry_run:
+        if args.mode == "auto":
+            args.mode = "incremental"     # no database to ask, and no state to resume from
         ids = args.sources.split(",") if args.sources else registered_ids()
         results = collect_all(ids, args.mode, today, {})
         obs = [o for r in results for o in r.observations]
         report.add(evals.check_no_silent_empty(results))
         report.add(evals.check_sources_reported(results))
+        report.add(evals.check_skipped_records(results))
         report.add(evals.check_observation_types(obs))
         report.add(evals.check_forecast_not_used_as_evidence(obs))
         report.add(evals.check_dates_present(obs, censored_at))
@@ -99,6 +105,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if report.ok else 1
 
     conn = db.connect()
+    if args.mode == "auto":
+        # Same rule as the KEV pipeline (see zdc_kev.run.decide_mode): the weekly MSRC
+        # re-read that finds late Exploited:Yes flips must not depend on cron timing.
+        args.mode = decide_mode(db.last_full_success(conn, PIPELINE), datetime.now(timezone.utc))
+        log.info("--mode auto resolved to %s", args.mode)
     registry = {s["source_id"]: s for s in db.enabled_sources(conn)}
     requested = args.sources.split(",") if args.sources else list(registry)
     source_ids = [s for s in requested if s in registry]
@@ -138,6 +149,7 @@ def main(argv: list[str] | None = None) -> int:
 
     report.add(evals.check_no_silent_empty(results))
     report.add(evals.check_sources_reported(results))
+    report.add(evals.check_skipped_records(results))
     report.add(evals.check_observation_types(all_obs))
     report.add(evals.check_forecast_not_used_as_evidence(all_obs))
     report.add(evals.check_dates_present(all_obs, censored_at))
@@ -149,7 +161,10 @@ def main(argv: list[str] | None = None) -> int:
     run_ok = report.ok and counters["sources_ok"] == counters["sources_attempted"]
     failures = "; ".join(f"{r.source_id}: {r.error}" for r in results if r.error) or None
     db.finish_run(conn, run_id, ok=run_ok, error=failures,
-                  notes={"rollup_rows": rows}, **counters)
+                  notes={"rollup_rows": rows,
+                         "skipped_records": {r.source_id: len(r.skipped)
+                                             for r in results if r.skipped}},
+                  **counters)
     conn.commit()
     conn.close()
 
@@ -168,6 +183,7 @@ def _write_report(path, report, observations, results, counters=None, run_id=Non
         "run_id": run_id, "ok": report.ok, "counters": counters or {},
         "observations": len(observations),
         "per_source": {r.source_id: {"observations": len(r.observations),
+                                     "skipped": len(r.skipped),
                                      "unchanged": r.unchanged,
                                      "complete_snapshot": r.complete_snapshot,
                                      "error": r.error, "fetches": len(r.fetches)}

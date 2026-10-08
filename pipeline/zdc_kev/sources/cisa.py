@@ -15,7 +15,8 @@ from __future__ import annotations
 import json
 from datetime import date
 
-from ..models import CollectResult, KevObservation, parse_date, parse_timestamp
+from ..models import (CollectResult, KevObservation, NormalisationError, parse_date,
+                      parse_timestamp)
 from .base import KevSource, SourceState, register
 
 FEED_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
@@ -66,8 +67,8 @@ class CisaKev(KevSource):
             if not cve_id:
                 continue
             vuln_id, vuln_id_type = self.primary_id(cve_id, cve_id)
-            result.observations.append(
-                KevObservation(
+            try:
+                observation = KevObservation(
                     source_id=self.source_id,
                     upstream_source="cisa",
                     source_entry_id=cve_id,
@@ -92,7 +93,12 @@ class CisaKev(KevSource):
                     reference_urls=_notes_to_urls(entry.get("notes")),
                     raw={"catalogVersion": catalog_version, **entry},
                 )
-            )
+            except NormalisationError as exc:
+                # e.g. "CVE-2026-XXXX" while CISA drafts an entry. Raising here used to
+                # drop all ~1,700 entries for one typo.
+                result.skipped.append(f"{cve_id}: {exc}")
+                continue
+            result.observations.append(observation)
 
         fetch.record_count = len(result.observations)
         # The feed is the entire catalogue every time, so absence here is a genuine

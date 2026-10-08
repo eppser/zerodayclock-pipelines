@@ -67,10 +67,19 @@ class Nvd(CveSource):
             result.covered.append("no NVD_API_KEY: running at the unauthenticated rate limit")
 
         now = datetime.now(timezone.utc)
-        if mode == "full" or state.last_success_at is None:
-            return self._sweep(client, result, params={}, label="full corpus", full=True)
+        # last_success_at is only the fallback for a database written before the
+        # cursor existed; once a cursor is recorded it is authoritative.
+        resume = _parse_cursor(state.cursor) or state.last_success_at
+        if mode == "full" or resume is None:
+            out = self._sweep(client, result, params={}, label="full corpus", full=True)
+            if not out.error:
+                out.cursor = now.isoformat()
+            return out
 
-        start = state.last_success_at - timedelta(hours=OVERLAP_HOURS)
+        # Resume from the end of the last window that was FULLY ingested, never from
+        # when the last ok fetch started: a run whose second page fails still has an
+        # ok first page, and resuming from it would skip the window that failed.
+        start = resume - timedelta(hours=OVERLAP_HOURS)
         windows = _chunk(start, now)
         for w_start, w_end in windows:
             sub = self._sweep(
@@ -79,7 +88,8 @@ class Nvd(CveSource):
                 label=f"{w_start.date()}..{w_end.date()}", full=False,
             )
             if sub.error:
-                return sub
+                return sub      # cursor stays at the last window that completed
+            result.cursor = w_end.isoformat()
         return result
 
     def _sweep(self, client, result: CveCollectResult, params: dict, label: str,
@@ -132,6 +142,16 @@ class Nvd(CveSource):
         if full:
             result.complete_snapshot = True
         return result
+
+
+def _parse_cursor(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def _fmt(dt: datetime) -> str:

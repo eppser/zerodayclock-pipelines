@@ -41,7 +41,7 @@ class TestStripTags:
 
     def test_is_applied_to_parsed_cve_text(self):
         """Parsing poisoned input must not be the way it gets in."""
-        s = parse_cves([{"id": "CVE-2026-1", "title": strip_tags(POISONED),
+        s = parse_cves([{"id": "CVE-2026-0001", "title": strip_tags(POISONED),
                          "affected_components": [{"vendor": "V", "product": "P"}]}])[0]
         assert not any(0xE0000 <= ord(c) <= 0xE007F for c in s.title)
 
@@ -62,6 +62,14 @@ class TestParseTimeline:
 
     def test_keeps_the_last_day_when_no_cutoff_is_given(self):
         assert len(parse_timeline("CVE-1", self.PTS)) == 3
+
+    def test_points_on_the_same_utc_day_are_summed_not_overwritten(self):
+        pts = [{"timestamp": "2026-09-20T00:00:00Z", "count": 5},
+               {"timestamp": "2026-09-20T12:00:00Z", "count": 7},
+               # 01:00 at +02:00 is 23:00 UTC the day before.
+               {"timestamp": "2026-09-21T01:00:00+02:00", "count": 4}]
+        out = parse_timeline("CVE-1", pts)
+        assert [(c.day, c.count) for c in out] == [(date(2026, 9, 20), 16)]
 
     @pytest.mark.parametrize("bad", [None, {}, "nope", [{"count": 1}],
                                      [{"timestamp": "x", "count": 1}],
@@ -86,16 +94,33 @@ class TestParseCves:
     def test_skips_identifiers_that_are_not_cves(self):
         """The tracker is CVE-only today. A GHSA appearing later must not be silently
         mis-typed as a CVE — it is dropped and the count moves, which is visible."""
-        assert parse_cves([{"id": "GHSA-xxxx"}, {"id": "CVE-2026-1"}]) == \
-            parse_cves([{"id": "CVE-2026-1"}])
+        assert parse_cves([{"id": "GHSA-xxxx"}, {"id": "CVE-2026-0001"}]) == \
+            parse_cves([{"id": "CVE-2026-0001"}])
+
+    def test_upper_cases_and_requires_the_database_check_pattern(self):
+        """A prefix test let these through to the obs_cve_shape CHECK, where one row
+        failed the whole batch. Each is now rejected and counted, never dropped silently."""
+        rejected: list[str] = []
+        out = parse_cves([{"id": "cve-2026-0003"}, {"id": "CVE-2026-XXXX"},
+                          {"id": "CVE-2026-123"}, {"id": "GHSA-xxxx"}, {"id": None}],
+                         rejected)
+        assert [s.cve_id for s in out] == ["CVE-2026-0003"]
+        assert len(rejected) == 4
+
+    def test_rejected_ids_eval_warns_with_the_count(self):
+        ok = evals.check_rejected_ids([])
+        bad = evals.check_rejected_ids(["'CVE-2026-XXXX'"])
+        assert ok.passed and not bad.passed
+        assert bad.severity == evals.WARN and not bad.blocking
+        assert bad.detail["rejected"] == 1
 
     def test_survives_a_missing_components_block(self):
-        s = parse_cves([{"id": "CVE-2026-1"}])[0]
+        s = parse_cves([{"id": "CVE-2026-0001"}])[0]
         assert s.vendor is None and s.product is None
 
     def test_active_is_what_decides_a_timeline_fetch(self):
-        never = parse_cves([{"id": "CVE-2026-1", "nb_ips": 0}])[0]
-        seen = parse_cves([{"id": "CVE-2026-2", "first_seen": "2026-01-01T00:00:00Z"}])[0]
+        never = parse_cves([{"id": "CVE-2026-0001", "nb_ips": 0}])[0]
+        seen = parse_cves([{"id": "CVE-2026-0002", "first_seen": "2026-01-01T00:00:00Z"}])[0]
         assert not never.active and seen.active
 
 

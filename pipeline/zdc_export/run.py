@@ -88,12 +88,17 @@ EXPORTS: list[tuple[str, str]] = [
 
 
 def _assert_key_is_unique(conn, view: str, key: str) -> None:
-    """A sort key with ties makes the export non-deterministic. Fail, don't drift."""
+    """A sort key with ties makes the export non-deterministic. Fail, don't drift.
+
+    RuntimeError, not SystemExit: SystemExit is a BaseException, so main()'s
+    `except Exception` let it straight past and the run row stopped at started_at,
+    which the watchdog cannot tell from a run that never happened.
+    """
     with conn.cursor() as cur:
         cur.execute(f"select count(*), count(distinct ({key})) from public.{view}")
         total, distinct = cur.fetchone()
     if total != distinct:
-        raise SystemExit(
+        raise RuntimeError(
             f"public.{view}: sort key ({key}) has {total - distinct} duplicate(s) "
             f"across {total} rows — the export would not be reproducible"
         )
@@ -139,7 +144,7 @@ def export(conn, out_dir: Path, *, only: list[str] | None = None) -> dict:
     if only:
         missing = sorted(set(only) - {v for v, _ in EXPORTS})
         if missing:
-            raise SystemExit(f"unknown view(s): {', '.join(missing)}")
+            raise RuntimeError(f"unknown view(s): {', '.join(missing)}")
 
     staged: dict[str, bytes] = {}
     files: list[dict] = []

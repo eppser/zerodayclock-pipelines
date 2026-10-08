@@ -47,6 +47,14 @@ def start_run(conn, pipeline: str, mode: str, trigger: str, git_sha: str | None)
         return cur.fetchone()[0]
 
 
+def last_full_success(conn, pipeline: str):
+    """When this pipeline last completed a full run successfully (None if never)."""
+    with conn.cursor() as cur:
+        cur.execute("""select max(started_at) from obs_raw.pipeline_runs
+                        where pipeline = %s and mode = 'full' and ok""", (pipeline,))
+        return cur.fetchone()[0]
+
+
 def finish_run(conn, run_id: str, *, ok: bool, error: str | None = None, **c) -> None:
     with conn.cursor() as cur:
         cur.execute(

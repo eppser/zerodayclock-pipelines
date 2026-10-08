@@ -246,6 +246,58 @@ class TestNvd:
         assert result.records == [] and "403" in result.error
 
 
+class TestNvdCursor:
+    """The incremental cursor must never advance past a page that failed."""
+
+    def page(self, records, total):
+        return make_fetch("nvd", json.dumps({"resultsPerPage": len(records),
+                                             "totalResults": total,
+                                             "vulnerabilities": records}).encode())
+
+    def failed(self):
+        return make_fetch("nvd", None, ok=False, status=503, error="HTTP 503")
+
+    def test_resumes_from_the_cursor_not_the_last_ok_fetch(self):
+        # A failed run leaves ok fetches whose timestamps are AFTER the gap; the
+        # recorded cursor is the end of the last window actually ingested.
+        cursor = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        state = CveSourceState(last_success_at=datetime(2026, 9, 5, tzinfo=timezone.utc),
+                               cursor=cursor.isoformat())
+        client = StubClient([self.page([], 0)])
+        Nvd(api_key="k").collect(client, state, "incremental")
+        sent = client.calls[0]["params"]["lastModStartDate"]
+        assert sent == (cursor - timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    def test_page_two_failing_does_not_advance_the_cursor(self):
+        recs = load_json("nvd_page.json")["vulnerabilities"]
+        state = CveSourceState(cursor=(datetime.now(timezone.utc)
+                                       - timedelta(days=2)).isoformat())
+        client = StubClient([self.page(recs, total=len(recs) + 5), self.failed()])
+        result = Nvd(api_key="k").collect(client, state, "incremental")
+        assert result.error and result.cursor is None
+        assert result.records == []     # a half-read window is not persisted either
+
+    def test_a_later_window_failing_keeps_the_earlier_windows_cursor(self):
+        recs = load_json("nvd_page.json")["vulnerabilities"]
+        start = datetime.now(timezone.utc) - timedelta(days=150)   # two windows
+        state = CveSourceState(cursor=start.isoformat())
+        client = StubClient([self.page(recs, total=len(recs)),               # window 1
+                             self.page(recs, total=len(recs) + 5), self.failed()])  # window 2
+        result = Nvd(api_key="k").collect(client, state, "incremental")
+        assert result.error
+        window_1_end = _chunk(start - timedelta(hours=6), datetime.now(timezone.utc))[0][1]
+        assert datetime.fromisoformat(result.cursor) == window_1_end
+        sent_2 = client.calls[1]["params"]["lastModStartDate"]
+        assert sent_2 == window_1_end.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    def test_a_clean_incremental_advances_to_the_last_window_end(self):
+        state = CveSourceState(cursor=(datetime.now(timezone.utc)
+                                       - timedelta(days=1)).isoformat())
+        before = datetime.now(timezone.utc)
+        result = Nvd(api_key="k").collect(StubClient([self.page([], 0)]), state, "incremental")
+        assert result.error is None and datetime.fromisoformat(result.cursor) >= before
+
+
 class TestPublicationLagEval:
     """Each median can be absent independently — before NVD loads, every
     nvd_published is NULL and only the reservation lag exists."""

@@ -77,8 +77,10 @@ def main(argv: list[str] | None = None) -> int:
     # ---- 1. the catalogue -------------------------------------------------
     t0 = datetime.now(timezone.utc)
     items, total, err = client.paged("/cves?detailed=true")
-    states = {s.cve_id: s for s in parse_cves(items)}
+    rejected: list[str] = []
+    states = {s.cve_id: s for s in parse_cves(items, rejected)}
     results.append(evals.check_catalogue_fetched(total or len(states), err))
+    results.append(evals.check_rejected_ids(rejected))
     log.info("tracker catalogue: %s CVEs (total reported %s)", len(states), total)
     cat_fetch = FetchRecord(
         source_id=SOURCE_ID, url="https://admin.api.crowdsec.net/v1/cves?detailed=true",
@@ -125,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
     results.append(evals.check_no_per_ip_data(
         [db._raw(states[c.cve_id], c) for c in counts[:200] if c.cve_id in states]))
 
-    report.update({"tracked": len(states), "asked": len(wanted),
+    report.update({"tracked": len(states), "rejected_ids": len(rejected), "asked": len(wanted),
                    "timeline_failures": len(failed), "day_counts": len(counts),
                    "days_seen": days_seen})
 
@@ -153,7 +155,8 @@ def main(argv: list[str] | None = None) -> int:
                          f"{span[2]:,}", f"{span[3]:,}", span[0], span[1])
                 ok = not any(r.blocking for r in results)
                 obs_db.finish_run(conn, run_id, ok=ok, error=None if ok else "eval blocked",
-                                  notes={"day_counts": len(counts), "tracked": len(states)})
+                                  notes={"day_counts": len(counts), "tracked": len(states),
+                                         "rejected_ids": len(rejected)})
                 conn.commit()
             except Exception as exc:  # noqa: BLE001
                 conn.rollback()

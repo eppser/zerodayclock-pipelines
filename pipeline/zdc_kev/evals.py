@@ -107,6 +107,30 @@ def check_sources_reported(collect_results) -> EvalResult:
     )
 
 
+def check_skipped_records(collect_results) -> EvalResult:
+    """Upstream records an adapter could not normalise and left out.
+
+    WARN, not ERROR: the rest of the source is good and publishable, and failing the
+    run over one malformed id is the outage this replaces. But a skip is a record a
+    catalogue asserts and we do not carry, so it must be visible every run.
+    """
+    skipped = {r.source_id: list(getattr(r, "skipped", None) or []) for r in collect_results}
+    skipped = {k: v for k, v in skipped.items() if v}
+    total = sum(len(v) for v in skipped.values())
+    return EvalResult(
+        name="skipped_records",
+        severity=WARN,
+        passed=not total,
+        summary=(
+            "no upstream record was skipped"
+            if not total
+            else f"{total} upstream record(s) skipped as malformed: "
+                 + ", ".join(f"{k} {len(v)}" for k, v in sorted(skipped.items()))
+        ),
+        detail={k: {"count": len(v), "examples": v[:10]} for k, v in skipped.items()},
+    )
+
+
 def check_cve_shape(observations) -> EvalResult:
     bad = sorted({o.cve_id for o in observations if o.cve_id and not CVE_RE.match(o.cve_id)})
     return EvalResult(
@@ -608,26 +632,54 @@ def check_coverage_not_dropped(conn, tolerance: float = 0.20) -> EvalResult:
     raw.pipeline_runs.notes->'source_counts'. Same quantity on both sides, and
     independent of whether a run was incremental or full — an incremental run fetches a
     delta but still stores the whole catalogue.
+
+    A GENUINE PERMANENT DROP IS ACKNOWLEDGED, NOT WAITED OUT. The baseline comes only
+    from ok runs, and a run that fails this check is not ok, so a real >20% loss (a
+    catalogue pruning itself) would block every run forever. Letting the baseline drift
+    to whatever recent runs stored would heal that, but it would also accept a
+    truncated snapshot once its withdrawals had persisted for a few runs - VulnCheck's
+    full sync is weekly, so a bad one stays stored for days. So the new level is
+    accepted only by a row in core.kev_coverage_acknowledgements (migration 0084),
+    dated on or after the baseline run and stating its basis. The acknowledged count
+    then becomes the floor, with the same tolerance; the first ok run after it becomes
+    the new baseline and the row goes stale on its own.
     """
     with conn.cursor() as cur:
         cur.execute(
-            """select notes->'source_counts' from raw.pipeline_runs
+            """select notes->'source_counts', started_at from raw.pipeline_runs
                 where ok and pipeline = 'kev' and notes ? 'source_counts'
                 order by started_at desc limit 1"""
         )
         row = cur.fetchone()
         previous = {k: int(v) for k, v in (row[0] or {}).items()} if row else {}
+        baseline_at = row[1] if row else None
         cur.execute(
             """select source_id, count(*) from core.kev_entries
                where withdrawn_at is null group by source_id"""
         )
         current = {r[0]: r[1] for r in cur.fetchall()}
 
-    drops = {}
-    for source_id, before in previous.items():
-        after = current.get(source_id, 0)
-        if before and after < before * (1 - tolerance):
-            drops[source_id] = {"previous": before, "current": after}
+        drops = {}
+        for source_id, before in previous.items():
+            after = current.get(source_id, 0)
+            if before and after < before * (1 - tolerance):
+                drops[source_id] = {"previous": before, "current": after}
+
+        accepted = {}
+        if drops:
+            cur.execute(
+                """select distinct on (source_id) source_id, accepted_count, checked_on
+                     from core.kev_coverage_acknowledgements
+                    where checked_on >= (%s::timestamptz at time zone 'UTC')::date
+                    order by source_id, checked_on desc""",
+                (baseline_at,),
+            )
+            for source_id, count, checked_on in cur.fetchall():
+                drop = drops.get(source_id)
+                if drop and drop["current"] >= int(count) * (1 - tolerance):
+                    accepted[source_id] = {**drops.pop(source_id),
+                                           "acknowledged_count": int(count),
+                                           "acknowledged_on": str(checked_on)}
     return EvalResult(
         name="coverage_not_dropped",
         severity=ERROR,
@@ -635,10 +687,12 @@ def check_coverage_not_dropped(conn, tolerance: float = 0.20) -> EvalResult:
         summary=(
             ("no source lost more than %d%% of its stored entries" % int(tolerance * 100))
             + ("" if previous else " (no prior run recorded counts — nothing to compare yet)")
+            + (f"; acknowledged new level for {sorted(accepted)}" if accepted else "")
             if not drops
             else f"coverage collapse in {sorted(drops)}"
         ),
-        detail={"drops": drops, "baseline": previous, "current": current},
+        detail={"drops": drops, "accepted": accepted, "baseline": previous,
+                "current": current},
     )
 
 

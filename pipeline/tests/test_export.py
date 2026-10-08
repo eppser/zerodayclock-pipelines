@@ -89,7 +89,7 @@ class TestSortKeyIsVerified:
         # The real case: scan_pressure's key was (vuln_id, window_days), which has
         # 6,307 duplicates across 7,379 rows. Ties make the row order arbitrary.
         conn = FakeConn(counts=(7379, 1072))
-        with pytest.raises(SystemExit) as e:
+        with pytest.raises(RuntimeError) as e:
             export_run._assert_key_is_unique(conn, "scan_pressure", "vuln_id, window_days")
         assert "6307 duplicate" in str(e.value)
 
@@ -112,9 +112,38 @@ class TestManifest:
         json.loads((tmp_path / "manifest.json").read_text())
 
     def test_unknown_view_is_refused(self, tmp_path):
-        with pytest.raises(SystemExit):
+        with pytest.raises(RuntimeError):
             export_run.export(FakeConn(), tmp_path, only=["not_a_view"])
 
     def test_every_declared_export_has_a_sort_key(self):
         for view, key in export_run.EXPORTS:
             assert key and key.strip(), f"{view} has no sort key"
+
+
+class TestFailureIsRecorded:
+    """A refused export must finish its run row as failed, not leave it at started_at."""
+
+    class Conn(FakeConn):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def commit(self):
+            pass
+
+    def test_a_sort_key_with_ties_is_recorded_on_the_run_row(self, monkeypatch, tmp_path):
+        finished = []
+        monkeypatch.setenv("DATABASE_URL", "postgresql://test")
+        monkeypatch.setattr(export_run.psycopg, "connect",
+                            lambda dsn: self.Conn(counts=(10, 9)))
+        monkeypatch.setattr(export_run.runs_db, "start_run", lambda *a, **k: "run-1")
+        monkeypatch.setattr(export_run.runs_db, "finish_run",
+                            lambda conn, run_id, **k: finished.append((run_id, k)))
+        with pytest.raises(RuntimeError):
+            export_run.main(["--out", str(tmp_path), "--only", "cve_detail"])
+        assert len(finished) == 1
+        run_id, kw = finished[0]
+        assert run_id == "run-1" and kw["ok"] is False
+        assert "duplicate" in kw["error"]

@@ -82,7 +82,8 @@ jobs:
       # BILLED MINUTE. Measured 2026-09-02..09-10, the four guard jobs cost 47 billable
       # minutes to do 2.4 minutes of work: ~188 min/month of pure per-job round-up.
       #
-      # The logic below is the guard's, moved and otherwise unchanged.
+      # The logic below is the guard's, moved; the weekly-full rule has since moved
+      # into Python (`--mode auto`, zdc_kev.run.decide_mode).
       - id: clock
         name: Decide the run mode (no exact-hour gate — see below)
         working-directory: .
@@ -104,20 +105,15 @@ jobs:
           # step. The other 20 reported SUCCESS with the job skipped — a dead collector
           # behind a green tick, which is the exact v1 failure this project exists to
           # avoid. Whatever hour the delayed cron lands on, run.
-          HOUR=$(TZ=Europe/Berlin date +%H)
-          DOW=$(TZ=Europe/Berlin date +%u)   # 1=Mon .. 7=Sun
-          if [ "$HOUR" -lt 12 ]; then SLOT=am; else SLOT=pm; fi
-          echo "Berlin hour $HOUR — running ($SLOT slot)."
           echo "should_run=true" >> "$GITHUB_OUTPUT"
 
           # Weekly complete re-pull. Incremental modes can only ever *add*; a full sync
           # is what detects upstream withdrawals and repairs any missed delta, which is
-          # what "priority is the most comprehensive dataset" requires.
-          if [ "$DOW" = "7" ] && [ "$SLOT" = "am" ]; then
-            echo "mode=full" >> "$GITHUB_OUTPUT"
-          else
-            echo "mode=incremental" >> "$GITHUB_OUTPUT"
-          fi
+          # what "priority is the most comprehensive dataset" requires. It used to be
+          # "Sunday, Berlin morning slot" here, and a cron start delayed 3-6h missed that
+          # slot, so the weekly run could silently not happen. `auto` asks the database
+          # instead: full whenever no full run has succeeded in 7 days.
+          echo "mode=auto" >> "$GITHUB_OUTPUT"
 
 
       - name: Mask database connection details

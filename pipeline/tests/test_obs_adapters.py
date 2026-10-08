@@ -211,6 +211,18 @@ class TestVulnCheckCanaries:
         # A KEV listing without a canary hit is not an observed attempt.
         assert {o.cve_id for o in result.observations} == {"CVE-2024-0001"}
 
+    def test_malformed_cve_id_is_skipped_not_fatal(self):
+        payload = {"_meta": {"total_pages": 1}, "data": [
+            {"cve": ["GHSA-abcd-efgh-ijkl"], "date_added": "2026-01-01T00:00:00Z",
+             "reported_exploited_by_vulncheck_canaries": True},
+            {"cve": ["CVE-2024-0001"], "date_added": "2026-01-01T00:00:00Z",
+             "reported_exploited_by_vulncheck_canaries": True},
+        ]}
+        result, _ = self.collect_index(payload)
+        assert result.error is None
+        assert [o.cve_id for o in result.observations] == ["CVE-2024-0001"]
+        assert len(result.skipped) == 1
+
     def test_uses_earliest_report_date_not_catalogue_date(self):
         payload = {"_meta": {"total_pages": 1}, "data": [{
             "cve": ["CVE-2024-0004"], "date_added": "2026-07-14T00:00:00Z",

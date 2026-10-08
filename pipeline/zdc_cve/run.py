@@ -120,13 +120,18 @@ def main(argv: list[str] | None = None) -> int:
                 counters["entries_updated"] += upd
                 counters["entries_seen"] += len(result.records)
                 all_records.extend(result.records)
+            conn.commit()
+            # A cursor is recorded only once the records behind it are committed.
             if result.ok:
                 counters["sources_ok"] += 1
                 # Advance the cursor ONLY on a clean run. A partial fetch must be
                 # replayed next time, not skipped.
                 if result.covered and result.source_id == "cve_project":
                     cursors[result.source_id] = result.covered[-1].split(":")[0]
-            conn.commit()
+            # An adapter-set cursor already stops at the last fully ingested window,
+            # so it is honoured even when a LATER window failed.
+            if result.cursor:
+                cursors[result.source_id] = result.cursor
         except Exception as exc:  # noqa: BLE001
             conn.rollback()
             persistence_errors[result.source_id] = f"{type(exc).__name__}: {exc}"

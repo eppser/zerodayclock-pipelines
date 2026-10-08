@@ -24,7 +24,7 @@ import logging
 import os
 import subprocess
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from . import db, evals
 from .evals import EvalReport
@@ -36,6 +36,24 @@ log = logging.getLogger("zdc_kev")
 PIPELINE = "kev"
 CONSOLIDATION_METHOD = "v1"
 AGREEMENT_METHOD = "v1"
+
+#: A complete re-pull at least this often. Incremental runs can only add; a full run
+#: is what detects upstream withdrawals and repairs a missed delta.
+FULL_EVERY = timedelta(days=7)
+
+
+def decide_mode(last_full_ok_at: datetime | None, now: datetime,
+                every: timedelta = FULL_EVERY) -> str:
+    """`--mode auto`: full when no full run has SUCCEEDED within `every`.
+
+    This replaced a workflow rule of "Sunday, Berlin morning slot". GitHub starts cron
+    runs 3-6h late, so that slot was routinely missed and the weekly full run silently
+    did not happen. Asking the database what actually ran cannot miss: a skipped or
+    failed full run just makes the next run full.
+    """
+    if last_full_ok_at is None or now - last_full_ok_at >= every:
+        return "full"
+    return "incremental"
 
 
 def git_sha() -> str | None:
@@ -83,7 +101,8 @@ def collect_all(source_ids, mode, today, states):
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="zdc-kev", description="Zero Day Clock KEV pipeline")
-    parser.add_argument("--mode", choices=["incremental", "full"], default="incremental")
+    parser.add_argument("--mode", choices=["incremental", "full", "auto"], default="incremental",
+                        help="auto = full if no full run succeeded in the last 7 days")
     parser.add_argument("--trigger", default="manual")
     parser.add_argument("--sources", help="comma-separated subset; default = all enabled")
     parser.add_argument("--dry-run", action="store_true", help="no database writes")
@@ -103,11 +122,16 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- dry run: no database, pure evals only --------------------------------
     if args.dry_run:
+        # No database to ask; a dry run has no source state either, so the adapters
+        # already read as much as a full run would.
+        if args.mode == "auto":
+            args.mode = "incremental"
         source_ids = args.sources.split(",") if args.sources else registered_ids()
         results = collect_all(source_ids, args.mode, today, {})
         observations = [o for r in results for o in r.observations]
         report.add(evals.check_no_silent_empty(results))
         report.add(evals.check_sources_reported(results))
+        report.add(evals.check_skipped_records(results))
         report.add(evals.check_cve_shape(observations))
         report.add(evals.check_no_future_dates(observations, censored_at))
         report.add(evals.check_signal_not_inflated(observations))
@@ -117,6 +141,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # ---- live run --------------------------------------------------------------
     conn = db.connect()
+    if args.mode == "auto":
+        # Resolved before start_run, so the run row records what actually ran and the
+        # next auto decision can see it.
+        args.mode = decide_mode(db.last_full_success(conn, PIPELINE), datetime.now(timezone.utc))
+        log.info("--mode auto resolved to %s", args.mode)
     registry = {s["source_id"]: s for s in db.enabled_sources(conn)}
     requested = args.sources.split(",") if args.sources else list(registry)
     source_ids = [s for s in requested if s in registry]
@@ -184,6 +213,7 @@ def main(argv: list[str] | None = None) -> int:
     report.add(evals.check_no_silent_empty(results))
     report.add(evals.check_sources_reported(results))
     report.add(evals.check_source_yield(results, expected))
+    report.add(evals.check_skipped_records(results))
     report.add(evals.check_cve_shape(all_observations))
     report.add(evals.check_no_future_dates(all_observations, censored_at))
     report.add(evals.check_signal_not_inflated(all_observations))
@@ -197,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
         notes={"consolidated_rows": rows, "agreement_pairs": pairs,
                # Stored counts, so the next run's coverage check compares like with like.
                "source_counts": db.live_entry_counts(conn),
+               "skipped_records": {r.source_id: len(r.skipped) for r in results if r.skipped},
                "evals": [r.name for r in report.results if r.blocking]},
         **counters,
     )
@@ -225,6 +256,7 @@ def _write_report(path, report, observations, results, counters=None, run_id=Non
         "per_source": {
             r.source_id: {
                 "observations": len(r.observations),
+                "skipped": len(r.skipped),
                 "unchanged": r.unchanged,
                 "complete_snapshot": r.complete_snapshot,
                 "error": r.error,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -38,6 +38,12 @@ class TestParseDate:
         # "12:00:00 AM" is midnight, not noon. Getting this wrong shifts a whole
         # source's exploitation dates by a day.
         assert parse_date("Mar 20, 2026, 12:00:00 AM") == date(2026, 3, 20)
+
+    def test_offset_timestamp_is_converted_to_utc_before_taking_the_date(self):
+        # Local date 2027-01-01, UTC date 2026-12-31: even the year differs.
+        assert parse_date("2027-01-01T00:30:00+01:00") == date(2026, 12, 31)
+        assert parse_date(datetime(2027, 1, 1, 0, 30, tzinfo=timezone(
+            timedelta(hours=1)))) == date(2026, 12, 31)
 
 
 class TestParseTimestamp:

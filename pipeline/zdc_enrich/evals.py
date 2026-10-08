@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import re
 
-from datetime import date
+from datetime import date, timedelta
 
 from zdc_kev.evals import ERROR, INFO, WARN, EvalReport, EvalResult  # noqa: F401
 
@@ -1598,6 +1598,11 @@ def check_pressure_late_arrivals_settled(conn) -> EvalResult:
 
     Only months whose whole settling window is observable are used: a month that ended
     before ingestion started would report its backfill date, not its filing date.
+
+    And only SETTLED months in a trailing window (`settled_month_range`). An unsettled
+    month cannot yet have a late arrival, so counting it only dilutes the share; and an
+    all-history denominator grows every month, so a change in filing behaviour would
+    take ever longer to cross the threshold. The window rolls, it never accumulates.
     """
     with conn.cursor() as cur:
         # resolved exactly as db.current_method_versions() does, so the eval reads the
@@ -1609,6 +1614,15 @@ def check_pressure_late_arrivals_settled(conn) -> EvalResult:
                         limit 1""")
         row = cur.fetchone()
         declared = row[0] if row and row[0] is not None else 14
+        cur.execute("select max(censored_at) from derived.pressure_index")
+        row = cur.fetchone()
+        censored = row[0] if row else None
+        if censored is None:
+            return EvalResult("pressure_late_arrivals_settled", WARN, True,
+                              "derived.pressure_index has no censoring date, so no month "
+                              "can be called settled; nothing to re-measure",
+                              {"declared_maturity_days": declared, "measurable_rows": 0})
+        first_month, last_month = settled_month_range(censored, declared)
         cur.execute("""
           with era as (select min(first_seen_at)::date + 1 as usable_from
                          from core.cves where first_seen_at is not null),
@@ -1622,9 +1636,11 @@ def check_pressure_late_arrivals_settled(conn) -> EvalResult:
                -- the month must have STARTED after ingestion began, or first_seen_at is
                -- a backfill timestamp and says nothing about how fast the CNA filed
                and date_trunc('month', date_published at time zone 'UTC')::date
-                   >= era.usable_from)
+                   >= era.usable_from
+               and date_trunc('month', date_published at time zone 'UTC')::date
+                   between %s and %s)
           select count(*), count(*) filter (where settle_days > %s), max(settle_days)
-            from x""", (declared,))
+            from x""", (first_month, last_month, declared))
         n, beyond, worst = cur.fetchone()
 
     if not n:
@@ -1635,16 +1651,37 @@ def check_pressure_late_arrivals_settled(conn) -> EvalResult:
                           {"declared_maturity_days": declared, "measurable_rows": 0})
     share = beyond / n
     ok = share <= 0.001
+    span = f"settled months {first_month:%Y-%m}..{last_month:%Y-%m}"
     return EvalResult("pressure_late_arrivals_settled", ERROR, ok,
                       f"records settle within the declared {declared}d: {beyond} of {n:,} "
-                      f"({100 * share:.3f}%) arrived later, worst {worst}d"
+                      f"({100 * share:.3f}%) arrived later, worst {worst}d ({span})"
                       if ok else
                       f"{beyond} of {n:,} ({100 * share:.2f}%) records arrived MORE than "
-                      f"{declared}d after their month closed, worst {worst}d — "
+                      f"{declared}d after their month closed, worst {worst}d ({span}) — "
                       f"maturity_days is too small and the published window is being "
                       f"cut before filing has finished",
                       {"declared_maturity_days": declared, "rows": n,
-                       "arrived_late": beyond, "worst_settle_days": worst})
+                       "arrived_late": beyond, "worst_settle_days": worst,
+                       "first_month": str(first_month), "last_month": str(last_month),
+                       "censored_at": str(censored)})
+
+
+def settled_month_range(censored: date, declared_days: int,
+                        months: int = 6) -> tuple[date, date]:
+    """First and last month start of the trailing `months` SETTLED months.
+
+    A month is settled once its last day plus the declared settling time has passed
+    by the censoring date. Derived from the censoring date, so it rolls on its own.
+    """
+    cutoff = censored - timedelta(days=declared_days)
+    # The last month whose final day is on or before the cutoff.
+    last = cutoff.replace(day=1)
+    if (last + timedelta(days=32)).replace(day=1) - timedelta(days=1) > cutoff:
+        last = (last - timedelta(days=1)).replace(day=1)
+    first = last
+    for _ in range(months - 1):
+        first = (first - timedelta(days=1)).replace(day=1)
+    return first, last
 
 
 def run_db_evals(conn) -> list[EvalResult]:

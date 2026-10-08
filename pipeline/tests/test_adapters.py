@@ -41,6 +41,17 @@ class TestCisa:
         assert first.signal == "successful_exploitation"
         assert first.date_added is not None
 
+    @pytest.mark.parametrize("bad", ["CVE-2026-XXXX", "CVE-2026-123"])
+    def test_one_malformed_id_skips_one_entry_not_the_catalogue(self, bad):
+        body = json.dumps({"count": 2, "vulnerabilities": [
+            {"cveID": bad, "dateAdded": "2026-10-01"},
+            {"cveID": "CVE-2026-12345", "dateAdded": "2026-10-01"},
+        ]}).encode()
+        result, _ = self.collect(body)
+        assert result.error is None
+        assert [o.cve_id for o in result.observations] == ["CVE-2026-12345"]
+        assert len(result.skipped) == 1 and result.skipped[0].startswith(bad)
+
     def test_sends_conditional_headers_when_state_exists(self, cisa_body):
         state = SourceState(last_etag='"abc"', last_modified="Wed, 26 Aug 2026 17:00:09 GMT")
         _, client = self.collect(cisa_body, state)
@@ -290,6 +301,22 @@ class TestVulnCheck:
         assert {o.cve_id for o in result.observations} == {"CVE-2024-0001", "CVE-2024-0002"}
         assert len({o.identity for o in result.observations}) == 2
 
+    def test_malformed_ids_in_cve_list_are_skipped_not_fatal(self):
+        records = [
+            {"cve": ["GHSA-abcd-efgh-ijkl", "CVE-2024-0007"], "date_added": "2026-01-01T00:00:00Z"},
+            {"cve": ["CVE-2026-XXXX"], "date_added": "2026-01-01T00:00:00Z"},
+            {"cve": ["CVE-2024-0008"], "date_added": "2026-01-01T00:00:00Z"},
+        ]
+        client = StubClient([make_fetch("vulncheck", self.index_page(records))])
+        result = self.source().collect(client, self._recent_state(), "incremental",
+                                       today=date(2026, 8, 27))
+        assert result.error is None
+        assert {o.cve_id for o in result.observations} == {"CVE-2024-0007", "CVE-2024-0008"}
+        assert len(result.skipped) == 2
+        # The GHSA is still a true alias of the CVE it was listed beside.
+        seven = next(o for o in result.observations if o.cve_id == "CVE-2024-0007")
+        assert "GHSA-ABCD-EFGH-IJKL" in seven.aliases
+
     def test_exploited_since_uses_earliest_report_not_catalogue_date(self):
         record = {
             "cve": ["CVE-2024-0003"],
@@ -449,3 +476,35 @@ class TestCirclOrigins:
         )
         assert seeded, "could not parse core.kev_origins seed from the migration"
         assert ORIGIN_ISSUERS == seeded
+
+
+class TestAutoMode:
+    """`--mode auto` decides the weekly full run from what actually ran, not the clock."""
+
+    def test_full_when_no_full_run_ever_succeeded(self):
+        from datetime import datetime, timezone
+        from zdc_kev.run import decide_mode
+        assert decide_mode(None, datetime(2026, 10, 8, tzinfo=timezone.utc)) == "full"
+
+    def test_incremental_within_seven_days_of_a_successful_full(self):
+        from datetime import datetime, timedelta, timezone
+        from zdc_kev.run import decide_mode
+        now = datetime(2026, 10, 8, 9, tzinfo=timezone.utc)
+        assert decide_mode(now - timedelta(days=6, hours=23), now) == "incremental"
+
+    def test_full_once_seven_days_have_passed_whatever_the_hour(self):
+        # The Sunday-morning rule missed whenever cron started 3-6h late; this cannot.
+        from datetime import datetime, timedelta, timezone
+        from zdc_kev.run import decide_mode
+        now = datetime(2026, 10, 11, 14, 37, tzinfo=timezone.utc)   # Sunday afternoon
+        assert decide_mode(now - timedelta(days=7), now) == "full"
+        assert decide_mode(now - timedelta(days=12), now) == "full"
+
+    def test_both_pipelines_accept_auto_and_share_the_rule(self):
+        import zdc_kev.run as kev_run
+        import zdc_obs.run as obs_run
+        assert obs_run.decide_mode is kev_run.decide_mode
+        for main in (kev_run.main, obs_run.main):
+            with pytest.raises(SystemExit) as e:      # argparse: --help exits 0
+                main(["--mode", "auto", "--help"])
+            assert e.value.code == 0

@@ -120,6 +120,10 @@ class CveCollectResult:
     error: str | None = None
     #: Release tags / windows consumed, so a run can say exactly what it covered.
     covered: list[str] = field(default_factory=list)
+    #: Where the next run resumes. None leaves the stored cursor where it was. Kept
+    #: apart from `ok` because a run can fail AFTER fully ingesting earlier windows:
+    #: those must not be re-read forever, and the failed one must not be skipped.
+    cursor: str | None = None
 
     @property
     def ok(self) -> bool:

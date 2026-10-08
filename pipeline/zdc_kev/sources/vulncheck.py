@@ -22,7 +22,8 @@ import json
 import zipfile
 from datetime import date, timedelta
 
-from ..models import CollectResult, KevObservation, parse_date, parse_timestamp
+from ..models import (CVE_RE, CollectResult, KevObservation, NormalisationError,
+                      parse_date, parse_timestamp)
 from .base import KevSource, SourceState, register
 
 INDEX_URL = "https://api.vulncheck.com/v3/index/vulncheck-kev"
@@ -111,7 +112,7 @@ class VulnCheckKev(KevSource):
             archive.body = None  # keep the multi-MB archive out of the raw payload store
 
         for record in records:
-            result.observations.extend(_to_observations(record))
+            result.observations.extend(_to_observations(record, result.skipped))
         archive.record_count = len(result.observations)
         result.complete_snapshot = True
         return result
@@ -146,7 +147,7 @@ class VulnCheckKev(KevSource):
             data = payload.get("data") or []
             fetch.record_count = len(data)
             for record in data:
-                result.observations.extend(_to_observations(record))
+                result.observations.extend(_to_observations(record, result.skipped))
 
             meta = payload.get("_meta") or {}
             total_pages = meta.get("total_pages") or 1
@@ -183,8 +184,16 @@ def _read_backup_zip(body: bytes) -> list[dict]:
     return records
 
 
-def _to_observations(record: dict) -> list[KevObservation]:
-    cves = [str(c).strip().upper() for c in (record.get("cve") or []) if str(c).strip()]
+def _to_observations(record: dict, skipped: list[str] | None = None) -> list[KevObservation]:
+    """One observation per well-formed CVE; anything else lands in `skipped`.
+
+    `cve[]` has carried non-CVE ids (a GHSA) and placeholders; one of those used to
+    raise and take the whole VulnCheck catalogue with it.
+    """
+    skipped = skipped if skipped is not None else []
+    listed = [str(c).strip().upper() for c in (record.get("cve") or []) if str(c).strip()]
+    cves = [c for c in listed if CVE_RE.fullmatch(c)]
+    skipped.extend(f"{c}: not a well-formed CVE id" for c in listed if c not in cves)
     if not cves:
         return []
 
@@ -208,8 +217,8 @@ def _to_observations(record: dict) -> list[KevObservation]:
     observations: list[KevObservation] = []
     for cve_id in cves:
         vuln_id, vuln_id_type = KevSource.primary_id(cve_id, cve_id)
-        observations.append(
-            KevObservation(
+        try:
+            observation = KevObservation(
                 source_id="vulncheck",
                 upstream_source="vulncheck",
                 # Suffixed by CVE: one record can cover several, and each must stay
@@ -218,7 +227,8 @@ def _to_observations(record: dict) -> list[KevObservation]:
                 vuln_id=vuln_id,
                 vuln_id_type=vuln_id_type,
                 cve_id=cve_id,
-                aliases=tuple(c for c in cves if c != cve_id),
+                # A skipped non-CVE id (a GHSA) is still a true alias; keep it here.
+                aliases=tuple(c for c in listed if c != cve_id),
                 signal="successful_exploitation",
                 status_reason="confirmed",
                 confidence=None,
@@ -234,5 +244,8 @@ def _to_observations(record: dict) -> list[KevObservation]:
                 reference_urls=urls,
                 raw=record,
             )
-        )
+        except NormalisationError as exc:
+            skipped.append(f"{cve_id}: {exc}")
+            continue
+        observations.append(observation)
     return observations

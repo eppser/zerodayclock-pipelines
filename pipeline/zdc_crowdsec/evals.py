@@ -34,6 +34,21 @@ def check_catalogue_fetched(total, error) -> EvalResult:
         {"total": total, "error": error})
 
 
+def check_rejected_ids(rejected: list[str]) -> EvalResult:
+    """Catalogue ids that are not well-formed CVEs and were left out.
+
+    WARN: the rest of the catalogue is good. Failing here would recreate the outage
+    this replaces (one bad id used to fail the whole upsert at the CHECK constraint),
+    while dropping silently would hide a new population appearing in the tracker.
+    """
+    return EvalResult(
+        "rejected_ids", WARN, not rejected,
+        "every catalogue id is a well-formed CVE" if not rejected
+        else f"{len(rejected):,} catalogue id(s) rejected as not a CVE: "
+             + ", ".join(rejected[:5]),
+        {"rejected": len(rejected), "examples": rejected[:20]})
+
+
 def check_timelines_fetched(asked, failed) -> EvalResult:
     """A partial harvest is allowed; a mostly-failed one is not.
 

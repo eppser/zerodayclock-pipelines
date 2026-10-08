@@ -72,7 +72,8 @@ jobs:
       # THE GUARD USED TO BE ITS OWN JOB. It always returns should_run=true — the
       # Berlin-hour gate was removed after it dropped 20 of 21 scheduled runs — so all
       # it still did was compute `mode`, in three seconds, in a job that costs a FULL
-      # BILLED MINUTE. The block below is the guard's, moved and otherwise unchanged.
+      # BILLED MINUTE. The block below is the guard's, moved; the weekly-full rule has
+      # since moved into Python (`--mode auto`, zdc_kev.run.decide_mode).
       - id: clock
         name: Decide the run mode
         working-directory: .
@@ -86,25 +87,19 @@ jobs:
             echo "mode=${INPUT_MODE:-incremental}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          HOUR=$(TZ=Europe/Berlin date +%H)
-          DOW=$(TZ=Europe/Berlin date +%u)
           # NO EXACT-HOUR TEST. This used to require a specific Europe/Berlin hour, which
           # assumes cron fires on the hour. GitHub delays scheduled workflows on private
           # repos by hours: measured 2026-08-28..08-31, only 1 of 21 scheduled runs across
           # these four workflows reached its ingest step. The other 20 reported SUCCESS
           # with the job skipped — a dead collector behind a green tick, the exact v1
           # failure this project exists to avoid. Whatever hour the cron lands on, run.
-          if [ "$HOUR" -lt 12 ]; then SLOT=am; else SLOT=pm; fi
-          echo "Berlin hour $HOUR — running ($SLOT slot)."
           echo "should_run=true" >> "$GITHUB_OUTPUT"
           # Weekly full sweep re-reads every MSRC month back to 2016. Microsoft revises
           # documents in place and a CVE can gain Exploited:Yes long after publication,
-          # so only a full pass finds those late flips.
-          if [ "$DOW" = "7" ] && [ "$SLOT" = "am" ]; then
-            echo "mode=full" >> "$GITHUB_OUTPUT"
-          else
-            echo "mode=incremental" >> "$GITHUB_OUTPUT"
-          fi
+          # so only a full pass finds those late flips. The old "Sunday, Berlin morning
+          # slot" rule was missed whenever cron started 3-6h late; `auto` asks the
+          # database instead: full whenever no full run has succeeded in 7 days.
+          echo "mode=auto" >> "$GITHUB_OUTPUT"
 
       - name: Mask database connection details
         working-directory: .

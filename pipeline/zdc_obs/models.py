@@ -107,6 +107,8 @@ class ObsCollectResult:
     complete_snapshot: bool = False
     unchanged: bool = False
     error: str | None = None
+    #: Records left out as malformed ("<id>: <reason>"); see zdc_kev's CollectResult.
+    skipped: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:

@@ -9,13 +9,20 @@ one observation store, not a purpose-built table per sensor.
 
 from __future__ import annotations
 
+import re
+from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any
 
 # Only CVE identifiers appear in the tracker's CVE endpoints. Fingerprints (product
 # probing with no CVE) are a separate population and are NOT collected here.
 ID_TYPE = "cve"
+
+# The exact pattern of obs_core's obs_cve_shape CHECK (0007). A prefix test let
+# "CVE-2026-XXXX" or a lower-case id through to the database, where one row failed
+# the CHECK and took the whole upsert batch with it.
+CVE_ID = re.compile(r"^CVE-[0-9]{4}-[0-9]{4,}$")
 
 
 def _date(v: Any) -> date | None:
@@ -24,9 +31,12 @@ def _date(v: Any) -> date | None:
     if isinstance(v, date):
         return v
     try:
-        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).date()
+        dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
     except ValueError:
         return None
+    # The grain is the UTC day. An offset timestamp's local date can be the day before
+    # or after, which would file a count under the wrong day.
+    return (dt.astimezone(timezone.utc) if dt.tzinfo else dt).date()
 
 
 @dataclass(frozen=True)
@@ -70,12 +80,20 @@ class DayCount:
     count: int
 
 
-def parse_cves(items: list[dict]) -> list[CveState]:
+def parse_cves(items: list[dict], rejected: list[str] | None = None) -> list[CveState]:
+    """Tracked CVEs. Any id that is not a well-formed CVE goes to `rejected`.
+
+    Rejecting rather than dropping: the tracker is CVE-only today, so a GHSA or a
+    placeholder is news, and the rejected_ids eval reports it every run.
+    """
+    rejected = rejected if rejected is not None else []
     out = []
     for it in items:
-        cid = it.get("id") or it.get("name")
-        if not isinstance(cid, str) or not cid.startswith("CVE-"):
-            continue          # the tracker is CVE-only today; anything else is new
+        raw_id = it.get("id") or it.get("name")
+        cid = raw_id.strip().upper() if isinstance(raw_id, str) else None
+        if not cid or not CVE_ID.fullmatch(cid):
+            rejected.append(repr(raw_id))
+            continue
         comp = (it.get("affected_components") or [{}])[0]
         phase = (it.get("exploitation_phase") or {}).get("name")
         out.append(CveState(
@@ -113,7 +131,10 @@ def parse_timeline(cve_id: str, points: Any, *, upto: date | None = None) -> lis
     """
     if not isinstance(points, list):
         return []
-    out = []
+    # Summed per UTC day: two points landing on one day (sub-daily points, or offset
+    # timestamps either side of midnight) are both counts of that day, and keyed on
+    # CVE@day the upsert would otherwise keep whichever came last.
+    by_day: dict[date, int] = defaultdict(int)
     for p in points:
         if not isinstance(p, dict):
             continue
@@ -123,5 +144,5 @@ def parse_timeline(cve_id: str, points: Any, *, upto: date | None = None) -> lis
             continue
         if upto is not None and d >= upto:
             continue
-        out.append(DayCount(cve_id, d, c))
-    return out
+        by_day[d] += c
+    return [DayCount(cve_id, d, c) for d, c in sorted(by_day.items())]

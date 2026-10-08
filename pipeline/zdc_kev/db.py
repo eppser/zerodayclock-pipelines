@@ -61,6 +61,14 @@ def start_run(conn, pipeline: str, mode: str, trigger: str, git_sha: str | None)
         return cur.fetchone()[0]
 
 
+def last_full_success(conn, pipeline: str):
+    """When this pipeline last completed a full run successfully (None if never)."""
+    with conn.cursor() as cur:
+        cur.execute("""select max(started_at) from raw.pipeline_runs
+                        where pipeline = %s and mode = 'full' and ok""", (pipeline,))
+        return cur.fetchone()[0]
+
+
 def live_entry_counts(conn) -> dict[str, int]:
     """Live assertions per source, as STORED. This is the quantity coverage is measured
     in — never raw.source_fetches.record_count, which counts records *returned by a

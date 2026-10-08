@@ -106,8 +106,15 @@ def record_fetch(conn, run_id: str, fetch: FetchRecord) -> str:
 
 def get_source_state(conn, source_id: str) -> CveSourceState:
     with conn.cursor() as cur:
-        cur.execute("""select max(started_at) from raw.source_fetches
-                       where source_id=%s and ok""", (source_id,))
+        # Only a fallback now (NVD resumes from notes->cursor). Still exclude any run
+        # in which a fetch for this source failed: its ok pages are newer than the
+        # page that failed, so they would place the resume point past the gap.
+        cur.execute("""select max(f.started_at) from raw.source_fetches f
+                       where f.source_id=%s and f.ok
+                         and not exists (select 1 from raw.source_fetches g
+                                         where g.run_id=f.run_id and g.source_id=f.source_id
+                                           and not g.ok and not g.not_modified)""",
+                    (source_id,))
         last_success = cur.fetchone()[0]
         cur.execute("""select max(f.started_at) from raw.source_fetches f
                        join raw.pipeline_runs r on r.run_id=f.run_id

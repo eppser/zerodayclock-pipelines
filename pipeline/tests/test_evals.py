@@ -25,6 +25,19 @@ def obs(**overrides) -> KevObservation:
     return KevObservation(**kwargs)
 
 
+class TestSkippedRecords:
+    def test_passes_when_nothing_was_skipped(self):
+        r = evals.check_skipped_records([CollectResult(source_id="cisa", observations=[obs()])])
+        assert r.passed and r.severity == evals.WARN
+
+    def test_warns_with_the_count_when_records_were_skipped(self):
+        results = [CollectResult(source_id="vulncheck", skipped=["GHSA-x: bad", "CVE-1: bad"]),
+                   CollectResult(source_id="cisa")]
+        r = evals.check_skipped_records(results)
+        assert not r.passed and r.severity == evals.WARN and not r.blocking
+        assert "2" in r.summary and r.detail["vulncheck"]["count"] == 2
+
+
 class TestNoSilentEmpty:
     """The v1 bug: a WAF block recorded as a successful run with no data."""
 
@@ -614,3 +627,104 @@ class TestIndependenceCountsAgree:
         assert r.summary.endswith("...")
         assert len(r.detail["sample"]) == 5
         assert "42 of 5,316" in r.summary
+
+
+class TestCoverageNotDropped:
+    """A one-off collapse fails; an acknowledged permanent drop stops blocking."""
+
+    class FakeConn:
+        def __init__(self, baseline, current, acks=()):
+            from datetime import datetime, timezone
+            self.baseline = (baseline, datetime(2026, 10, 1, 4, tzinfo=timezone.utc))
+            self.current = list(current.items())
+            self.acks = list(acks)
+            self.ack_queries = 0
+
+        def cursor(self):
+            conn = self
+
+            class Cur:
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+                def execute(self, sql, params=None):
+                    self.sql = sql
+                    if "kev_coverage_acknowledgements" in sql:
+                        conn.ack_queries += 1
+                def fetchone(self): return conn.baseline
+                def fetchall(self):
+                    return conn.acks if "acknowledgements" in self.sql else conn.current
+            return Cur()
+
+    def test_passes_when_nothing_dropped(self):
+        conn = self.FakeConn({"circl": 4500}, {"circl": 4490})
+        assert evals.check_coverage_not_dropped(conn).passed
+        assert conn.ack_queries == 0         # the table is read only when needed
+
+    def test_fails_on_a_collapse(self):
+        conn = self.FakeConn({"circl": 4500}, {"circl": 2000})
+        r = evals.check_coverage_not_dropped(conn)
+        assert not r.passed and "circl" in r.detail["drops"]
+
+    def test_acknowledged_permanent_drop_passes(self):
+        from datetime import date as d
+        conn = self.FakeConn({"circl": 4500}, {"circl": 3000},
+                             acks=[("circl", 3000, d(2026, 10, 2))])
+        r = evals.check_coverage_not_dropped(conn)
+        assert r.passed and "circl" in r.detail["accepted"]
+
+    def test_acknowledgement_does_not_hide_a_further_collapse(self):
+        from datetime import date as d
+        conn = self.FakeConn({"circl": 4500}, {"circl": 1000},
+                             acks=[("circl", 3000, d(2026, 10, 2))])
+        assert not evals.check_coverage_not_dropped(conn).passed
+
+    def test_acknowledgement_covers_only_its_own_source(self):
+        from datetime import date as d
+        conn = self.FakeConn({"circl": 4500, "cisa": 1700}, {"circl": 3000, "cisa": 100},
+                             acks=[("circl", 3000, d(2026, 10, 2))])
+        r = evals.check_coverage_not_dropped(conn)
+        assert not r.passed and list(r.detail["drops"]) == ["cisa"]
+
+
+class TestPressureLateArrivalsSettled:
+    """Only SETTLED months in a trailing six-month window are measured."""
+
+    class FakeConn:
+        def __init__(self, censored, counts=(1000, 0, 3), declared=14):
+            self.answers = [(declared,), (censored,), counts]
+            self.calls: list[tuple] = []
+
+        def cursor(self):
+            conn = self
+
+            class Cur:
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+                def execute(self, sql, params=None): conn.calls.append((sql, params))
+                def fetchone(self): return conn.answers.pop(0)
+            return Cur()
+
+    def test_window_ends_at_the_last_settled_month(self):
+        # 2026-09-30 + 14d = 10-14 is after 10-08, so September is not settled yet.
+        assert enrich_evals.settled_month_range(date(2026, 10, 8), 14) == \
+            (date(2026, 3, 1), date(2026, 8, 1))
+
+    def test_a_month_settles_on_exactly_its_end_plus_declared(self):
+        assert enrich_evals.settled_month_range(date(2026, 10, 14), 14)[1] == date(2026, 9, 1)
+        assert enrich_evals.settled_month_range(date(2026, 10, 13), 14)[1] == date(2026, 8, 1)
+
+    def test_window_rolls_across_a_year_boundary(self):
+        assert enrich_evals.settled_month_range(date(2027, 2, 20), 14) == \
+            (date(2026, 8, 1), date(2027, 1, 1))
+
+    def test_the_query_is_bounded_to_settled_months(self):
+        conn = self.FakeConn(date(2026, 10, 8))
+        r = enrich_evals.check_pressure_late_arrivals_settled(conn)
+        assert r.passed
+        sql, params = conn.calls[-1]
+        assert params == (date(2026, 3, 1), date(2026, 8, 1), 14)
+        assert r.detail["last_month"] == "2026-08-01"
+
+    def test_late_arrivals_in_the_window_still_fail(self):
+        conn = self.FakeConn(date(2026, 10, 8), counts=(1000, 5, 40))
+        assert not enrich_evals.check_pressure_late_arrivals_settled(conn).passed

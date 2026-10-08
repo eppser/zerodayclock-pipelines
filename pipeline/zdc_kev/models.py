@@ -74,6 +74,13 @@ def extract_cve(*candidates: object) -> str | None:
     return None
 
 
+def _utc_date(dt: datetime) -> date:
+    """The UTC calendar date. An offset timestamp's local date is a different day
+    near midnight ("2027-01-01T00:30:00+01:00" is 2026-12-31 in UTC), and every date
+    stored here is a UTC date. A naive timestamp is taken as UTC already."""
+    return (dt.astimezone(timezone.utc) if dt.tzinfo else dt).date()
+
+
 def parse_date(value: object) -> date | None:
     """Parse the date formats these four sources actually emit.
 
@@ -85,7 +92,7 @@ def parse_date(value: object) -> date | None:
     if isinstance(value, date) and not isinstance(value, datetime):
         return value
     if isinstance(value, datetime):
-        return value.date()
+        return _utc_date(value)
 
     text = str(value).strip()
     if not text:
@@ -94,7 +101,7 @@ def parse_date(value: object) -> date | None:
     # ISO-8601, with or without time and timezone (CISA, CIRCL, VulnCheck).
     iso = text.replace("Z", "+00:00")
     try:
-        return datetime.fromisoformat(iso).date()
+        return _utc_date(datetime.fromisoformat(iso))
     except ValueError:
         pass
 
@@ -246,6 +253,10 @@ class CollectResult:
     complete_snapshot: bool = False
     unchanged: bool = False
     error: str | None = None
+    #: Upstream records that could not be normalised ("<id>: <reason>"). One bad id
+    #: must cost one record, not the whole source; the skipped_records eval reports
+    #: them so a skip is never silent.
+    skipped: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:

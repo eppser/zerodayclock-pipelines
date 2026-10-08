@@ -28,7 +28,8 @@ from datetime import date, timedelta
 
 from zdc_kev.sources.vulncheck import _read_backup_zip as read_backup_zip
 
-from ..models import ExploitationObservation, ObsCollectResult, parse_date
+from ..models import (CVE_RE, ExploitationObservation, NormalisationError, ObsCollectResult,
+                      parse_date)
 from .base import ObservationSource, ObsSourceState, register
 
 INDEX_URL = "https://api.vulncheck.com/v3/index/vulncheck-kev"
@@ -95,7 +96,7 @@ class VulnCheckCanaries(ObservationSource):
             data = payload.get("data") or []
             hits = 0
             for record in data:
-                for obs in _to_observations(record):
+                for obs in _to_observations(record, result.skipped):
                     if obs.source_entry_id in seen:
                         continue
                     seen.add(obs.source_entry_id)
@@ -154,7 +155,7 @@ class VulnCheckCanaries(ObservationSource):
 
         seen: set[str] = set()
         for record in records:
-            for obs in _to_observations(record):
+            for obs in _to_observations(record, result.skipped):
                 if obs.source_entry_id in seen:
                     continue
                 seen.add(obs.source_entry_id)
@@ -164,11 +165,17 @@ class VulnCheckCanaries(ObservationSource):
         return result
 
 
-def _to_observations(record: dict) -> list[ExploitationObservation]:
+def _to_observations(record: dict,
+                     skipped: list[str] | None = None) -> list[ExploitationObservation]:
     if not record.get("reported_exploited_by_vulncheck_canaries"):
         return []
 
-    cves = [str(c).strip().upper() for c in (record.get("cve") or []) if str(c).strip()]
+    # Same index as the KEV adapter, same hazard: one non-CVE id in cve[] used to
+    # raise and drop every canary observation in the run.
+    skipped = skipped if skipped is not None else []
+    listed = [str(c).strip().upper() for c in (record.get("cve") or []) if str(c).strip()]
+    cves = [c for c in listed if CVE_RE.fullmatch(c)]
+    skipped.extend(f"{c}: not a well-formed CVE id" for c in listed if c not in cves)
     if not cves:
         return []
 
@@ -185,8 +192,8 @@ def _to_observations(record: dict) -> list[ExploitationObservation]:
     out = []
     for cve_id in cves:
         vuln_id, vuln_id_type = ObservationSource.primary_id(cve_id, cve_id)
-        out.append(
-            ExploitationObservation(
+        try:
+            observation = ExploitationObservation(
                 source_id="vulncheck_canary",
                 source_entry_id=f"{cve_id}@{observed.isoformat()}",
                 observation_type="attempt_observed",
@@ -204,5 +211,8 @@ def _to_observations(record: dict) -> list[ExploitationObservation]:
                 title=record.get("vulnerabilityName"),
                 raw=record,
             )
-        )
+        except NormalisationError as exc:
+            skipped.append(f"{cve_id}: {exc}")
+            continue
+        out.append(observation)
     return out
