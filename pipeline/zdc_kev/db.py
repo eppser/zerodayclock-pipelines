@@ -273,6 +273,26 @@ def upsert_observations(
     return inserted, len(flags) - inserted
 
 
+def apply_assertion_withdrawals(conn) -> int:
+    """Withdraw assertions listed in core.kev_assertion_withdrawals.
+
+    A relay (CIRCL) can keep carrying an entry its origin has dropped. The upsert resets
+    withdrawn_at on everything the relay still lists, so without this the withdrawal
+    would be undone on every run. Withdraws only the named source's assertion.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """update core.kev_entries e
+                  set withdrawn_at = w.checked_on::timestamptz
+                 from core.kev_assertion_withdrawals w
+                where e.source_id = w.source_id
+                  and coalesce(e.upstream_source, e.source_id) = w.upstream_source
+                  and e.vuln_id = w.vuln_id
+                  and e.withdrawn_at is null"""
+        )
+        return cur.rowcount
+
+
 def reconcile_withdrawals(conn, source_id: str, seen: Iterable[tuple[str, str]]) -> int:
     """Mark entries absent from a COMPLETE snapshot as withdrawn.
 

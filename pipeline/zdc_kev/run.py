@@ -171,6 +171,9 @@ def main(argv: list[str] | None = None) -> int:
             persistence_errors[result.source_id] = f"{type(exc).__name__}: {exc}"
             log.exception("%s: persistence failed", result.source_id)
 
+    withdrawn_by_decision = db.apply_assertion_withdrawals(conn)
+    if withdrawn_by_decision:
+        log.info("applied %d recorded assertion withdrawal(s)", withdrawn_by_decision)
     rows = db.rebuild_consolidated(conn, CONSOLIDATION_METHOD, censored_at, run_id)
     log.info("consolidated %d vulnerabilities", rows)
     pairs = db.rebuild_source_agreement(conn, AGREEMENT_METHOD, censored_at)
