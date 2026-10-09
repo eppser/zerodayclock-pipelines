@@ -274,6 +274,84 @@ def rebuild_scan_age_mix(conn, *, method_version: str, censored_at: date,
         return cur.fetchone()[0]
 
 
+def _function_exists(conn, signature: str) -> bool:
+    """True if the database defines this function (to_regprocedure, never raises)."""
+    with conn.cursor() as cur:
+        cur.execute("select to_regprocedure(%s) is not null", (signature,))
+        return bool(cur.fetchone()[0])
+
+
+def rebuild_scan_pressure_mix(conn, *, method_version: str, censored_at: date,
+                              run_id: str | None = None) -> int:
+    """Rebuild the two-network weekly scanning mix (Shadowserver + CrowdSec), migration 0086.
+
+    Each network's count becomes a share of its own weekly total and only shares are
+    averaged, over the networks able to detect the vulnerability. The week ends on the
+    earlier of Shadowserver's last day and CrowdSec's last MATURED day, which is why this
+    takes the censoring date: CrowdSec days younger than three days are still growing.
+
+    GUARDED. This module runs from the public pipelines repo, which mirrors main; the
+    function exists only once 0086 has been applied. Absent, it returns 0 and logs
+    rather than turning every other rebuild's run red over a prototype.
+    """
+    if not _function_exists(conn, "derived.rebuild_scan_pressure_mix(text,date,uuid)"):
+        log.warning("derived.rebuild_scan_pressure_mix is not defined; skipped (0086 not applied)")
+        return 0
+    with conn.cursor() as cur:
+        cur.execute("select derived.rebuild_scan_pressure_mix(%s, %s, %s)",
+                    (method_version, censored_at, run_id))
+        return cur.fetchone()[0]
+
+
+def rebuild_scan_pressure_combined(conn, *, method_version: str, censored_at: date,
+                                   run_id: str | None = None) -> int:
+    """Rebuild the weekly scanning chart with CrowdSec occurrences added to Shadowserver
+    attempts (migration 0088). Same arithmetic as scan_pressure; the week ends where both
+    networks are complete, so it takes the censoring date.
+
+    GUARDED like rebuild_scan_pressure_mix: absent until 0088 is applied.
+    """
+    if not _function_exists(conn, "derived.rebuild_scan_pressure_combined(text,date,uuid)"):
+        log.warning("derived.rebuild_scan_pressure_combined is not defined; skipped (0088 not applied)")
+        return 0
+    with conn.cursor() as cur:
+        cur.execute("select derived.rebuild_scan_pressure_combined(%s, %s, %s)",
+                    (method_version, censored_at, run_id))
+        return cur.fetchone()[0]
+
+
+def rebuild_scan_age_mix_combined(conn, *, method_version: str, censored_at: date,
+                                  run_id: str | None = None) -> int:
+    """Rebuild the age chart with CrowdSec occurrences added to Shadowserver attempts
+    (migration 0089). Same arithmetic as scan_age_mix; CrowdSec counts only in months it
+    covers, and a month closes where both networks are complete, so it takes the
+    censoring date.
+
+    GUARDED like rebuild_scan_pressure_mix: absent until 0089 is applied.
+    """
+    if not _function_exists(conn, "derived.rebuild_scan_age_mix_combined(text,date,uuid,integer,integer)"):
+        log.warning("derived.rebuild_scan_age_mix_combined is not defined; skipped (0089 not applied)")
+        return 0
+    with conn.cursor() as cur:
+        cur.execute("select derived.rebuild_scan_age_mix_combined(%s, %s, %s)",
+                    (method_version, censored_at, run_id))
+        return cur.fetchone()[0]
+
+
+def rebuild_scan_age_mix_crowdsec(conn, *, method_version: str, censored_at: date,
+                                  run_id: str | None = None) -> int:
+    """Rebuild CrowdSec's own scanning-by-age bands, migration 0086. Never combined with
+    Shadowserver's. Shares only: no occurrence count is stored. Guarded like the above."""
+    if not _function_exists(conn, "derived.rebuild_scan_age_mix_crowdsec(text,date,uuid)"):
+        log.warning("derived.rebuild_scan_age_mix_crowdsec is not defined; skipped "
+                    "(0086 not applied)")
+        return 0
+    with conn.cursor() as cur:
+        cur.execute("select derived.rebuild_scan_age_mix_crowdsec(%s, %s, %s)",
+                    (method_version, censored_at, run_id))
+        return cur.fetchone()[0]
+
+
 def rebuild_cve_activity(conn, *, method_version: str, censored_at: date,
                          run_id: str | None = None, days: int = 90) -> int:
     """Rebuild the trailing-window daily attempt series behind the Explorer sparkline.

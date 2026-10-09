@@ -556,6 +556,195 @@ def check_scan_pressure_window_rolls(conn) -> EvalResult:
                        "lookback_days": lookback})
 
 
+# The CrowdSec IDS charts close where both networks are complete, so they may trail
+# Shadowserver by CrowdSec's maturity (3 days) and, while its feed is late, by up to the
+# stall tolerance (7 days) before moving on without it.
+COMBINED_EXTRA_LAG_DAYS = 3 + 7
+
+
+def check_scan_combined_charts(conn) -> EvalResult:
+    """The two charts with CrowdSec IDS added (0088 weekly, 0089 by age) must roll, and
+    must equal production wherever CrowdSec does not count.
+
+    Skipped where the migrations are absent (the public mirror runs from main). The
+    properties, each a failure the combined arithmetic could hide:
+      * neither chart has stopped moving: a stalled CrowdSec feed may hold the window
+        back by its tolerance, never longer;
+      * the weekly ladder keeps every offset, and no bubble carries CrowdSec in a week
+        CrowdSec did not count for;
+      * the age stream draws the last complete month at its own window end, at most the
+        declared months, four bands each;
+      * every age month CrowdSec did not count in equals production's month, band for
+        band — the check that the copied rebuild has not drifted from the live one.
+    """
+    name = "scan_combined_charts"
+    with conn.cursor() as cur:
+        cur.execute("""select to_regclass('derived.scan_pressure_combined') is not null,
+                              to_regclass('derived.scan_age_mix_combined') is not null""")
+        has_w, has_a = cur.fetchone()
+        if not (has_w or has_a):
+            return EvalResult(name, ERROR, True, "combined charts not applied; skipped", {})
+        cur.execute("""select max(observed_at)::date from obs_core.exploitation_observations
+                        where source_id = 'shadowserver_api'
+                          and observation_type = 'attempt_observed'""")
+        sensor_max = cur.fetchone()[0]
+        tolerance = REBUILD_LAG_TOLERANCE_DAYS + COMBINED_EXTRA_LAG_DAYS
+        why: list[str] = []
+        details: dict = {"sensor_max": str(sensor_max) if sensor_max else None}
+
+        def lag_ok(label, end):
+            if end is None or sensor_max is None:
+                why.append(f"{label}: no rows or no sensor data")
+                return
+            lag = (sensor_max - end).days
+            details[f"{label}_lag_days"] = lag
+            if end > sensor_max:
+                why.append(f"{label}: window end {end} is ahead of the sensor's {sensor_max}")
+            elif lag > tolerance:
+                why.append(f"{label}: window end {end} trails the sensor's {sensor_max} by "
+                           f"{lag}d (> {tolerance}d) - the rebuild has stopped moving")
+
+        if has_w:
+            cur.execute("""select coalesce((parameters->>'offsets')::int, 8),
+                                  coalesce((parameters->>'window_days')::int, 7)
+                             from core.method_registry
+                            where metric_id = 'scan_pressure_combined' and superseded_at is null
+                            order by introduced_at desc nulls last, method_version desc limit 1""")
+            row = cur.fetchone()
+            offsets, window_days = row if row else (8, 7)
+            cur.execute("""select count(distinct offset_weeks), min(offset_weeks),
+                                  max(offset_weeks), max(obs_window_end), min(window_start)
+                             from derived.scan_pressure_combined""")
+            n, k_lo, k_hi, w_end, w_start = cur.fetchone()
+            cur.execute("""select count(*) from derived.scan_pressure_combined
+                            where 'crowdsec' = any(seen_by)
+                              and not ('crowdsec' = any(networks))""")
+            stray = cur.fetchone()[0]
+            lag_ok("weekly", w_end)
+            if n != offsets or k_lo != 0 or k_hi != offsets - 1:
+                why.append(f"weekly: offsets {k_lo}..{k_hi} ({n} distinct) against {offsets}")
+            elif (w_end - w_start).days >= offsets * window_days:
+                why.append(f"weekly: span {w_start}..{w_end} exceeds {offsets} weeks")
+            if stray:
+                why.append(f"weekly: {stray} bubbles carry CrowdSec in a week it did not count for")
+            details.update(weekly_offsets=n, weekly_end=str(w_end) if w_end else None,
+                           weekly_stray_crowdsec=stray)
+
+        if has_a:
+            cur.execute("""select coalesce((parameters->>'months')::int, 12)
+                             from core.method_registry
+                            where metric_id = 'scan_age_mix_combined' and superseded_at is null
+                            order by introduced_at desc nulls last, method_version desc limit 1""")
+            row = cur.fetchone()
+            declared = row[0] if row else 12
+            cur.execute("""select min(month), max(month), count(distinct month), max(obs_window_end)
+                             from derived.scan_age_mix_combined""")
+            lo, hi, n_months, a_end = cur.fetchone()
+            cur.execute("""select count(*) from (select month from derived.scan_age_mix_combined
+                                                  group by month having count(*) <> 4) t""")
+            short = cur.fetchone()[0]
+            cur.execute("""select count(*) from (
+                             select month, age_band, attempts, cve_count, population_attempts,
+                                    all_attempts, days_covered
+                               from derived.scan_age_mix
+                              where month in (select month from derived.scan_age_mix_combined
+                                               where networks = array['shadowserver'])
+                             except
+                             select month, age_band, attempts, cve_count, population_attempts,
+                                    all_attempts, days_covered
+                               from derived.scan_age_mix_combined) t""")
+            drift = cur.fetchone()[0]
+            lag_ok("age", a_end)
+            if a_end is not None:
+                from calendar import monthrange
+                if a_end.day == monthrange(a_end.year, a_end.month)[1]:
+                    exp = (a_end.year, a_end.month)
+                else:
+                    exp = (a_end.year, a_end.month - 1) if a_end.month > 1 else (a_end.year - 1, 12)
+                if (hi.year, hi.month) != exp:
+                    why.append(f"age: newest month {hi} is not the last complete month "
+                               f"{exp[0]}-{exp[1]:02d} at {a_end}")
+                if n_months > declared:
+                    why.append(f"age: {n_months} months against {declared} declared")
+            if short:
+                why.append(f"age: {short} month(s) without all four bands")
+            if drift:
+                why.append(f"age: {drift} band-months without CrowdSec differ from production")
+            details.update(age_months=n_months, age_window=[str(lo), str(hi)],
+                           age_drift=drift)
+
+    ok = not why
+    return EvalResult(name, ERROR, ok,
+                      "both CrowdSec IDS charts roll and match production where CrowdSec "
+                      "does not count" if ok else "; ".join(why), details)
+
+
+def check_scanning_series_fresh(conn) -> EvalResult:
+    """The Explorer's 90-day scanning series (Shadowserver plus CrowdSec IDS) must end on the
+    latest day any counting network reported (0091), never behind it by more than the gap
+    between rebuilds and never ahead of it. Skipped where the series is absent."""
+    name = "scanning_series_fresh"
+    with conn.cursor() as cur:
+        cur.execute("select to_regclass('derived.cve_scanning_daily') is not null")
+        if not cur.fetchone()[0]:
+            return EvalResult(name, ERROR, True, "cve_scanning_daily not applied; skipped", {})
+        cur.execute("""select max(observed_at) from obs_core.exploitation_observations
+                        where derived.is_scanning_count(source_id, observation_type)
+                          and withdrawn_at is null""")
+        feed = cur.fetchone()[0]
+        # A zero or an out-of-window day cannot be stored: the table's check constraints refuse
+        # both (tested in test_scan_combined_db.py), so only the clock needs watching here.
+        cur.execute("select max(window_end), count(*) from derived.cve_scanning_daily")
+        win, n = cur.fetchone()
+    if feed is None:
+        return EvalResult(name, INFO, True, "no scanning observations to window", {})
+    if win is None:
+        return EvalResult(name, ERROR, False, "the scanning series is empty while the feeds have data", {})
+    lag = (feed - win).days
+    ok = 0 <= lag <= REBUILD_LAG_TOLERANCE_DAYS
+    return EvalResult(name, ERROR, ok,
+                      f"series ends {win}, {lag}d behind the feeds, {n:,} rows"
+                      + ("" if ok else f" - outside the allowed 0..{REBUILD_LAG_TOLERANCE_DAYS}d: "
+                                       "the rebuild has stopped moving"),
+                      {"window_end": str(win), "feed_end": str(feed), "lag_days": lag})
+
+
+def check_epss_lifecycle_recorded(conn) -> EvalResult:
+    """The EPSS lifecycle (0091) must be current and self-consistent:
+      * every CVE EPSS scores (since 30-day EPSS began) has a summary at its latest score - a
+        gap means the daily record stopped;
+      * a summary's confirmed state agrees with its CVE's last move;
+      * no move is dated after the score that proves it.
+    Skipped where 0091 is absent."""
+    name = "epss_lifecycle_recorded"
+    with conn.cursor() as cur:
+        cur.execute("select to_regclass('core.epss_summary') is not null")
+        if not cur.fetchone()[0]:
+            return EvalResult(name, ERROR, True, "epss lifecycle not applied; skipped", {})
+        cur.execute("""select count(*) filter (where x.cve_id is null or x.last_date < e.score_date),
+                              (select count(*) from core.epss_summary)
+                         from core.cve_epss e
+                         left join core.epss_summary x using (cve_id)
+                        where e.score_date >= date '2022-02-04'""")
+        behind, total = cur.fetchone()
+        cur.execute("""select count(*) from core.epss_summary x
+                         join lateral (select direction from core.epss_transitions t
+                                        where t.cve_id = x.cve_id
+                                        order by changed_on desc limit 1) t on true
+                        where x.confirmed_high <> (t.direction = 'up')""")
+        contradicted = cur.fetchone()[0]
+        cur.execute("""select count(*) from core.epss_transitions t
+                         join core.epss_summary x using (cve_id)
+                        where t.changed_on > x.last_date""")
+        ahead = cur.fetchone()[0]
+    ok = behind == 0 and contradicted == 0 and ahead == 0 and total > 0
+    return EvalResult(name, ERROR, ok,
+                      f"{total:,} CVEs tracked, all current and consistent" if ok else
+                      f"{behind} CVEs behind their latest score, {contradicted} states contradict "
+                      f"their last move, {ahead} moves after the score that proves them, {total} tracked",
+                      {"behind": behind, "contradicted": contradicted, "ahead": ahead, "tracked": total})
+
+
 def check_partial_year_not_extended(conn) -> EvalResult:
     """A partial cohort must stop at the boundary, and a complete one must not be dashed."""
     with conn.cursor() as cur:
@@ -859,6 +1048,13 @@ VIEW_BASE_TABLES = [
     ("public.kev_technology_cohorts","derived.kev_technology_cohorts"),
     ("public.severity_predictiveness","derived.severity_predictiveness"),
     ("public.scan_age_mix",          "derived.scan_age_mix"),
+    # 0086. Absent views are skipped by the check, so these are harmless before it lands.
+    ("public.scan_pressure_mix",     "derived.scan_pressure_mix"),
+    ("public.scan_pressure_combined", "derived.scan_pressure_combined"),
+    ("public.scan_age_mix_crowdsec", "derived.scan_age_mix_crowdsec"),
+    ("public.scan_age_mix_combined", "derived.scan_age_mix_combined"),
+    ("public.cve_scanning_daily",    "derived.cve_scanning_daily"),
+    ("public.epss_models",           "derived.epss_models"),
     ("public.kev_lag_points",        "derived.kev_lag_points"),
 ]
 
@@ -1702,6 +1898,9 @@ def run_db_evals(conn) -> list[EvalResult]:
         check_cohort_window_rolls(conn),
         check_scan_age_window_rolls(conn),
         check_scan_pressure_window_rolls(conn),
+        check_scan_combined_charts(conn),
+        check_scanning_series_fresh(conn),
+        check_epss_lifecycle_recorded(conn),
         check_pressure_window_matured(conn),
         check_pressure_late_arrivals_settled(conn),
         check_partial_year_not_extended(conn),

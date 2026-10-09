@@ -169,6 +169,13 @@ def main(argv: list[str] | None = None) -> int:
         ("severity_rows", "derived.severity_predictiveness", db.rebuild_severity_predictiveness),
         ("scan_pressure_rows", "derived.scan_pressure", db.rebuild_scan_pressure),
         ("scan_age_mix_rows", "derived.scan_age_mix", db.rebuild_scan_age_mix),
+        # 0086, CrowdSec beside Shadowserver. Both are guarded in db.py: absent the
+        # migration they return 0 instead of failing the run.
+        ("scan_pressure_mix_rows", "derived.scan_pressure_mix", db.rebuild_scan_pressure_mix),
+        ("scan_pressure_combined_rows", "derived.scan_pressure_combined", db.rebuild_scan_pressure_combined),
+        ("scan_age_mix_combined_rows", "derived.scan_age_mix_combined", db.rebuild_scan_age_mix_combined),
+        ("scan_age_mix_crowdsec_rows", "derived.scan_age_mix_crowdsec",
+         db.rebuild_scan_age_mix_crowdsec),
         ("pressure_index_rows", "derived.pressure_index", db.rebuild_pressure_index),
         ("explorer_list_rows", "derived.explorer_list", db.rebuild_explorer_list),
         ("explorer_strata_rows", "derived.explorer_strata", db.rebuild_explorer_strata),

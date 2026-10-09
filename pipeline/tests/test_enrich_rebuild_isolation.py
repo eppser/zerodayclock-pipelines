@@ -183,3 +183,45 @@ def test_two_metrics_get_two_different_versions_in_one_run():
     db.run_rebuilds(conn, [("a", "derived.pressure_index", f1),
                            ("b", "derived.cve_detail", f2)], **KW)
     assert (s1["version"], s2["version"]) == ("v5", "v3")
+
+
+class _ScriptedConn:
+    """Answers to_regprocedure with `exists` and records every statement executed."""
+
+    def __init__(self, exists: bool, rows: int = 7):
+        self.exists, self.rows, self.sql = exists, rows, []
+
+    def cursor(self):
+        conn = self
+
+        class _C:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def execute(self, sql, params=None):
+                conn.sql.append(sql)
+                self._last = sql
+
+            def fetchone(self):
+                return (conn.exists,) if "to_regprocedure" in self._last else (conn.rows,)
+        return _C()
+
+
+@pytest.mark.parametrize("fn", [db.rebuild_scan_pressure_mix, db.rebuild_scan_age_mix_crowdsec,
+                                db.rebuild_scan_pressure_combined, db.rebuild_scan_age_mix_combined])
+def test_crowdsec_rebuilds_are_harmless_before_their_migration(fn):
+    """0086's rebuilds return 0 and call nothing when the function is not defined."""
+    conn = _ScriptedConn(exists=False)
+    assert fn(conn, method_version="v1", censored_at=None, run_id=None) == 0
+    assert all("to_regprocedure" in s for s in conn.sql)
+
+
+@pytest.mark.parametrize("fn", [db.rebuild_scan_pressure_mix, db.rebuild_scan_age_mix_crowdsec,
+                                db.rebuild_scan_pressure_combined, db.rebuild_scan_age_mix_combined])
+def test_crowdsec_rebuilds_run_once_their_migration_exists(fn):
+    conn = _ScriptedConn(exists=True, rows=7)
+    assert fn(conn, method_version="v1", censored_at=None, run_id=None) == 7
+    assert any(s.startswith("select derived.rebuild_") for s in conn.sql)
