@@ -316,9 +316,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="score every due month after the latest stored one (the scheduled call)")
     ap.add_argument("--dry-run", action="store_true", help="compute and print, write nothing")
     ap.add_argument("--report", help="write a JSON report here")
+    ap.add_argument("--today", help=argparse.SUPPRESS)   # tests: pretend today is this date
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    today = date.today()
+    today = date.fromisoformat(args.today) if args.today else date.today()
     dsn = os.environ.get("DATABASE_URL")
     if not dsn:
         raise RuntimeError("DATABASE_URL is not set")
