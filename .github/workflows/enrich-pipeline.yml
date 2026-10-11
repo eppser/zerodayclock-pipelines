@@ -155,6 +155,16 @@ jobs:
           if [ -n "$CENSORED_AT" ]; then args+=(--censored-at "$CENSORED_AT"); fi
           python -m zdc_enrich.run "${args[@]}"
 
+      # MONTHLY, ON EVERY PASS. The prioritisation scorecard scores the previous month once it is
+      # complete (from the 5th); --if-due makes every other pass a no-op that exits in seconds.
+      # Its own step, after the enrichment, and run even if enrichment failed: it reads the
+      # observations and KEV tables directly, not anything enrichment rebuilds.
+      - name: Patch prioritisation scorecard (monthly)
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m zdc_prio.run --if-due --report prio-report.json
+
       - name: Upload eval report
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
