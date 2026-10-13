@@ -1,0 +1,145 @@
+name: Breach pipeline
+
+# Breach tracking - hourly. See supabase/migrations/0101_breach_tracking.sql and
+# docs/decisions/0006-breach-tracking.md.
+#
+# PUBLIC, LIKE THE OTHER SCHEDULED PIPELINES. Every input is public (leak-site trackers,
+# regulator lists, news feeds) and hourly runs would cost ~1,500 private Actions minutes a
+# month. Because the logs and the report artifact are public, the pipeline prints and reports
+# COUNTS ONLY: no organisation name, no article text, ever.
+#
+# HOURLY, WITH PER-SOURCE CADENCES INSIDE. Leak trackers, SEC filings and news feeds are read
+# every run; regulator lists every 6 hours (WA, DE, HIBP) or daily (CA, HHS). The cadence lives
+# in zdc_breach.run.CADENCE_H, measured against breach_core.source_state, so a run that lands
+# late (GitHub delays scheduled runs by hours) still does what is due and nothing twice.
+#
+# THE LLM IS CAPPED TWICE. OpenRouter is called only for the extraction backlog, at most
+# 40 documents a run, and zdc_breach.llm refuses any call that would cross the owner's
+# 50 EUR/month cap (or a daily slice of it) as recorded in breach_core.llm_calls.
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      sources:
+        description: 'Comma-separated subset (blank = everything due); "extract" = LLM backlog'
+        type: string
+        default: ''
+      force:
+        description: 'Ignore per-source cadence'
+        type: boolean
+        default: false
+      environment:
+        description: 'Target environment'
+        type: choice
+        options: [staging, production]
+        default: staging
+
+concurrency:
+  group: breach-pipeline-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Tests run with no environment, so nothing they install can reach a secret.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-ci.txt
+      - name: Unit tests
+        run: python -m pytest -q tests/test_breach.py
+
+  ingest:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Mask database connection details
+        working-directory: .
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.parse
+          u = urllib.parse.urlsplit(os.environ.get("DATABASE_URL", ""))
+          for v in {u.hostname, u.username, u.password}:
+              if v:
+                  print(f"::add-mask::{v}")
+                  print(f"::add-mask::{urllib.parse.unquote(v)}")
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-run.txt
+
+      - name: Run pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          SOURCES: ${{ github.event.inputs.sources }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          python -m zdc_breach.run \
+            ${SOURCES:+--sources "$SOURCES"} \
+            $( [ "$FORCE" = "true" ] && echo --force ) \
+            --trigger "${{ github.event_name }}" \
+            --report breach-report.json
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f breach-report.json ]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r = json.load(open("breach-report.json"))
+          print(f"### Breach pipeline — {'OK' if r.get('ok') else 'BLOCKED'}\n")
+          llm = r.get("llm", {})
+          print(f"- LLM: {llm.get('docs', 0)} documents, {llm.get('cost_usd', 0):.4f} USD; "
+                f"claims accepted {r.get('claims', {}).get('accepted', 0)}, rejected {r.get('claims', {}).get('rejected', 0)}\n")
+          print("| source | ok | HTTP | parsed / items | new | changed |")
+          print("|---|---|---|---|---|---|")
+          for s, v in sorted(r.get("sources", {}).items()):
+              if "skipped" in v:
+                  print(f"| {s} | not due | | | | |")
+                  continue
+              print(f"| {s} | {'yes' if v.get('ok') else 'NO'} | {v.get('http', '')} | "
+                    f"{v.get('parsed', v.get('items', ''))} | {v.get('new', '')} | {v.get('changed', '')} |")
+          print("\n| check | severity | result |")
+          print("|---|---|---|")
+          for c in r.get("evals", []):
+              print(f"| {c['name']} | {c['severity']} | {'PASS' if c['passed'] else 'FAIL'} — {c['summary']} |")
+          PY
+          else
+            echo "No report produced — the run failed before evaluation." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Counts only (see the header): safe to keep as a public artifact.
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: breach-report-${{ github.run_id }}
+          path: pipeline/breach-report.json
+          if-no-files-found: warn
+          retention-days: 14
