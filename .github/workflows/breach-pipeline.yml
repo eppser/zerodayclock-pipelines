@@ -74,9 +74,10 @@ jobs:
   ingest:
     needs: test
     runs-on: ubuntu-latest
-    # The run stops itself at 15 minutes (--deadline-minutes) and records the result; this is
-    # the backstop if something hangs.
-    timeout-minutes: 40
+    # The run stops itself at 32 minutes (--deadline-minutes) and records the result; this is
+    # the backstop if something hangs. The sources take a few minutes; the GDELT news search
+    # (paced, retried on 429) uses whatever is left - minutes are free in this public repo.
+    timeout-minutes: 50
     environment: ${{ github.event.inputs.environment || 'staging' }}
     defaults:
       run:
@@ -124,6 +125,7 @@ jobs:
             ${SOURCES:+--sources "$SOURCES"} \
             $( [ "$FORCE" = "true" ] && echo --force ) \
             --sec-days "$SEC_DAYS" \
+            --deadline-minutes 32 \
             --trigger "${{ github.event_name }}" \
             --report breach-report.json
 

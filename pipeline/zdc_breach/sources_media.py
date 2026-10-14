@@ -16,7 +16,10 @@ from datetime import date, datetime, timedelta, timezone
 
 API = "https://api.gdeltproject.org/api/v2/doc/doc"
 INDEX_START = date(2017, 1, 1)
-PACE_S = 6.0
+PACE_S = 8.0          # GDELT asks for one request per 5 s; shared runner IPs need more
+RETRIES_429 = 3       # GDELT is often congested: a 429 that is retried 15 s later usually answers
+RETRY_SLEEP_S = 15.0
+GIVE_UP_AFTER = 5     # consecutive searches that never got an answer
 _BREACH = re.compile(r"(ransom|breach|hack|cyber|attack|leak|stolen|extort|data theft|compromis|incident|"
                      r"datenleck|cyberangriff|piratage|fuite|ciberataque|violaci|attacco|lek|aanval)", re.I)
 

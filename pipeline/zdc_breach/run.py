@@ -432,7 +432,7 @@ def parse_leak_facts(cur, limit=20000) -> dict:
 
 
 # ---- news coverage per victim (GDELT) --------------------------------------------------------
-MEDIA_PER_RUN = 60
+MEDIA_PER_RUN = 300           # searches; in practice the run's deadline decides
 MEDIA_RESEARCH_DAYS = 30
 
 
@@ -451,7 +451,7 @@ def run_media(ctx, cur) -> dict:
                     limit %s""", (MEDIA_RESEARCH_DAYS, MEDIA_PER_RUN * 3))
     todo = cur.fetchall()
     today = datetime.now(timezone.utc).date()
-    searched = found = skipped = 0
+    searched = found = skipped = unanswered = 0
     state = []
     for vid, name, seen in todo:
         if searched >= MEDIA_PER_RUN or datetime.now(timezone.utc) > ctx.deadline - timedelta(minutes=2):
@@ -463,12 +463,22 @@ def run_media(ctx, cur) -> dict:
             continue
         if searched:
             time.sleep(sources_media.PACE_S)
-        f = _fetch(ctx, cur, "gdelt", url, accept="application/json", timeout=60)
         searched += 1
-        if f.status == 429:
+        for attempt in range(sources_media.RETRIES_429 + 1):
+            f = _fetch(ctx, cur, "gdelt", url, accept="application/json", timeout=60)
+            if f.status != 429:
+                break
             db.record_fetch(cur, ctx.run_id, "gdelt", f, None)
-            ctx.report["sources"].setdefault("gdelt", {})["rate_limited"] = True
-            break      # GDELT asked us to slow down; the rest wait for the next run
+            ctx.report["sources"].setdefault("gdelt", {})["throttled"] = \
+                ctx.report["sources"].get("gdelt", {}).get("throttled", 0) + 1
+            time.sleep(sources_media.RETRY_SLEEP_S)
+        if f.status == 429:
+            unanswered += 1
+            if unanswered >= sources_media.GIVE_UP_AFTER:
+                ctx.report["sources"].setdefault("gdelt", {})["rate_limited"] = True
+                break      # GDELT is refusing this runner; the rest wait for the next run
+            continue       # this victim is not marked searched; it is retried next run
+        unanswered = 0
         if not f.ok:
             db.record_fetch(cur, ctx.run_id, "gdelt", f, None)
             state.append((vid, "error", 0))
@@ -715,7 +725,8 @@ def run(conn, args, getter=http.get, llm=None, fx=None) -> dict:
     deadline = datetime.now(timezone.utc) + timedelta(minutes=args.deadline_minutes)
     ctx.deadline = deadline
     wanted = [s for s in args.sources.split(",") if s] if args.sources else list(CADENCE_H)
-    sources = [s for s in wanted if s != "extract"]
+    # GDELT runs last: it uses whatever time the run has left, so it must not starve the others.
+    sources = sorted((s for s in wanted if s != "extract"), key=lambda s: s == "gdelt")
     feeds = {f.source_id: f for f in sources_news.FEEDS}
     for source_id in sources:
         # A run that has used its time stops starting new work, finishes cleanly and records
