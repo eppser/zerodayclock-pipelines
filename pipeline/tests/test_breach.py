@@ -544,7 +544,11 @@ def test_feed_title_matching_is_whole_phrase_and_distinctive():
     assert sm.find_in_title("Hackers target hospitals with ransomware", idx) == []
     assert sm.find_in_title("Change Healthcare ransomware attack cost $2.9bn", idx) == ["v2"]
     assert sm.find_in_title("PowerSchool breach: hacker extorted districts", idx) == ["v3"]
-    assert sm.find_in_title("Ascension restores systems after ransomware", idx) == ["v6"]    # 9 letters
+    assert sm.find_in_title("Ascension restores systems after ransomware", idx) == []        # one plain word: never
+    assert not sm.distinctive("Affiliate") and not sm.distinctive("Notification") and sm.distinctive("McKesson")
+    assert not sm.TITLE_EVENT.search("Microsoft catches hackers exploiting Zimbra bug before disclosure")
+    assert sm.TITLE_EVENT.search("Manchester Airports Group Hit by Cyber Incident")
+    assert sm.TITLE_EVENT.search("Nutex Health Says Patient Data Stolen, Hackers Threaten Leak")
     assert sm.find_in_title("Changes to healthcare law", idx) == []
     assert "dutch" not in sm.index_names([("v7", "Dutch ???")])
     from datetime import date

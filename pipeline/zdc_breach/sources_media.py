@@ -86,7 +86,9 @@ def distinctive(name: str | None) -> bool:
     if len(words) >= 2:
         return len(norm(n)) >= 6
     w = n.strip()
-    return bool(re.search(r"[a-z][A-Z]|\d", w)) or len(w) >= 9
+    # One word: only when it cannot be an ordinary word - "Affiliate" and "Notification" are
+    # victim names on some lists and words in every other headline.
+    return bool(re.search(r"[a-z][A-Z]|\d", w))
 
 
 def index_names(victims) -> dict[str, list]:
@@ -105,6 +107,13 @@ def in_window(published: date | None, seen: date | None) -> bool:
     if published is None or seen is None:
         return False
     return seen - timedelta(days=30) <= published <= seen + timedelta(days=365)
+
+
+# A headline must report a breach EVENT. "hackers" or "attack" alone is any security story
+# ("Microsoft catches hackers exploiting Zimbra bug").
+TITLE_EVENT = re.compile(r"ransomware|data breach|\bbreach(?:ed|es)?\b|\bhacked\b|cyber[- ]?attack|cyber incident|"
+                         r"security incident|data (?:leak|theft)|(?:data|records|files) (?:were )?stolen|stolen data|"
+                         r"\bleak(?:ed|s)?\b|extort|datenleck|cyberangriff|piratage|ciberataque", re.I)
 
 
 def find_in_title(title: str, idx: dict[str, list[str]], max_words: int = 8) -> list[str]:

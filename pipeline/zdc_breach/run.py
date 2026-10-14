@@ -38,7 +38,9 @@ log = logging.getLogger("zdc_breach")
 
 # source_id -> minimum hours between fetches
 CADENCE_H = {"ransomlook": 1, "ransomfeed": 1, "sec_8k": 1, "wa_ag": 6, "de_ag": 6, "hibp": 6,
-             "ca_ag": 24, "hhs_ocr": 24, "wikidata": 1, "misp_galaxy": 168, "thumbs": 1, "gdelt": 1}
+             "ca_ag": 24, "hhs_ocr": 24, "wikidata": 1, "misp_galaxy": 168, "thumbs": 1}
+# "gdelt" runs only when asked for (--sources gdelt): from GitHub's runners it answered 4 of 29
+# searches in two 30-minute runs (2026-10-14), so in the hourly run it only burns the deadline.
 # "thumbs" (owner decision 2026-10-14): header crops are STORED again but never served - 0115
 # found them readable at 400 px, so nothing reads them until a human approves each one.
 CADENCE_H.update({f.source_id: 1 for f in sources_news.FEEDS})
@@ -519,7 +521,7 @@ def link_media_from_feeds(cur) -> dict:
                     order by r.record->>'url', r.version desc""")
     rows = []
     for sid, url, title, published in cur.fetchall():
-        if not title or not sources_media._BREACH.search(title):
+        if not title or not sources_media.TITLE_EVENT.search(title):
             continue
         try:
             pub = datetime.fromisoformat(published).date() if published else None
@@ -528,6 +530,8 @@ def link_media_from_feeds(cur) -> dict:
         for vid, seen in set(sources_media.find_in_title(title, idx)):
             if sources_media.in_window(pub, seen):
                 rows.append((vid, url[:2000], title[:500], url.split("/")[2][:200], published, "rss:" + sid))
+    # A rebuild replaces: a link that no longer passes the current rule is removed.
+    cur.execute("delete from breach_core.victim_media where found_via like 'rss:%'")
     if rows:
         with cur.connection.pipeline():
             cur.executemany("""insert into breach_core.victim_media (victim_id, url, title, outlet, published_at, found_via, match_basis)
