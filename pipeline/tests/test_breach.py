@@ -395,3 +395,28 @@ def test_placeholder_dates_rejected():
     ds, _ = sources_reg.parse_de([{"company_name": "Acme", "date_of_notice": "2026-09-25T00:00:00.000",
                                     "date_of_breach": "1971-01-01T00:00:00.000", "total_affected": "10"}])
     assert ds[0].event_date is None and ds[0].as_of.year == 2026
+
+
+def test_wikidata_size_latest_dated_value_wins():
+    from zdc_breach import sources_size
+    p = {"results": {"bindings": [
+        {"item": {"value": "http://www.wikidata.org/entity/Q1"}, "url": {"value": "https://www.acme.com/"},
+         "emp": {"value": "1000"}, "t": {"value": "2018-01-01T00:00:00Z"}},
+        {"item": {"value": "http://www.wikidata.org/entity/Q1"}, "url": {"value": "https://www.acme.com/"},
+         "emp": {"value": "1500"}, "t": {"value": "2024-01-01T00:00:00Z"}},
+        {"item": {"value": "http://www.wikidata.org/entity/Q1"}, "url": {"value": "https://www.acme.com/"},
+         "emp": {"value": "9999"}},
+        {"item": {"value": "http://www.wikidata.org/entity/Q2"}, "url": {"value": "https://other.org"},
+         "emp": {"value": "5"}}]}}
+    got = sources_size.parse(p, ["acme.com"])
+    assert got == {"acme.com": (1500, date(2024, 1, 1), "Q1")}
+    assert "https://www.acme.com/" in sources_size.variants("acme.com") and len(sources_size.variants("acme.com")) == 8
+
+
+def test_headcount_from_leak_post():
+    f = sources_leak.employees_stated
+    assert f("Around 630 employees work at Placer.ai after 150 layoffs") == 630
+    assert f("operating in 25+ countries with 250–400 employees.") == 250
+    assert f("around 2,000 employees in 36 countries") == 2000
+    assert f("We stole the data of 5,000 employees and customers") is None
+    assert f("Files: 746,108 Data volume: 106.8 GB") is None

@@ -27,7 +27,7 @@ import psycopg
 
 from zdc_kev import db as runs_db
 
-from . import db, evals, extract, http, reconcile, resolve, sources_leak, sources_news, sources_reg
+from . import db, evals, extract, http, reconcile, resolve, sources_leak, sources_news, sources_reg, sources_size
 from .fx import Fx
 from .llm import MODEL, BudgetExceeded, OpenRouter
 from .normalize import norm_country, norm_domain
@@ -37,7 +37,7 @@ log = logging.getLogger("zdc_breach")
 
 # source_id -> minimum hours between fetches
 CADENCE_H = {"ransomlook": 1, "ransomfeed": 1, "sec_8k": 1, "wa_ag": 6, "de_ag": 6, "hibp": 6,
-             "ca_ag": 24, "hhs_ocr": 24}
+             "ca_ag": 24, "hhs_ocr": 24, "wikidata": 1}
 CADENCE_H.update({f.source_id: 1 for f in sources_news.FEEDS})
 
 RANSOMLOOK_URL = "https://www.ransomlook.io/api/last/2"
@@ -268,6 +268,58 @@ def run_sec(ctx, cur) -> dict:
                 store_doc(cur, "sec_8k", d.url, f"{d.organization} 8-K", None, text, d.source_record_id)
                 extracted += 1
     return {"parsed": len(items), "malformed": bad, **counts, "documents": extracted}
+
+
+# ---- organisation size (Wikidata) ------------------------------------------------------------
+SIZE_BATCH = 25
+SIZE_PER_RUN = 300
+SIZE_RETRY_DAYS = 90
+
+
+def run_size(ctx, cur) -> dict:
+    """Employees for domains we hold (organisations and leak victims) that were never looked up,
+    or whose last lookup is older than 90 days, newest victims first."""
+    cur.execute("""with d as (
+                       select victim_domain as domain, max(first_seen_at) as seen from breach_core.leak_claims
+                        where victim_domain is not null group by 1
+                       union all
+                       select domain, max(created_at) from breach_core.organizations where domain is not null group by 1)
+                   select d.domain from d
+                     left join breach_core.org_sizes z using (domain)
+                    where z.domain is null or z.looked_up_at < now() - make_interval(days => %s)
+                    group by d.domain order by max(d.seen) desc limit %s""", (SIZE_RETRY_DAYS, SIZE_PER_RUN))
+    todo = [r[0] for r in cur.fetchall()]
+    found = missing = errors = 0
+    rows = []
+    for i in range(0, len(todo), SIZE_BATCH):
+        batch = todo[i:i + SIZE_BATCH]
+        f = http.post_form(sources_size.ENDPOINT, {"query": sources_size.query(batch), "format": "json"},
+                           accept="application/sparql-results+json")
+        ctx.report["sources"].setdefault("wikidata", {})["http"] = f.status
+        db.record_fetch(cur, ctx.run_id, "wikidata", f, len(batch) if f.ok else None)
+        if not f.ok:
+            errors += len(batch)
+            rows += [(d, "error", None, None, None) for d in batch]
+            continue
+        hit = sources_size.parse(sources_size.body_json(f.body), batch)
+        for d in batch:
+            if d in hit:
+                emp, as_of, qid = hit[d]
+                rows.append((d, "ok", emp, as_of, qid))
+                found += 1
+            else:
+                rows.append((d, "not_found", None, None, None))
+                missing += 1
+    if rows:
+        with cur.connection.pipeline():
+            cur.executemany("""insert into breach_core.org_sizes (domain, outcome, employees, employees_as_of, wikidata_qid, looked_up_at)
+                               values (%s,%s,%s,%s,%s, now())
+                               on conflict (domain) do update set outcome = excluded.outcome, employees = excluded.employees,
+                                   employees_as_of = excluded.employees_as_of, wikidata_qid = excluded.wikidata_qid,
+                                   looked_up_at = now()""", rows)
+    if todo and errors == len(todo):
+        raise RuntimeError("every Wikidata batch failed")
+    return {"looked_up": len(todo), "found": found, "not_found": missing, "errors": errors}
 
 
 # ---- news ------------------------------------------------------------------------------------
@@ -501,6 +553,8 @@ def run(conn, args, getter=http.get, llm=None, fx=None) -> dict:
                         res = run_leak(ctx, cur, source_id)
                     elif source_id == "sec_8k":
                         res = run_sec(ctx, cur)
+                    elif source_id == "wikidata":
+                        res = run_size(ctx, cur)
                     elif source_id in feeds:
                         res = run_feed(ctx, cur, feeds[source_id])
                     else:

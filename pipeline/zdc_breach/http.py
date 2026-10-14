@@ -97,3 +97,20 @@ def get(url: str, *, timeout: int = 60, retries: int = 2, sleep=time.sleep,
                 continue
             return last
     return last  # pragma: no cover
+
+
+def post_form(url: str, form: dict, *, timeout: int = 90, accept: str = "*/*", opener=None) -> Fetched:
+    """A form POST (Wikidata's query service takes long queries this way). Same recording as get()."""
+    import urllib.parse
+    op = opener or _OPENER
+    req = urllib.request.Request(url, data=urllib.parse.urlencode(form).encode(), method="POST",
+                                 headers={"User-Agent": UA, "Accept": accept,
+                                          "Content-Type": "application/x-www-form-urlencoded"})
+    started = datetime.now(timezone.utc)
+    try:
+        with op.open(req, timeout=timeout) as r:
+            return Fetched(url, r.status, r.read(20_000_000), None, started, datetime.now(timezone.utc), dict(r.headers))
+    except urllib.error.HTTPError as e:
+        return Fetched(url, e.code, b"", f"HTTP {e.code}", started, datetime.now(timezone.utc), dict(e.headers or {}))
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return Fetched(url, 0, b"", f"{type(e).__name__}"[:200], started, datetime.now(timezone.utc), {})

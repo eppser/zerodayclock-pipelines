@@ -107,15 +107,16 @@ def upsert_leak_posts(cur, posts) -> dict:
         return counts
     groups = sorted({p.actor_group for p in posts})
     cur.execute("""select claim_key, actor_group, victim_domain, victim_norm, first_seen_at, last_seen_at,
-                          trackers, tracker_refs, country, sector
+                          trackers, tracker_refs, country, sector, employees_stated
                      from breach_core.leak_claims
                     where actor_group = any(%s) and first_seen_at between %s and %s""",
                 (groups, posts[0].seen_at - LEAK_WINDOW, posts[-1].seen_at + LEAK_WINDOW))
     by_group: dict = {}
-    for key, grp, dom, norm, first, last, trackers, refs, country, sector in cur.fetchall():
+    for key, grp, dom, norm, first, last, trackers, refs, country, sector, emp in cur.fetchall():
         by_group.setdefault(grp, []).append({"key": key, "domain": dom, "norm": norm, "first": first, "last": last,
                                              "trackers": list(trackers), "refs": list(refs or []),
-                                             "country": country, "sector": sector, "dirty": False, "new": False})
+                                             "country": country, "sector": sector, "employees": emp,
+                                             "dirty": False, "new": False})
     for p in posts:
         ref = {"source_id": p.source_id, "id": p.source_record_id}
         cands = [c for c in by_group.get(p.actor_group, [])
@@ -125,12 +126,15 @@ def upsert_leak_posts(cur, posts) -> dict:
             c = min(cands, key=lambda c: abs((c["first"] - p.seen_at).total_seconds()))
             if ref in c["refs"]:
                 counts["already"] += 1
+                if c["employees"] is None and p.employees:
+                    c["employees"], c["dirty"] = p.employees, True
                 continue
             c["refs"].append(ref)
             c["trackers"] = sorted(set(c["trackers"]) | {p.source_id})
             c["domain"] = c["domain"] or p.victim_domain
             c["country"] = c["country"] or p.country
             c["sector"] = c["sector"] or p.sector
+            c["employees"] = c["employees"] or p.employees
             c["first"], c["last"] = min(c["first"], p.seen_at), max(c["last"], p.seen_at)
             c["dirty"] = True
             counts["joined"] += 1
@@ -143,7 +147,7 @@ def upsert_leak_posts(cur, posts) -> dict:
             by_group.setdefault(p.actor_group, []).append(
                 {"key": key, "domain": p.victim_domain, "norm": p.victim_norm, "first": p.seen_at, "last": p.seen_at,
                  "trackers": [p.source_id], "refs": [ref], "country": p.country, "sector": p.sector,
-                 "dirty": True, "new": True, "group": p.actor_group, "name": p.victim_name})
+                 "employees": p.employees, "dirty": True, "new": True, "group": p.actor_group, "name": p.victim_name})
             counts["new_claims"] += 1
     inserts, updates = [], []
     for grp, cs in by_group.items():
@@ -152,19 +156,20 @@ def upsert_leak_posts(cur, posts) -> dict:
                 continue
             if c["new"]:
                 inserts.append((c["key"], grp, c["name"], c["norm"], c["domain"], c["country"], c["sector"],
-                                c["first"], c["last"], c["trackers"], Jsonb(c["refs"])))
+                                c["first"], c["last"], c["trackers"], Jsonb(c["refs"]), c["employees"]))
             else:
                 updates.append((c["trackers"], Jsonb(c["refs"]), c["domain"], c["country"], c["sector"],
-                                c["first"], c["last"], c["key"]))
+                                c["first"], c["last"], c["employees"], c["key"]))
     with cur.connection.pipeline():
         if inserts:
             cur.executemany("""insert into breach_core.leak_claims (claim_key, actor_group, victim_name, victim_norm,
-                                   victim_domain, country, sector, first_seen_at, last_seen_at, trackers, tracker_refs)
-                               values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) on conflict (claim_key) do nothing""", inserts)
+                                   victim_domain, country, sector, first_seen_at, last_seen_at, trackers, tracker_refs,
+                                   employees_stated)
+                               values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) on conflict (claim_key) do nothing""", inserts)
         if updates:
             cur.executemany("""update breach_core.leak_claims set trackers = %s, tracker_refs = %s,
                                    victim_domain = %s, country = %s, sector = %s,
-                                   first_seen_at = %s, last_seen_at = %s
+                                   first_seen_at = %s, last_seen_at = %s, employees_stated = %s
                                 where claim_key = %s""", updates)
     return counts
 

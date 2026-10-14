@@ -175,10 +175,11 @@ def test_end_to_end(conn):
     claims = q(conn, "select actor_group, trackers from breach_core.leak_claims order by actor_group, first_seen_at")
     assert ("qilin", ["ransomfeed", "ransomlook"]) in claims
     assert sum(1 for g, _ in claims if g == "akira") == 2
-    # only filed or confirmed incidents are public; a claimed-only victim never is
-    public = {r[0] for r in q(conn, "select organization from public.breach_incidents")}
-    assert "Only Claimed GmbH" not in public and "Twin Filing Corp" in public
-    assert not q(conn, "select 1 from public.breach_leak_claims_monthly where actor_group = 'only claimed gmbh'")
+    # 0105: every victim is named with its status; a leak-only victim appears as a claim
+    public = dict(q(conn, "select organization, status from public.breach_incidents"))
+    assert public["Twin Filing Corp"] == "filed_with_regulator"
+    leak = dict(q(conn, "select victim_name, status from public.breach_leak_victims"))
+    assert leak["Only Claimed GmbH"] == "claimed_by_attackers"
 
 
 def test_same_event_date_merges_near_date_links(conn):
@@ -212,16 +213,18 @@ def test_llm_facts_hidden_until_extractor_active(conn):
     assert ("quote_not_in_document",) in rejected
 
 
-def test_news_alone_does_not_publish_but_attaches_by_domain(conn):
+def test_news_alone_never_confirms(conn):
     brun.run(conn, args(), getter=fake_get, llm=FakeLLM(), fx=NoFx())
     activate(conn)
     acme = q(conn, """select i.media_reported, i.victim_confirmed, i.actor_claimed
                         from breach_core.incidents i join breach_core.organizations o using (org_id)
                        where o.domain = 'acmewidgets.example' order by i.first_public_date""")
     assert acme and all(r[0] or r[2] for r in acme)
-    # the article's 'said in a statement' is not trusted while the extractor is inactive
+    # an article never sets victim_confirmed (advisor review 2); the incident is public with the
+    # status the evidence supports (0105), never "confirmed"
     assert not any(r[1] for r in acme)
-    assert not q(conn, "select 1 from public.breach_incidents where domain = 'acmewidgets.example'")
+    statuses = {r[0] for r in q(conn, "select status from public.breach_incidents where domain = 'acmewidgets.example'")}
+    assert statuses and "confirmed_by_victim" not in statuses
 
 
 def test_second_run_changes_nothing_and_facts_are_deterministic(conn):

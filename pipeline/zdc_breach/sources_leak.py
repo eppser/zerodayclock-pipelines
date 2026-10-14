@@ -17,10 +17,31 @@ not polled until the owner decides (docs/decisions/0006).
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from .normalize import domain_from_title, norm_country, norm_domain, norm_name
+
+
+_EMPLOYEES = re.compile(
+    r"(?:around|about|approximately|roughly|over|more than|nearly|with|has|employs|employing|"
+    r"workforce of|team of|staff of)\s+(\d{1,3}(?:,\d{3})+|\d+)(?:\s*[\u2013-]\s*\d[\d,]*)?\+?\s+"
+    r"(?:employees|staff|workers|people)\b", re.I)
+_NOT_HEADCOUNT = re.compile(r"(data|records|information|files|details|documents|belonging|stolen|leaked|of)\W*$", re.I)
+
+
+def employees_stated(text: str | None) -> int | None:
+    """A company headcount stated in a leak post ("around 630 employees work at ...", "with
+    250-400 employees"); the lower bound of a range. A number that counts whose data was taken
+    ("data of 5,000 employees") is not a headcount and is refused."""
+    for m in _EMPLOYEES.finditer(text or ""):
+        if _NOT_HEADCOUNT.search((text or "")[max(0, m.start() - 25):m.start()]):
+            continue
+        n = int(m.group(1).replace(",", ""))
+        if 0 < n < 5_000_000:
+            return n
+    return None
 
 
 @dataclass(frozen=True)
@@ -34,6 +55,10 @@ class LeakPost:
     sector: str | None
     seen_at: datetime
     record: dict
+
+    @property
+    def employees(self) -> int | None:
+        return employees_stated(str(self.record.get("description") or ""))
 
     @property
     def victim_norm(self) -> str:

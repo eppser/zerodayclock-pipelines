@@ -70,16 +70,19 @@ def budget(report) -> EvalResult:
                       if not stopped else f"extraction stopped: {stopped}", {"llm": report["llm"]})
 
 
-def no_unconfirmed_names_public(cur) -> EvalResult:
-    """The rule that matters most: no organisation reaches the public view on a criminal's or a
-    journalist's say-so alone. Asserted against the live view, every run."""
-    cur.execute("""select count(*) from public.breach_incidents p
-                     join breach_core.incidents i using (incident_id)
-                    where not (i.victim_confirmed or i.regulator_filed) or i.suppressed""")
-    n = cur.fetchone()[0]
-    return EvalResult("no_unconfirmed_names_public", ERROR, n == 0,
-                      "every published incident is victim-confirmed or regulator-filed" if n == 0
-                      else f"{n} published incident(s) lack confirmation", {"violations": n})
+def public_rows_have_status(cur) -> EvalResult:
+    """Owner decision 2026-10-14 (migration 0105): every victim is named, and every named row
+    says how we know - filed, confirmed, reported, or only claimed by attackers. A row with no
+    status, or a suppressed incident still on the page, fails the run."""
+    cur.execute("""select count(*) filter (where p.status is null),
+                          count(*) filter (where i.suppressed)
+                     from public.breach_incidents p join breach_core.incidents i using (incident_id)""")
+    no_status, suppressed = cur.fetchone()
+    ok = no_status == 0 and suppressed == 0
+    return EvalResult("public_rows_have_status", ERROR, ok,
+                      "every published incident carries a status; none is suppressed" if ok
+                      else f"{no_status} without a status, {suppressed} suppressed but published",
+                      {"no_status": no_status, "suppressed": suppressed})
 
 
 def unit_integrity(cur) -> EvalResult:
@@ -120,7 +123,7 @@ def run_all(cur, ctx) -> list[EvalResult]:
     r = ctx.report
     return [sources_answered(r), leak_not_silently_empty(r), regulators_not_silently_empty(r),
             records_parse(r), quote_offsets_valid(ctx.new_quotes), budget(r),
-            no_unconfirmed_names_public(cur), unit_integrity(cur), placeholders_excluded(cur),
+            public_rows_have_status(cur), unit_integrity(cur), placeholders_excluded(cur),
             censoring(cur),
             EvalResult("claims_gate", INFO, True,
                        f"{r['claims']['accepted']} accepted, {r['claims']['rejected']} rejected",
