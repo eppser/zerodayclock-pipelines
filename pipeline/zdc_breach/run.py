@@ -27,7 +27,8 @@ import psycopg
 
 from zdc_kev import db as runs_db
 
-from . import confidence, db, evals, extract, http, reconcile, resolve, sources_leak, sources_news, sources_reg, sources_size, thumbs
+from . import (confidence, db, evals, extract, http, reconcile, resolve, sources_actors, sources_leak, sources_media,
+               sources_news, sources_reg, sources_size, thumbs)
 from .fx import Fx
 from .llm import MODEL, BudgetExceeded, OpenRouter
 from .normalize import norm_country, norm_domain
@@ -37,8 +38,9 @@ log = logging.getLogger("zdc_breach")
 
 # source_id -> minimum hours between fetches
 CADENCE_H = {"ransomlook": 1, "ransomfeed": 1, "sec_8k": 1, "wa_ag": 6, "de_ag": 6, "hibp": 6,
-             "ca_ag": 24, "hhs_ocr": 24, "wikidata": 1}
-# "thumbs" is withdrawn (migration 0115): at 400 px a text-only leak page stayed readable.
+             "ca_ag": 24, "hhs_ocr": 24, "wikidata": 1, "misp_galaxy": 168, "thumbs": 1, "gdelt": 1}
+# "thumbs" (owner decision 2026-10-14): header crops are STORED again but never served - 0115
+# found them readable at 400 px, so nothing reads them until a human approves each one.
 CADENCE_H.update({f.source_id: 1 for f in sources_news.FEEDS})
 
 RANSOMLOOK_URL = "https://www.ransomlook.io/api/last/2"
@@ -324,14 +326,25 @@ def run_size(ctx, cur) -> dict:
 
 
 # ---- leak-post header thumbnails -------------------------------------------------------------
-THUMBS_PER_RUN = 30
-THUMB_DAYS = 90
+THUMBS_PER_RUN = 150
+THUMB_DAYS = 3650
 
 
 def run_thumbs(ctx, cur) -> dict:
-    # Withdrawn by 0115 (advisor review 2026-10-14): header crops still showed stolen-data text.
-    # Kept callable only so an explicit --sources thumbs fails safe instead of erroring.
-    return {"withdrawn": True}
+    """Header crops, stored privately (0115 withdrew serving them; the owner kept storing them,
+    2026-10-14). Also records RansomLook's own screenshot URL on every claim that has one."""
+    cur.execute("""update breach_core.leak_claims c set screenshot_url = 'https://www.ransomlook.io/' || replace(r.screen, ' ', '%20')
+                     from (select distinct on (c2.claim_key) c2.claim_key, r2.record->>'screen' as screen
+                             from breach_core.leak_claims c2
+                             cross join lateral jsonb_array_elements(c2.tracker_refs) ref
+                             join lateral (select record from breach_raw.source_records x
+                                            where x.source_id = 'ransomlook' and x.source_record_id = ref->>'id'
+                                            order by version desc limit 1) r2 on true
+                            where c2.screenshot_url is null and ref->>'source_id' = 'ransomlook'
+                              and coalesce(r2.record->>'screen', '') ~ '^screenshots/[^.][^[:space:]]*$'
+                            order by c2.claim_key) r
+                    where c.claim_key = r.claim_key""")
+    linked = cur.rowcount
     cur.execute("""select c.claim_key, r.record->>'screen'
                      from breach_core.leak_claims c
                      cross join lateral jsonb_array_elements(c.tracker_refs) ref
@@ -364,7 +377,125 @@ def run_thumbs(ctx, cur) -> dict:
             cur.execute("""insert into breach_core.thumb_attempts (claim_key, last_error) values (%s,%s)
                            on conflict (claim_key) do update set attempts = breach_core.thumb_attempts.attempts + 1,
                                last_error = excluded.last_error, last_at = now()""", (key, f"{type(e).__name__}"[:200]))
-    return {"made": made, "failed": failed}
+    return {"made": made, "failed": failed, "screenshot_urls": linked}
+
+
+# ---- actor registry (MISP galaxies + RansomLook groups) ---------------------------------------
+def run_actors(ctx, cur) -> dict:
+    got = {}
+    for sid, url in (("misp_galaxy", sources_actors.MISP_ACTORS), ("misp_galaxy", sources_actors.MISP_RANSOMWARE),
+                     ("ransomlook_groups", sources_actors.RANSOMLOOK_GROUPS)):
+        f = _fetch(ctx, cur, sid, url, accept="application/json", timeout=120, max_bytes=40_000_000)
+        db.record_fetch(cur, ctx.run_id, sid, f, None)
+        if not f.ok:
+            raise RuntimeError(f"{url.rsplit('/', 1)[-1]}: {f.error or f'HTTP {f.status}'}")
+        got[url] = sources_actors.body_json(f.body)
+    actors, aliases = sources_actors.build(got[sources_actors.MISP_ACTORS], got[sources_actors.MISP_RANSOMWARE],
+                                           got[sources_actors.RANSOMLOOK_GROUPS])
+    if len(actors) < 500:
+        raise RuntimeError(f"only {len(actors)} actors parsed; refusing to replace the registry")
+    # A rebuild replaces: an actor the galaxies dropped must not linger.
+    cur.execute("delete from breach_core.actor_aliases")
+    cur.execute("delete from breach_core.actors")
+    with cur.connection.pipeline():
+        cur.executemany("""insert into breach_core.actors (actor_id, display_name, kind, motive, sponsor_country,
+                               listed_ransomware, aliases, sources, refs) values (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                        [(a.actor_id, a.display_name[:200], a.kind, a.motive, a.sponsor_country, a.listed_ransomware,
+                          sorted(a.aliases)[:200], sorted(a.sources), a.refs) for a in actors])
+        cur.executemany("insert into breach_core.actor_aliases (alias_norm, actor_id, alias, source) values (%s,%s,%s,%s)",
+                        [(n, aid, alias[:200], src) for n, (aid, alias, src) in aliases.items()])
+    db.mark_source(cur, "ransomlook_groups", True)
+    return {"actors": len(actors), "aliases": len(aliases),
+            "state_sponsored": sum(a.kind == "state_sponsored" for a in actors)}
+
+
+# ---- what leak posts state about the victim --------------------------------------------------
+def parse_leak_facts(cur, limit=20000) -> dict:
+    """Data size and revenue the group states, parsed once per claim from the stored posts."""
+    cur.execute("""select c.claim_key, string_agg(coalesce(r.record->>'description', '') || ' ' ||
+                                               coalesce(r.record->>'victim_notes', ''), ' || ')
+                     from breach_core.leak_claims c
+                     cross join lateral jsonb_array_elements(c.tracker_refs) ref
+                     join lateral (select record from breach_raw.source_records x
+                                    where x.source_id = ref->>'source_id' and x.source_record_id = ref->>'id'
+                                    order by version desc limit 1) r on true
+                    where c.stated_parsed_at is null
+                    group by c.claim_key limit %s""", (limit,))
+    rows = []
+    for key, text in cur.fetchall():
+        rows.append((sources_leak.data_size_stated(text), sources_leak.revenue_stated(text), key))
+    if rows:
+        with cur.connection.pipeline():
+            cur.executemany("""update breach_core.leak_claims set data_bytes_stated = %s, revenue_usd_stated = %s,
+                                   stated_parsed_at = now() where claim_key = %s""", rows)
+    return {"parsed": len(rows), "size": sum(1 for r in rows if r[0]), "revenue": sum(1 for r in rows if r[1])}
+
+
+# ---- news coverage per victim (GDELT) --------------------------------------------------------
+MEDIA_PER_RUN = 60
+MEDIA_RESEARCH_DAYS = 30
+
+
+def run_media(ctx, cur) -> dict:
+    """Victims never searched first - regulator-filed and press-reported before leak claims,
+    newest first; a recent victim (<180 days) is searched again after 30 days, as coverage grows."""
+    import time
+    cur.execute("""select v.victim_id, v.name, v.seen_date
+                     from breach_core.victims_list v
+                     left join breach_core.media_search_state s using (victim_id)
+                    where v.name is not null
+                      and (s.victim_id is null
+                           or (s.status = 'ok' and s.searched_at < now() - make_interval(days => %s)
+                               and v.seen_date > current_date - 180))
+                    order by (s.victim_id is null) desc, (v.kind = 'incident') desc, v.seen_date desc nulls last
+                    limit %s""", (MEDIA_RESEARCH_DAYS, MEDIA_PER_RUN * 3))
+    todo = cur.fetchall()
+    today = datetime.now(timezone.utc).date()
+    searched = found = skipped = 0
+    state = []
+    for vid, name, seen in todo:
+        if searched >= MEDIA_PER_RUN or datetime.now(timezone.utc) > ctx.deadline - timedelta(minutes=2):
+            break
+        url = sources_media.query_url(name, seen or today, today) if sources_media.searchable(name) else None
+        if url is None:
+            state.append((vid, "not_searchable", 0))
+            skipped += 1
+            continue
+        if searched:
+            time.sleep(sources_media.PACE_S)
+        f = _fetch(ctx, cur, "gdelt", url, accept="application/json", timeout=60)
+        searched += 1
+        if f.status == 429:
+            db.record_fetch(cur, ctx.run_id, "gdelt", f, None)
+            ctx.report["sources"].setdefault("gdelt", {})["rate_limited"] = True
+            break      # GDELT asked us to slow down; the rest wait for the next run
+        if not f.ok:
+            db.record_fetch(cur, ctx.run_id, "gdelt", f, None)
+            state.append((vid, "error", 0))
+            continue
+        try:
+            payload = f.json()
+        except ValueError:
+            payload = {}    # GDELT answers a bad query with a plain-text message
+        hits = sources_media.parse(payload, name)
+        db.record_fetch(cur, ctx.run_id, "gdelt", f, len(hits))
+        for h in hits:
+            cur.execute("""insert into breach_core.victim_media (victim_id, url, title, outlet, published_at, language,
+                               found_via, match_basis) values (%s,%s,%s,%s,%s,%s,'gdelt','title_names_victim_and_breach')
+                           on conflict (victim_id, url) do nothing""",
+                        (vid, h["url"], h["title"], h["outlet"], h["published_at"], h["language"]))
+        found += len(hits)
+        state.append((vid, "ok", len(hits)))
+    if state:
+        cur.executemany("""insert into breach_core.media_search_state (victim_id, status, n_found) values (%s,%s,%s)
+                           on conflict (victim_id) do update set status = excluded.status, n_found = excluded.n_found,
+                               searched_at = now()""", state)
+    answered = [x for x in state if x[1] in ("ok", "error")]
+    if ctx.report["sources"].get("gdelt", {}).get("rate_limited") and not any(x[1] == "ok" for x in answered):
+        raise RuntimeError("GDELT rate-limited this runner before any search completed")
+    if answered and all(x[1] == "error" for x in answered):
+        raise RuntimeError("every GDELT search failed")
+    return {"searched": searched, "links": found, "not_searchable": skipped}
 
 
 # ---- news ------------------------------------------------------------------------------------
@@ -602,6 +733,10 @@ def run(conn, args, getter=http.get, llm=None, fx=None) -> dict:
                         res = run_size(ctx, cur)
                     elif source_id == "thumbs":
                         res = run_thumbs(ctx, cur)
+                    elif source_id == "misp_galaxy":
+                        res = run_actors(ctx, cur)
+                    elif source_id == "gdelt":
+                        res = run_media(ctx, cur)
                     elif source_id in feeds:
                         res = run_feed(ctx, cur, feeds[source_id])
                     else:
@@ -627,6 +762,7 @@ def run(conn, args, getter=http.get, llm=None, fx=None) -> dict:
             ctx.report["actor_links"] = link_leak_claims(cur)
             ctx.report["incident_facts"] = reconcile.build(cur)
             ctx.report["confidence_rows"] = confidence.build(cur)
+            ctx.report["leak_facts"] = parse_leak_facts(cur)
             # The public list and its facet counts (0117, 0118): computed once per run, not per
             # request - the live view took 17 s with the API's column list.
             cur.execute("select breach_core.rebuild_victims_list()")
@@ -708,7 +844,9 @@ def main(argv=None) -> int:
         print(text)
         return 0 if all(v.get("ok") for v in res.values()) else 1
     llm = None
-    if not args.no_llm:
+    # OpenRouter extraction is OFF unless BREACH_LLM=openrouter (owner, 2026-10-14: fill the data
+    # with Claude subagents for now - zdc_breach.agent_load - and bring OpenRouter back later).
+    if not args.no_llm and os.environ.get("BREACH_LLM", "") == "openrouter":
         key = os.environ.get("OPENROUTER_API_KEY", "")
         if key:
             with conn.cursor() as cur:

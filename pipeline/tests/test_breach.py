@@ -448,3 +448,64 @@ def test_wilson_interval():
     r, lo, hi = confidence.wilson(5, 100)
     assert r == 0.05 and 0.01 < lo < 0.05 < hi < 0.12
     assert confidence.wilson(0, 0) == (None, None, None)
+
+
+# ---- 0119: actors, media, leak-stated facts ----------------------------------------------------
+def test_actor_registry_merges_aliases_and_drops_shared_ones():
+    from zdc_breach import sources_actors as sa
+    misp = {"values": [
+        {"value": "APT28", "meta": {"synonyms": ["Fancy Bear", "Sednit"], "cfr-suspected-state-sponsor": "Russian Federation",
+                                    "cfr-type-of-incident": ["Espionage"], "refs": ["https://example.org/apt28"]}},
+        {"value": "Storm-1567", "meta": {"synonyms": ["Akira"]}},
+        {"value": "Alpha", "meta": {"synonyms": ["Shared Name"]}},
+        {"value": "Beta", "meta": {"synonyms": ["Shared Name"]}},
+        {"value": "Defacers", "meta": {"motive": "Hacktivists-Nationalists"}},
+    ]}
+    rw = {"values": [{"value": "Akira Ransomware", "meta": {}}, {"value": "LockBit", "meta": {"synonyms": ["LockBit 3.0"]}}]}
+    actors, aliases = sa.build(misp, rw, ["akira", "lockbit", "qilin"])
+    by = {a.actor_id: a for a in actors}
+    assert aliases["fancybear"][0] == aliases["sednit"][0] == "apt28"
+    assert by["apt28"].kind == "state_sponsored" and by["apt28"].sponsor_country == "RU" and by["apt28"].motive == "espionage"
+    assert aliases["akira"][0] == "storm-1567" and by["storm-1567"].display_name == "Akira"   # not the tracking code
+    assert by["storm-1567"].kind == "extortion" and by["storm-1567"].listed_ransomware
+    assert by["rl-lockbit"].listed_ransomware and not by["rl-qilin"].listed_ransomware
+    assert "sharedname" not in aliases                     # two actors claim it: dropped, not guessed
+    assert by["defacers"].kind == "hacktivist"
+
+
+def test_actor_norm_keeps_short_names_whole():
+    from zdc_breach.sources_actors import norm
+    assert norm("LockBit Ransomware") == "lockbit" and norm("Akira Team") == "akira"
+    assert norm("INC Ransom") == "incransom" and norm("Ransom House") == "ransomhouse"
+    assert norm("The Gentlemen") == norm("thegentlemen")
+
+
+def test_media_match_needs_the_name_in_the_title_and_a_breach_term():
+    from zdc_breach import sources_media as sm
+    assert sm.matches("Change Healthcare", "Change Healthcare confirms ransomware attack", "https://x.org/a")
+    assert not sm.matches("Change Healthcare", "UnitedHealth earnings beat", "https://x.org/ransomware-news")
+    assert not sm.matches("Acme", "Acmeville council meets on ransomware", "https://x.org/a")   # whole words only
+    assert sm.matches("Acme Corp", "Acme Corp quarterly results", "https://x.org/acme-corp-data-breach")
+    assert not sm.searchable("acme.com") and not sm.searchable("ABC") and sm.searchable("Acme Corp")
+    payload = {"articles": [
+        {"url": "https://news.example/a", "title": "Acme Corp hit by cyberattack", "seendate": "20250102T030405Z",
+         "domain": "news.example", "language": "English"},
+        {"url": "http://abc.onion/x", "title": "Acme Corp hit by cyberattack"},
+        {"url": "https://news.example/b", "title": "Acme Corp opens plant"}]}
+    got = sm.parse(payload, "Acme Corp")
+    assert [g["url"] for g in got] == ["https://news.example/a"] and got[0]["published_at"].year == 2025
+    from datetime import date
+    assert sm.query_url("Acme Corp", date(2016, 1, 1), date(2016, 6, 1)) is None    # before GDELT's index
+    assert "startdatetime=2024" in sm.query_url("Acme Corp", date(2024, 3, 1), date(2026, 10, 14))
+
+
+def test_leak_stated_size_and_revenue():
+    from zdc_breach import sources_leak as sl
+    assert sl.data_size_stated("We will upload 104gb corporate data soon.") == 104e9
+    assert sl.data_size_stated("Total size: 1,84Gb Revenue: $5,000,000") == 1.84e9
+    assert sl.data_size_stated("Stolen: 1.82 TB. 1,719,610 Files") == 1.82e12
+    assert sl.data_size_stated("The company makes 4K TVs with 2 TB drives") is None
+    assert sl.revenue_stated("Revenue: $17.4 Billion Website: amcor.com") == 17.4e9
+    assert sl.revenue_stated("estimated annual revenue of $19.1M with ~23-50 employees") == 19.1e6
+    assert sl.revenue_stated("Total size: 1,84Gb Revenue: <$5,000,000") is None      # a bound, not a value
+    assert sl.revenue_stated("Revenue: $5 Million | Views: 87") == 5e6

@@ -162,3 +162,61 @@ def claim_key(post: LeakPost) -> str:
     who = post.victim_domain or post.victim_norm
     bucket = int(post.seen_at.timestamp() // (14 * 86400))
     return f"{post.actor_group}|{who}|{bucket}"
+
+
+# ---- what the attackers state about the victim (migration 0119) --------------------------------
+# Numbers only, never text: the description around them can quote stolen data (0115). Stored as the
+# group's claim on leak_claims, never merged into regulator counts.
+_SIZE = re.compile(r"(\d{1,4}(?:[.,]\d{1,3})?)\s*(tb|gb|mb)\b", re.I)
+_SIZE_CUE = re.compile(r"\b(total size|size|stolen|upload|leak|exfiltrat|data|files|documents|archive|dump)", re.I)
+_UNIT = {"tb": 1e12, "gb": 1e9, "mb": 1e6}
+_REV = re.compile(
+    r"revenue[s]?\s*(?:[:\-]|of|is|was|about|around|approx\.?|~)?\s*(?:usd|us)?\s*\$\s?(\d[\d,]*(?:\.\d+)?)\s*(billion|bn|b|million|mln|mn|m|thousand|k)?\b"
+    r"|\$\s?(\d[\d,]*(?:\.\d+)?)\s*(billion|bn|b|million|mln|mn|m|thousand|k)?\s+(?:in\s+|of\s+|annual\s+)?(?:annual\s+)?revenue",
+    re.I)
+_MAG = {"billion": 1e9, "bn": 1e9, "b": 1e9, "million": 1e6, "mln": 1e6, "mn": 1e6, "m": 1e6, "thousand": 1e3, "k": 1e3}
+
+
+def _num(s: str) -> float | None:
+    s = s.strip()
+    # "1,234,567" thousands; "1,5" a decimal comma; "1.234.567" thousands
+    if re.fullmatch(r"\d{1,3}(,\d{3})+(\.\d+)?", s):
+        s = s.replace(",", "")
+    elif re.fullmatch(r"\d{1,3}(\.\d{3}){2,}", s):
+        s = s.replace(".", "")
+    else:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def data_size_stated(text: str | None) -> float | None:
+    """Bytes the post says were taken: the largest size in a sentence that talks about data."""
+    best = None
+    for sent in re.split(r"(?<=[.!?])\s+|\n+|\|", text or ""):
+        if not _SIZE_CUE.search(sent):
+            continue
+        for m in _SIZE.finditer(sent):
+            n = _num(m.group(1))
+            if n is None:
+                continue
+            b = n * _UNIT[m.group(2).lower()]
+            if 1e6 <= b <= 1e15:
+                best = max(best or 0, b)
+    return best
+
+
+def revenue_stated(text: str | None) -> float | None:
+    for m in _REV.finditer(text or ""):
+        if "<" in (text or "")[max(0, m.start() - 2):m.start() + m.group(0).find("$") + 1]:
+            continue    # "Revenue: <$5,000,000" is a bound, not a value
+        num, mag = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+        n = _num(num or "")
+        if n is None:
+            continue
+        v = n * _MAG.get((mag or "").lower(), 1)
+        if 1e4 <= v <= 2e12:
+            return v
+    return None
