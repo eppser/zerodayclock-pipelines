@@ -28,9 +28,14 @@ def record_fetch(cur, run_id, source_id: str, f: Fetched, n_records: int | None)
     return cur.fetchone()[0]
 
 
-def store_records(cur, source_id: str, items: list[tuple[str, dict]], fetch_id) -> tuple[dict, set]:
+def store_records(cur, source_id: str, items: list[tuple[str, dict]], fetch_id,
+                  limit: int | None = None) -> tuple[dict, set]:
     """Insert a new version only when a record's content changed. Returns the counts and the
-    ids that are new or changed - the only rows the caller needs to apply again."""
+    ids that are new or changed - the only rows the caller needs to apply again.
+
+    `limit` caps how many new or changed records one run writes. The rest are left unwritten,
+    so the next run sees them as new and takes the next slice: a first fill of thousands of
+    regulator rows spreads over several hourly runs instead of outliving the job's timeout."""
     if not items:
         return {"new": 0, "changed": 0, "unchanged": 0}, set()
     ids = list({i for i, _ in items})
@@ -50,6 +55,9 @@ def store_records(cur, source_id: str, items: list[tuple[str, dict]], fetch_id) 
         cur_v = current.get(rid)
         if cur_v and cur_v[1] == h:
             counts["unchanged"] += 1
+            continue
+        if limit is not None and len(changed) >= limit:
+            counts["deferred"] = counts.get("deferred", 0) + 1
             continue
         version = (cur_v[0] + 1) if cur_v else 1
         counts["changed" if cur_v else "new"] += 1

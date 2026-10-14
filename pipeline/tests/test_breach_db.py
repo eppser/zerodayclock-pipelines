@@ -132,7 +132,8 @@ SOURCES = "ransomlook,ransomfeed,wa_ag,ca_ag,hibp,sec_8k,news_hipaajournal,extra
 
 
 def args(**kw):
-    a = dict(sources=SOURCES, force=True, max_docs=10, sec_days=3, trigger="test", dry_run=False, report=None)
+    a = dict(sources=SOURCES, force=True, max_docs=10, sec_days=3, trigger="test", dry_run=False, report=None,
+             max_apply=2000)
     a.update(kw)
     return Namespace(**a)
 
@@ -280,3 +281,12 @@ def test_actor_attaches_only_by_domain(conn):
     assert {a for (a,) in actors} == {"qilin", "akira"}
     # the name-only German victim has no organisation to attach to
     assert q(conn, "select incident_id from breach_core.leak_claims where victim_domain = 'onlyclaimed.example'") == [(None,)]
+
+
+def test_first_fill_is_spread_over_runs(conn):
+    brun.run(conn, args(sources="ca_ag", max_apply=1), getter=fake_get, llm=None, fx=NoFx())
+    assert q(conn, "select count(*) from breach_raw.source_records where source_id = 'ca_ag'") == [(1,)]
+    brun.run(conn, args(sources="ca_ag", max_apply=1), getter=fake_get, llm=None, fx=NoFx())
+    assert q(conn, "select count(*) from breach_raw.source_records where source_id = 'ca_ag'") == [(2,)]
+    brun.run(conn, args(sources="ca_ag", max_apply=1), getter=fake_get, llm=None, fx=NoFx())
+    assert q(conn, "select count(*) from breach_raw.source_records where source_id = 'ca_ag'") == [(2,)]

@@ -30,6 +30,10 @@ on:
         description: 'Ignore per-source cadence'
         type: boolean
         default: false
+      backfill_leak_months:
+        description: 'Backfill RansomLook leak claims for N past months instead of the normal run (0 = normal run)'
+        type: string
+        default: '0'
       environment:
         description: 'Target environment'
         type: choice
@@ -100,7 +104,14 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           SOURCES: ${{ github.event.inputs.sources }}
           FORCE: ${{ github.event.inputs.force }}
+          BACKFILL: ${{ github.event.inputs.backfill_leak_months || '0' }}
         run: |
+          # A backfill is explicitly invoked and separate from the hourly stream (CLAUDE.md).
+          case "$BACKFILL" in ''|*[!0-9]*) echo "backfill_leak_months must be a number"; exit 1;; esac
+          if [ "$BACKFILL" -gt 0 ]; then
+            python -m zdc_breach.run --backfill-leak-months "$BACKFILL" --report breach-backfill.json > /dev/null
+            exit 0
+          fi
           python -m zdc_breach.run \
             ${SOURCES:+--sources "$SOURCES"} \
             $( [ "$FORCE" = "true" ] && echo --force ) \
@@ -140,6 +151,6 @@ jobs:
         if: always()
         with:
           name: breach-report-${{ github.run_id }}
-          path: pipeline/breach-report.json
+          path: pipeline/breach-*.json
           if-no-files-found: warn
           retention-days: 14

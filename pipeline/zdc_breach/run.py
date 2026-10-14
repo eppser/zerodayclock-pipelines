@@ -167,13 +167,28 @@ def run_structured(ctx, cur, source_id: str) -> dict:
         raise RuntimeError(f.error or f"HTTP {f.status}")
     items, bad = parse()
     fid = db.record_fetch(cur, ctx.run_id, source_id, f, len(items) + bad)
-    counts, changed = db.store_records(cur, source_id, [(d.source_record_id, d.record) for d in items], fid)
+    counts, changed = db.store_records(cur, source_id, [(d.source_record_id, d.record) for d in items], fid,
+                                       limit=ctx.args.max_apply)
     applied = 0
+    r = resolve.Resolver(cur)
     for d in items:
         if d.source_record_id in changed:
-            apply_disclosure(ctx, cur, d)
+            apply_disclosure_batched(r, d)
             applied += 1
+    r.flush()
     return {"parsed": len(items), "malformed": bad, **counts, "applied": applied}
+
+
+def apply_disclosure_batched(r: "resolve.Resolver", d: sources_reg.Disclosure):
+    country = "US" if d.source_id in US_REGULATORS else None
+    org, how = r.org(name=d.organization, domain=d.domain, cik=d.sec_cik, country=country, sector=d.sector)
+    inc, _ = r.incident(org_id=org, org_how=how, source_id=d.source_id, record_id=d.source_record_id,
+                        event_date=d.event_date, public_date=d.as_of)
+    r.flag(inc, d.basis)
+    for f in d.facts:
+        r.claim(incident_id=inc, field=f.field, value_num=f.value_num, value_text=f.value_text, unit=f.unit,
+                qualifier=f.qualifier, as_of=d.as_of, basis=d.basis, source_id=d.source_id,
+                source_record_id=d.source_record_id)
 
 
 def fetch_hhs(ctx) -> http.Fetched:
@@ -550,6 +565,8 @@ def main(argv=None) -> int:
     ap.add_argument("--force", action="store_true", help="ignore per-source cadence")
     ap.add_argument("--max-docs", type=int, default=40)
     ap.add_argument("--sec-days", type=int, default=3)
+    ap.add_argument("--max-apply", type=int, default=2000,
+                    help="new or changed rows applied per regulator source per run; the rest wait")
     ap.add_argument("--no-llm", action="store_true")
     ap.add_argument("--trigger", default=os.environ.get("GITHUB_EVENT_NAME", "manual"))
     ap.add_argument("--dry-run", action="store_true")

@@ -152,3 +152,146 @@ def add_claim(cur, *, incident_id: str, field: str, value_num=None, value_text=N
          amount_usd, fx_rate, fx_date, fx_source, as_of, basis, source_id, source_record_id,
          doc_sha256, quote, quote_start, quote_end, subject_match, extraction_id, accepted,
          reject_reason))
+
+
+# ---- batched form ------------------------------------------------------------------------------
+import uuid  # noqa: E402
+
+_CLAIM_SQL = """insert into breach_core.claims (incident_id, field, value_num, value_text, unit, qualifier,
+               money_kind, currency, amount_usd, fx_rate, fx_date, fx_source, as_of, basis, source_id,
+               source_record_id, doc_sha256, quote, quote_start, quote_end, subject_match,
+               extraction_id, accepted, reject_reason)
+           values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+           on conflict do nothing"""
+
+
+class Resolver:
+    """The rules above, unchanged, for a batch of structured rows.
+
+    MEASURED 2026-10-14: the per-row functions cost about a dozen round trips per regulator row,
+    and a GitHub runner sits ~100 ms from the database, so Washington's 1,000 rows took 15+
+    minutes and California's 5,300 would outlive the job. This reads the organisations, incidents,
+    links and overrides once, decides in memory, generates ids client-side and sends every write
+    in one pipelined batch. Same inputs, same decisions (tests run both paths)."""
+
+    def __init__(self, cur):
+        self.cur = cur
+        self.writes: list[tuple[str, tuple]] = []
+        cur.execute("""select org_id, norm_name, domain, country, sec_cik from breach_core.organizations
+                        order by created_at, org_id""")
+        self.by_cik, self.by_domain, self.by_name = {}, {}, {}
+        self.org_cik = {}
+        for oid, nn, dom, ctry, cik in cur.fetchall():
+            self._index_org(oid, nn, dom, ctry, cik)
+        cur.execute("""select org_id, incident_id, event_date, first_public_date from breach_core.incidents
+                        order by first_public_date, incident_id""")
+        self.incidents: dict = {}
+        for oid, iid, ev, pub in cur.fetchall():
+            self.incidents.setdefault(oid, []).append([iid, ev, pub])
+        cur.execute("select source_id, source_record_id, doc_sha256, incident_id from breach_core.incident_sources")
+        self.linked = {(s, r, d): i for s, r, d, i in cur.fetchall()}
+        cur.execute("select source_id, source_record_id, doc_sha256, incident_id from breach_core.match_overrides")
+        self.overrides = {(s, r, d): i for s, r, d, i in cur.fetchall()}
+        self.flags: set = set()
+
+    def _index_org(self, oid, nn, dom, ctry, cik):
+        if cik:
+            self.by_cik.setdefault(cik, oid)
+        if dom:
+            self.by_domain.setdefault(dom, oid)
+        self.by_name.setdefault((nn, ctry or ""), oid)
+        self.org_cik[oid] = cik
+
+    def org(self, *, name, domain=None, cik=None, country=None, sector=None):
+        nn, domain = norm_name(name), norm_domain(domain)
+        if cik and cik in self.by_cik:
+            return self.by_cik[cik], "sec_cik"
+        if domain and domain in self.by_domain:
+            oid = self.by_domain[domain]
+            if cik:
+                self.writes.append(("update breach_core.organizations set sec_cik = coalesce(sec_cik, %s) where org_id = %s", (cik, oid)))
+                self.by_cik.setdefault(cik, oid)
+                self.org_cik[oid] = self.org_cik.get(oid) or cik
+            return oid, "domain"
+        if nn:
+            oid = self.by_name.get((nn, country or ""))
+            if oid and (cik is None or self.org_cik.get(oid) in (None, cik)):
+                self.writes.append(("""update breach_core.organizations set domain = coalesce(domain, %s),
+                                          sec_cik = coalesce(sec_cik, %s), sector = coalesce(sector, %s)
+                                       where org_id = %s""", (domain, cik, sector, oid)))
+                if domain:
+                    self.by_domain.setdefault(domain, oid)
+                if cik:
+                    self.by_cik.setdefault(cik, oid)
+                    self.org_cik[oid] = self.org_cik.get(oid) or cik
+                return oid, "name"
+        oid = uuid.uuid4()
+        self.writes.append(("""insert into breach_core.organizations (org_id, display_name, norm_name, domain, country, sector, sec_cik)
+                               values (%s,%s,%s,%s,%s,%s,%s)""", (oid, name.strip()[:300], nn, domain, country, sector, cik)))
+        self._index_org(oid, nn, domain, country, cik)
+        return oid, "new"
+
+    def incident(self, *, org_id, org_how, source_id, record_id="", doc="", event_date, public_date):
+        key = (source_id, record_id or "", doc or "")
+        if key in self.linked:
+            return self.linked[key], "source_key"
+        method = incident = dup_of = None
+        if key in self.overrides and self.overrides[key]:
+            incident, method = self.overrides[key], "manual"
+        elif key not in self.overrides:
+            for inc in self.incidents.get(org_id, []):
+                inc_id, ev, pub = inc
+                if event_date and ev:
+                    close, same = abs(ev - event_date) <= EVENT_WINDOW, ev == event_date
+                else:
+                    close, same = abs(pub - public_date) <= PUBLIC_WINDOW, False
+                if not close:
+                    continue
+                if org_how in ("sec_cik", "domain"):
+                    incident, method = inc_id, org_how
+                    break
+                if same:
+                    incident, method = inc_id, "event_window"
+                    break
+                dup_of = dup_of or inc_id
+        if incident is None:
+            incident, method = uuid.uuid4(), method or "new"
+            self.writes.append(("""insert into breach_core.incidents (incident_id, org_id, event_date, first_public_date, possible_duplicate_of)
+                                   values (%s,%s,%s,%s,%s)""", (incident, org_id, event_date, public_date, dup_of)))
+            self.incidents.setdefault(org_id, []).append([incident, event_date, public_date])
+        else:
+            self.writes.append(("""update breach_core.incidents set event_date = coalesce(event_date, %s),
+                                      first_public_date = least(first_public_date, %s), updated_at = now()
+                                   where incident_id = %s""", (event_date, public_date, incident)))
+            for inc in self.incidents.get(org_id, []):
+                if inc[0] == incident:
+                    inc[1] = inc[1] or event_date
+                    inc[2] = min(inc[2], public_date)
+        self.writes.append(("""insert into breach_core.incident_sources (incident_id, source_id, source_record_id, doc_sha256, match_method)
+                               values (%s,%s,%s,%s,%s) on conflict do nothing""",
+                            (incident, source_id, record_id or "", doc or "", method)))
+        self.linked[key] = incident
+        return incident, method
+
+    def flag(self, incident_id, basis):
+        flag = FLAG_FOR_BASIS.get(basis)
+        if flag and (incident_id, flag) not in self.flags:
+            self.flags.add((incident_id, flag))
+            self.writes.append((f"update breach_core.incidents set {flag} = true, updated_at = now() where incident_id = %s and not {flag}",
+                                (incident_id,)))
+
+    def claim(self, *, incident_id, field, value_num=None, value_text=None, unit="none",
+              qualifier="not_applicable", as_of, basis, source_id, source_record_id=None):
+        self.writes.append((_CLAIM_SQL, (incident_id, field, value_num, value_text, unit, qualifier, None, None,
+                                         None, None, None, None, as_of, basis, source_id, source_record_id,
+                                         None, None, None, None, None, None, True, None)))
+
+    def flush(self):
+        if not self.writes:
+            return 0
+        n = len(self.writes)
+        with self.cur.connection.pipeline():
+            for sql, params in self.writes:
+                self.cur.execute(sql, params)
+        self.writes = []
+        return n
