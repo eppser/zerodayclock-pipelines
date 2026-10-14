@@ -509,3 +509,28 @@ def test_leak_stated_size_and_revenue():
     assert sl.revenue_stated("estimated annual revenue of $19.1M with ~23-50 employees") == 19.1e6
     assert sl.revenue_stated("Total size: 1,84Gb Revenue: <$5,000,000") is None      # a bound, not a value
     assert sl.revenue_stated("Revenue: $5 Million | Views: 87") == 5e6
+
+
+def test_category_fact_is_gated_on_quote_cue_and_hedge():
+    from zdc_breach import extract
+    doc = ("Acme Corp said its servers were encrypted in a ransomware attack on 3 May. "
+           "Officials believe the intrusion may have been espionage. "
+           "The breach was carried out by APT28, investigators said.")
+    out = {"is_incident_report": True, "incidents": [{"organization": "Acme Corp", "source_of_account": "news", "facts": [
+        {"field": "category", "value": "ransomware", "unit": "none", "qualifier": "not_applicable",
+         "quote": "Acme Corp said its servers were encrypted in a ransomware attack on 3 May."},
+        {"field": "category", "value": "espionage", "unit": "none", "qualifier": "not_applicable",
+         "quote": "Officials believe the intrusion may have been espionage."},
+        {"field": "category", "value": "skimming", "unit": "none", "qualifier": "not_applicable",
+         "quote": "Acme Corp said its servers were encrypted in a ransomware attack on 3 May."},
+        {"field": "category", "value": "ransomware", "unit": "none", "qualifier": "not_applicable",
+         "quote": "Acme Corp was hit by ransomware."},
+        {"field": "actor", "value": "APT28", "unit": "none", "qualifier": "not_applicable",
+         "quote": "The breach was carried out by APT28, investigators said."}]}]}
+    got = {(c.field, str(c.value)): c.reject_reason for c in extract.validate(out, doc)[0].candidates}
+    cands = extract.validate(out, doc)[0].candidates
+    assert cands[0].accepted                                   # stated, cued, in the document
+    assert cands[1].reject_reason == "hedged"                  # "believe ... may have been"
+    assert cands[2].reject_reason == "category_cue_missing"    # nothing about skimming in it
+    assert cands[3].reject_reason == "quote_not_in_document"   # paraphrase
+    assert cands[4].accepted and cands[4].value == "APT28"     # a named state group is an actor

@@ -612,14 +612,20 @@ def extract_doc(ctx, cur, sha, text, url, title, *, forced_incident=None, forced
     ctx.report["llm"]["cost_usd"] = round(ctx.report["llm"]["cost_usd"] + res.cost_usd, 6)
     if not res.ok:
         return 0   # no extraction row: the backlog retries it once more
+    return file_output(ctx, cur, sha, text, res.data, ext_id, call_id=call_id, published=published,
+                       source_id=source_id, forced_incident=forced_incident, forced_basis=forced_basis)
+
+
+def file_output(ctx, cur, sha, text, output, ext_id, *, call_id=None, published=None, source_id=None,
+                forced_incident=None, forced_basis=None) -> int:
+    """Store one extractor output and file its claims through the gate - shared by the OpenRouter
+    path above and by zdc_breach.agent_load (Claude subagents), so both pass the same validator."""
     cur.execute("""insert into breach_core.extractions (doc_sha256, extractor_id, output, ok, error, call_id)
-                   values (%s,%s,%s,%s,%s,%s) returning extraction_id""",
-                (sha, ext_id, json.dumps(res.data) if res.data is not None else None, res.ok, res.error, call_id))
+                   values (%s,%s,%s,true,null,%s) returning extraction_id""",
+                (sha, ext_id, json.dumps(output) if output is not None else None, call_id))
     extraction_id = cur.fetchone()[0]
-    cur.execute("select active and 'vector' = any(active_fields) from breach_core.extractor_versions where extractor_id = %s", (ext_id,))
-    active = cur.fetchone()[0]
     as_of = (published or datetime.now(timezone.utc)).date()
-    for ei in extract.validate(res.data, text):
+    for ei in extract.validate(output, text):
         basis = forced_basis or ei.basis
         if forced_incident:
             inc = forced_incident
@@ -765,6 +771,9 @@ def run(conn, args, getter=http.get, llm=None, fx=None) -> dict:
             ctx.report["leak_facts"] = parse_leak_facts(cur)
             # The public list and its facet counts (0117, 0118): computed once per run, not per
             # request - the live view took 17 s with the API's column list.
+            # The shared database's default statement timeout is minutes, not hours; the rebuild
+            # reads every victim, so it gets an explicit budget (0120 made it ~3 s locally).
+            cur.execute("set local statement_timeout = '10min'")
             cur.execute("select breach_core.rebuild_victims_list()")
             ctx.report["victims_listed"] = cur.fetchone()[0]
             results = evals.run_all(cur, ctx)
