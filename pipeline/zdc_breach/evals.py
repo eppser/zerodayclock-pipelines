@@ -85,6 +85,19 @@ def public_rows_have_status(cur) -> EvalResult:
                       {"no_status": no_status, "suppressed": suppressed})
 
 
+def victims_list_current(cur) -> EvalResult:
+    """The public list is a per-run table (0118). If the rebuild stopped running, the page would
+    keep showing an old snapshot with no error anywhere; compare it with its definition."""
+    cur.execute("""select (select count(*) from breach_core.victims_list),
+                          (select count(*) from breach_core.victims_source),
+                          (select max(built_at) from breach_core.victim_facets)""")
+    listed, source, built = cur.fetchone()
+    ok = listed == source and built is not None
+    return EvalResult("victims_list_current", ERROR, ok,
+                      f"{listed} rows listed, {source} in the definition, facets built {built}",
+                      {"listed": listed, "source": source})
+
+
 def unit_integrity(cur) -> EvalResult:
     """No reconciled count was fed by a claim of another unit (the CHECKs make this
     impossible today; this catches the day someone relaxes one)."""
@@ -123,7 +136,7 @@ def run_all(cur, ctx) -> list[EvalResult]:
     r = ctx.report
     return [sources_answered(r), leak_not_silently_empty(r), regulators_not_silently_empty(r),
             records_parse(r), quote_offsets_valid(ctx.new_quotes), budget(r),
-            public_rows_have_status(cur), unit_integrity(cur), placeholders_excluded(cur),
+            public_rows_have_status(cur), victims_list_current(cur), unit_integrity(cur), placeholders_excluded(cur),
             censoring(cur),
             EvalResult("claims_gate", INFO, True,
                        f"{r['claims']['accepted']} accepted, {r['claims']['rejected']} rejected",

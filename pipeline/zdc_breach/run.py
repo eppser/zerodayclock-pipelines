@@ -627,6 +627,10 @@ def run(conn, args, getter=http.get, llm=None, fx=None) -> dict:
             ctx.report["actor_links"] = link_leak_claims(cur)
             ctx.report["incident_facts"] = reconcile.build(cur)
             ctx.report["confidence_rows"] = confidence.build(cur)
+            # The public list and its facet counts (0117, 0118): computed once per run, not per
+            # request - the live view took 17 s with the API's column list.
+            cur.execute("select breach_core.rebuild_victims_list()")
+            ctx.report["victims_listed"] = cur.fetchone()[0]
             results = evals.run_all(cur, ctx)
             if args.dry_run:
                 raise _DryRun()
