@@ -14,7 +14,7 @@ name: Breach pipeline
 # late (GitHub delays scheduled runs by hours) still does what is due and nothing twice.
 #
 # THE LLM IS CAPPED TWICE. OpenRouter is called only for the extraction backlog, at most
-# 40 documents a run, and zdc_breach.llm refuses any call that would cross the owner's
+# 15 documents a run, and zdc_breach.llm refuses any call that would cross the owner's
 # 50 EUR/month cap (or a daily slice of it) as recorded in breach_core.llm_calls.
 
 on:
@@ -70,7 +70,9 @@ jobs:
   ingest:
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # The run stops itself at 15 minutes (--deadline-minutes) and records the result; this is
+    # the backstop if something hangs.
+    timeout-minutes: 40
     environment: ${{ github.event.inputs.environment || 'staging' }}
     defaults:
       run:

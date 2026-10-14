@@ -133,7 +133,7 @@ SOURCES = "ransomlook,ransomfeed,wa_ag,ca_ag,hibp,sec_8k,news_hipaajournal,extra
 
 def args(**kw):
     a = dict(sources=SOURCES, force=True, max_docs=10, sec_days=3, trigger="test", dry_run=False, report=None,
-             max_apply=2000)
+             max_apply=2000, deadline_minutes=15)
     a.update(kw)
     return Namespace(**a)
 
@@ -290,3 +290,9 @@ def test_first_fill_is_spread_over_runs(conn):
     assert q(conn, "select count(*) from breach_raw.source_records where source_id = 'ca_ag'") == [(2,)]
     brun.run(conn, args(sources="ca_ag", max_apply=1), getter=fake_get, llm=None, fx=NoFx())
     assert q(conn, "select count(*) from breach_raw.source_records where source_id = 'ca_ag'") == [(2,)]
+
+
+def test_deadline_skips_remaining_work_but_finishes(conn):
+    rep = brun.run(conn, args(deadline_minutes=-1), getter=fake_get, llm=FakeLLM(), fx=NoFx())
+    assert all(v.get("skipped") == "run deadline" for v in rep["sources"].values())
+    assert "ok" in rep and rep["evals"]

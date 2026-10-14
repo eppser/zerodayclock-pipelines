@@ -47,6 +47,7 @@ def store_records(cur, source_id: str, items: list[tuple[str, dict]], fetch_id,
     current = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
     counts = {"new": 0, "changed": 0, "unchanged": 0}
     seen, changed = set(), set()
+    rows = []
     for rid, rec in items:
         if rid in seen:
             continue
@@ -62,10 +63,15 @@ def store_records(cur, source_id: str, items: list[tuple[str, dict]], fetch_id,
         version = (cur_v[0] + 1) if cur_v else 1
         counts["changed" if cur_v else "new"] += 1
         changed.add(rid)
-        cur.execute(
-            """insert into breach_raw.source_records (source_id, source_record_id, version,
-                                                      content_hash, record, fetch_id)
-               values (%s,%s,%s,%s,%s,%s)""", (source_id, rid, version, h, Jsonb(rec), fetch_id))
+        rows.append((source_id, rid, version, h, Jsonb(rec), fetch_id))
+    # One pipelined batch: a runner is ~100 ms from the database, and one round trip per
+    # record made a 2,000-row first fill take minutes (measured 2026-10-14).
+    if rows:
+        with cur.connection.pipeline():
+            cur.executemany(
+                """insert into breach_raw.source_records (source_id, source_record_id, version,
+                                                          content_hash, record, fetch_id)
+                   values (%s,%s,%s,%s,%s,%s)""", rows)
     return counts, changed
 
 

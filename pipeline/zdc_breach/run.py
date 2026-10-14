@@ -349,6 +349,9 @@ def run_extraction(ctx, conn) -> dict:
             pass
         if ctx.report["llm"]["budget_stopped"]:
             break
+        if datetime.now(timezone.utc) > getattr(ctx, "deadline", datetime.max.replace(tzinfo=timezone.utc)):
+            ctx.report["llm"]["deadline_stopped"] = True
+            break
     with conn.cursor() as cur:
         cur.execute("""select count(*) from breach_raw.documents d where d.captured_at > now() - interval '21 days'
                          and not exists (select 1 from breach_core.extractions e where e.doc_sha256 = d.doc_sha256 and e.extractor_id = %s)""",
@@ -471,10 +474,18 @@ def run(conn, args, getter=http.get, llm=None, fx=None) -> dict:
     if not args.dry_run:
         conn.commit()
     ctx = Ctx(conn, run_id, args, getter, llm, fx)
+    deadline = datetime.now(timezone.utc) + timedelta(minutes=args.deadline_minutes)
+    ctx.deadline = deadline
     wanted = [s for s in args.sources.split(",") if s] if args.sources else list(CADENCE_H)
     sources = [s for s in wanted if s != "extract"]
     feeds = {f.source_id: f for f in sources_news.FEEDS}
     for source_id in sources:
+        # A run that has used its time stops starting new work, finishes cleanly and records
+        # itself: the next hourly run picks up what is still due. A job killed by the runner's
+        # timeout records nothing, which the watchdog would read as a dead pipeline.
+        if datetime.now(timezone.utc) > deadline:
+            ctx.report["sources"][source_id] = {"skipped": "run deadline"}
+            continue
         with conn.cursor() as cur:
             if not due(cur, source_id, args.force):
                 ctx.report["sources"][source_id] = {"skipped": "not due"}
@@ -563,7 +574,9 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="zdc-breach")
     ap.add_argument("--sources", default="")
     ap.add_argument("--force", action="store_true", help="ignore per-source cadence")
-    ap.add_argument("--max-docs", type=int, default=40)
+    ap.add_argument("--max-docs", type=int, default=15)
+    ap.add_argument("--deadline-minutes", type=float, default=15,
+                    help="stop starting new sources or documents after this long; the next run continues")
     ap.add_argument("--sec-days", type=int, default=3)
     ap.add_argument("--max-apply", type=int, default=2000,
                     help="new or changed rows applied per regulator source per run; the rest wait")
