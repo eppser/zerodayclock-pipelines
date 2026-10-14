@@ -17,9 +17,15 @@ repository, so pull requests here cannot be merged. Please open an issue instead
 | `enrich-pipeline.yml` | `zdc_enrich` | Derived tables, FIRST EPSS scores, and the eval gate over them |
 | `patch-pipeline.yml` | `zdc_patch` | Vendor patch-release dates from first-party advisories |
 | `watchdog.yml` | `tools/watchdog.py` | Alerts when any pipeline stops completing on schedule |
+| `honeypot-pipeline.yml` | `zdc_honeypot` | Shadowserver honeypot exploitation counts per CVE (licensed API) |
+| `crowdsec-pipeline.yml` | `zdc_crowdsec` | CrowdSec tracker exploitation counts per CVE (licensed API) |
+| `osm-pipeline.yml` | `zdc_osm` | OpenSourceMalware's latest verified malicious packages (token-gated) |
+| `netthreat-pipeline.yml` | `zdc_netthreat` | Weekly per-network threat scores from nine licensed and public sources |
 
-`zdc_honeypot`, `zdc_crowdsec` and `zdc_export` are included as code but run from the private
-repository, because their inputs are licensed feeds.
+The licensed pipelines log, summarise and report aggregates only (counts, model parameters,
+check results): never an IP address, a feed record, a network name or a per-network score.
+`zdc_export` is included as code but runs from the private repository: its release would
+redistribute licensed feed content.
 
 Every run executes the unit tests first and records an evaluation report; a failed check
 blocks the write.

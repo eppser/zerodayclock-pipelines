@@ -1,0 +1,129 @@
+name: Network threat atlas pipeline
+
+# Weekly, Mondays 06:30 UTC: collects every source at its native window for the ISO week
+# that just ended, then scores that week (migration 0094, ADR 0006). Runs in the PUBLIC
+# pipelines repository (owner decision 2026-10-14, after a security review): the inputs are
+# licensed feeds (CrowdSec Enterprise, VulnCheck, Shodan), so the run logs, the summary and the
+# report may carry aggregates only - counts, model parameters, check results - never an IP
+# address, a network name or a per-network score. No report artifact is uploaded; keep it so.
+#
+# WHY WEEKLY, NOT MONTHLY OR DAILY. CrowdSec's feed answers `since` up to 7 days only and
+# blocklist.de lists 48 hours, so a monthly run would read a week and call it a month. A
+# daily run would add rate-limit exposure and cost without changing a weekly verdict.
+#
+# GitHub runs schedules on this account 5-7 h late; the watchdog allows 199 h of silence.
+
+on:
+  schedule:
+    - cron: '30 6 * * 1'
+  # GitHub runs `schedule` and `workflow_dispatch` only for workflows on the default branch.
+  # Until this file is on main, a push to staging that touches the pipeline runs it against
+  # staging, so the staging page can be filled without a production change.
+  # No push trigger. It used to re-run on every push to staging, which (a) raced deploy-staging's
+  # migrate step on the same push and (b) counted as an ok run for the watchdog without collecting
+  # anything. Collection is the cron's job; a re-score is a workflow_dispatch with score_only.
+  workflow_dispatch:
+    inputs:
+      week:
+        description: 'Monday of the ISO week to collect (blank = the week that just ended)'
+        type: string
+        default: ''
+      score_only:
+        description: 'Rebuild the derived tables for that week from stored raw rows only'
+        type: boolean
+        default: false
+      environment:
+        description: "Target environment ('staging' holds the pipeline keys; 'production' is the site deploy's and has none)"
+        type: choice
+        options: [staging, production]
+        default: staging
+
+concurrency:
+  group: netthreat-pipeline-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  weekly:
+    runs-on: ubuntu-latest
+    # 120: the last full collections took 60-68 minutes (bot shares, abuse contacts) and the two
+    # v2 fits can take up to 15 minutes each at their wall-clock cap on a 2-vCPU runner.
+    timeout-minutes: 120
+    # The scheduled run uses the 'staging' environment's secrets like the other pipelines here:
+    # ZDC2 has ONE database (ADR 0002, zdc2-staging promoted), and 'staging' is where its keys live.
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Mask database connection details
+        working-directory: .
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.parse
+          u = urllib.parse.urlsplit(os.environ.get("DATABASE_URL", ""))
+          for v in {u.hostname, u.username, u.password}:
+              if v:
+                  print(f"::add-mask::{v}")
+                  print(f"::add-mask::{urllib.parse.unquote(v)}")
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-run.txt
+
+      - name: Run pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CROWDSEC_CTI_API_KEY: ${{ secrets.CROWDSEC_CTI_API_KEY }}
+          VULNCHECK_API_TOKEN: ${{ secrets.VULNCHECK_API_TOKEN }}
+          SHODAN_API_KEY: ${{ secrets.SHODAN_API_KEY }}
+          CLOUDFLARE_RADAR_TOKEN: ${{ secrets.CLOUDFLARE_RADAR_TOKEN }}
+          WEEK: ${{ github.event.inputs.week }}
+          SCORE_ONLY: ${{ github.event.inputs.score_only }}
+        run: |
+          set -euo pipefail
+          args=(--trigger "${{ github.event_name }}" --report netthreat-report.json)
+          if [ -n "${WEEK:-}" ]; then args+=(--week "$WEEK"); fi
+          if [ "${SCORE_ONLY:-false}" = "true" ]; then args+=(--score-only); fi
+          # 115 minutes inside a 120-minute job: a TERM from a parent we control reaches Python (and
+          # closes the run row) before GitHub's INT/TERM/KILL sequence tears the tree down.
+          timeout -s TERM -k 30 115m python -m zdc_netthreat.run "${args[@]}"
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f netthreat-report.json ]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r = json.load(open("netthreat-report.json"))
+          print(f"### Network threat atlas — week of {r.get('week')} — {'OK' if r.get('ok') else 'BLOCKED'}\n")
+          s = r.get("score") or {}
+          print(f"- networks scored: `{s.get('networks', 0):,}` · pairs above threshold: `{s.get('above', 0):,}` "
+                f"· score ≥ 0.9: `{s.get('score_ge_0_9', 0):,}` · prevalence: `{s.get('prevalence')}`\n")
+          v2 = r.get("score_v2") or {}
+          for side in ("attack", "host"):
+              x = v2.get(side) or {}
+              print(f"- v2 {side}: listed `{x.get('listed', 0)}` · feeds `{', '.join(x.get('feeds', []))}`"
+                    f"{' · ABSENT ' + ', '.join(x['absent']) if x.get('absent') else ''} · converged `{x.get('converged')}` "
+                    f"in `{x.get('iterations')}` iterations / `{x.get('seconds')}` s{' · PROVISIONAL' if x.get('provisional') else ''}\n")
+          print("| source | ok | volume |")
+          print("|---|---|---|")
+          for k, v in (r.get("sources") or {}).items():
+              print(f"| {k} | {'yes' if v['ok'] else 'NO — ' + str(v.get('error'))[:80]} | {v.get('volume', 0):,} |")
+          print("\n| check | severity | result |")
+          print("|---|---|---|")
+          for e in r.get("checks", []):
+              print(f"| {e['name']} | {e['severity']} | {'PASS' if e['passed'] else 'FAIL'} — {e['summary']} |")
+          PY
+          else
+            echo "No report produced — the run failed before evaluation." >> "$GITHUB_STEP_SUMMARY"
+          fi

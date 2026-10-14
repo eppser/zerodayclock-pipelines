@@ -1,0 +1,135 @@
+name: OSM pipeline
+
+# OpenSourceMalware threat feed — twice daily. See supabase/migrations/0087_osm_feed.sql.
+#
+# Runs in the PUBLIC pipelines repository (owner decision 2026-10-14, after a security review
+# that found logs, summary and report to be per-ecosystem counts and timestamps only). The feed
+# is token-gated and its terms forbid redistribution, so nothing beyond such aggregates may ever
+# be logged, summarised or uploaded here; errors go through the client's token scrubber.
+#
+# TWICE DAILY BECAUSE THE WINDOW CANNOT PAGE. query-latest returns the 100 most recently
+# updated records per ecosystem and nothing older. npm turns over ~33 a day (measured
+# 2026-10-08), so 12h uses about a sixth of the window; an overrun is detected per poll
+# and reported as the `window_complete` WARN rather than prevented by hourly polling.
+#
+# DELIBERATELY NO LOCAL-HOUR GUARD, for the reason honeypot-pipeline.yml records. Every
+# write is keyed on the threat id and content hash, so a run landing hours late, or
+# twice, revises rather than duplicates.
+
+on:
+  schedule:
+    - cron: '25 5,17 * * *'
+  workflow_dispatch:
+    inputs:
+      ecosystems:
+        description: 'Comma-separated subset (blank for all)'
+        type: string
+        default: ''
+      environment:
+        description: 'Target environment'
+        type: choice
+        options: [staging, production]
+        default: staging
+
+# One poll at a time: two runs would race on the same watermark and double the load on a
+# free quota of 2,000 requests a day.
+concurrency:
+  group: osm-pipeline-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Tests run in their own job with no environment, so neither the test tooling nor
+  # anything it installs can reach the API token or the database.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-ci.txt
+      - name: Unit tests
+        run: python -m pytest -q tests/test_osm.py
+
+  ingest:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Mask database connection details
+        working-directory: .
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.parse
+          u = urllib.parse.urlsplit(os.environ.get("DATABASE_URL", ""))
+          for v in {u.hostname, u.username, u.password}:
+              if v:
+                  print(f"::add-mask::{v}")
+                  print(f"::add-mask::{urllib.parse.unquote(v)}")
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-run.txt
+
+      - name: Run pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OSM_API_KEY: ${{ secrets.OSM_API_KEY }}
+          ECOSYSTEMS: ${{ github.event.inputs.ecosystems }}
+        run: |
+          python -m zdc_osm.run \
+            ${ECOSYSTEMS:+--ecosystems "$ECOSYSTEMS"} \
+            --trigger "${{ github.event_name }}" \
+            --report osm-report.json
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f osm-report.json ]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r = json.load(open("osm-report.json"))
+          print(f"### OSM pipeline — {'OK' if r.get('ok') else 'BLOCKED'}\n")
+          print(f"- run time: `{r.get('seconds')}s` · downloads: `{r.get('downloads', {}).get('outcomes')}`\n")
+          print("| ecosystem | HTTP | records | new | changed | window complete |")
+          print("|---|---|---|---|---|---|")
+          for e, v in r.get("ecosystems", {}).items():
+              print(f"| {e} | {v.get('status')} | {v.get('records')} | {v.get('new', '')} | "
+                    f"{v.get('changed', '')} | {v.get('window_complete', '')} |")
+          print("\n| check | severity | result |")
+          print("|---|---|---|")
+          for c in r.get("checks", []):
+              print(f"| {c['name']} | {c['severity']} | {'PASS' if c['passed'] else 'FAIL'} — {c['summary']} |")
+          PY
+          else
+            echo "No report produced — the run failed before evaluation." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: osm-report-${{ github.run_id }}
+          path: pipeline/osm-report.json
+          if-no-files-found: warn
+          retention-days: 30

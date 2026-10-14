@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 import httpx
 
 UA = "zerodayclock.com research (https://zerodayclock.com)"
-_SECRET = re.compile(r"(?i)(x-api-key|authorization|bearer|api[_-]?key|token|x-auth-key)[\"':= ]+[A-Za-z0-9._~+/=-]{8,}")
+_SECRET = re.compile(r"(?i)(x-api-key|authorization|bearer|api[_-]?key|token|x-auth-key|(?<=[?&])key)[\"':= ]+[A-Za-z0-9._~+/=-]{8,}")   # bare key= is Shodan's
 
 
 def redact(text: str) -> str:

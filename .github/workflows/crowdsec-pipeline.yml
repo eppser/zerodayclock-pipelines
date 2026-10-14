@@ -1,0 +1,118 @@
+name: CrowdSec pipeline
+
+# CrowdSec Live Exploit Tracker — daily per-CVE occurrence counts.
+#
+# THE WINDOW IS ROLLING, WHICH IS THE WHOLE REASON THIS RUNS DAILY. There is no history
+# endpoint: /cves/{id}/timeline returns 30 days and nothing older, so anything not
+# captured is gone for good. Each run re-reads the full 30 days and every write is an
+# upsert keyed CVE@YYYY-MM-DD, so up to 29 consecutive missed runs leave no hole and a
+# re-run revises rather than duplicates.
+#
+# DELIBERATELY NO LOCAL-HOUR GUARD, for the reason honeypot-pipeline.yml records: that
+# pattern was measured dropping 20 of 21 scheduled runs, because GitHub delays scheduled
+# workflows on private repos by hours. A daily aggregate does not care which hour it
+# runs, so there is nothing here for a guard to skip.
+#
+# Measured 2026-09-22: 819 timelines in 28s at 8 workers, 20,922 day-counts, 0 failures.
+
+on:
+  schedule:
+    - cron: '10 7 * * *'
+  workflow_dispatch:
+    inputs:
+      since_days:
+        description: 'Timeline window to request (the API offers only these three)'
+        type: choice
+        options: ['30', '7', '1']
+        default: '30'
+      all_cves:
+        description: 'Also ask for CVEs CrowdSec has never observed'
+        type: boolean
+        default: false
+      environment:
+        description: 'Target environment'
+        type: choice
+        options: [staging, production]
+        default: staging
+
+# One ingest at a time. Two runs would race on the same CVE@day keys for no benefit,
+# and would double the request load on a commercial API for nothing.
+concurrency:
+  group: crowdsec-pipeline-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Mask database connection details
+        working-directory: .
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.parse
+          u = urllib.parse.urlsplit(os.environ.get("DATABASE_URL", ""))
+          for v in {u.hostname, u.username, u.password}:
+              if v:
+                  print(f"::add-mask::{v}")
+                  print(f"::add-mask::{urllib.parse.unquote(v)}")
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      # By hash, as the public pipelines install. No editable install: the module runs
+      # with `python -m` from pipeline/, so the working directory is already on sys.path.
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-run.txt
+
+      - name: Run pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CROWDSEC_TRACKER_API_KEY: ${{ secrets.CROWDSEC_TRACKER_API_KEY }}
+        run: |
+          python -m zdc_crowdsec.run \
+            --since-days "${{ github.event.inputs.since_days || '30' }}" \
+            ${{ github.event.inputs.all_cves == 'true' && '--all' || '' }} \
+            --trigger "${{ github.event_name }}" \
+            --report crowdsec-report.json
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f crowdsec-report.json ]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r = json.load(open("crowdsec-report.json"))
+          print(f"### CrowdSec pipeline — {'OK' if r.get('ok') else 'BLOCKED'}\n")
+          print(f"- tracked CVEs: `{r.get('tracked', 0):,}` · timelines asked: "
+                f"`{r.get('asked', 0):,}` · day-counts: `{r.get('day_counts', 0):,}`")
+          print(f"- window: `{r.get('days_seen')}` days · censored `{r.get('censored_at')}`")
+          print(f"- stored: `{r.get('inserted', 0):,}` inserted, `{r.get('updated', 0):,}` revised\n")
+          print("| check | severity | result |")
+          print("|---|---|---|")
+          for e in r.get("checks", []):
+              print(f"| {e['name']} | {e['severity']} | {'PASS' if e['passed'] else 'FAIL'} — {e['summary']} |")
+          PY
+          else
+            echo "No report produced — the run failed before evaluation." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: crowdsec-report-${{ github.run_id }}
+          path: pipeline/crowdsec-report.json
+          if-no-files-found: warn
+          retention-days: 30

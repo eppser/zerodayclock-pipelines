@@ -1,0 +1,168 @@
+name: Honeypot pipeline
+
+# Shadowserver honeypot API — daily attempt counts per (vulnerability, product).
+#
+# DELIBERATELY NO LOCAL-HOUR GUARD. The other four harvesters fire on several UTC hours
+# and then exit unless the Europe/Berlin hour is exactly 06 or 18. That pattern is
+# measured to fail: GitHub delays scheduled workflows on private repos by hours, so
+# between 2026-08-28 and 08-31 only 1 of 21 scheduled runs across those workflows ever
+# reached its ingest step — the rest reported success with the job skipped.
+#
+# This source is a DAILY aggregate, so the hour it runs is irrelevant. Fire once a day,
+# take whatever hour GitHub gives us, and rely on idempotency: every write is an upsert
+# keyed on (vuln_id, product_key, observed_on), so a duplicate run revises rather than
+# duplicates. Nothing here needs a guard, so nothing here can be skipped by one.
+
+on:
+  schedule:
+    - cron: '40 5 * * *'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Trailing days to (re)fetch'
+        type: string
+        default: '3'
+      environment:
+        description: 'Target environment'
+        type: choice
+        options: [staging, production]
+        default: staging
+      backfill_start:
+        description: 'Backfill from (YYYY-MM-DD). Leave blank for a normal run.'
+        type: string
+        default: ''
+      backfill_end:
+        description: 'Backfill to (YYYY-MM-DD)'
+        type: string
+        default: ''
+
+concurrency:
+  group: honeypot-pipeline-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Skipped on a backfill dispatch. Both jobs in one run would execute in PARALLEL —
+  # the concurrency group is per-workflow, not per-job — so they would race on the same
+  # recent days and double the request load on a non-profit's API for nothing.
+  ingest:
+    if: github.event_name != 'workflow_dispatch' || inputs.backfill_start == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Mask database connection details
+        working-directory: .
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.parse
+          u = urllib.parse.urlsplit(os.environ.get("DATABASE_URL", ""))
+          for v in {u.hostname, u.username, u.password}:
+              if v:
+                  print(f"::add-mask::{v}")
+                  print(f"::add-mask::{urllib.parse.unquote(v)}")
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      # By hash, as the public pipelines install. No editable install: the module runs
+      # with `python -m` from pipeline/, so the working directory is already on sys.path.
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-run.txt
+
+      # Trailing 3 days by default, not 1: Shadowserver's tail is unstable day to day
+      # (list length swings 125..921) and a late-settling day would otherwise be frozen
+      # at whatever we saw first. Re-fetching is an upsert, so this costs 3 requests.
+      - name: Run pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SHADOWSERVER_API_KEY: ${{ secrets.SHADOWSERVER_API_KEY }}
+          SHADOWSERVER_API_SECRET: ${{ secrets.SHADOWSERVER_API_SECRET }}
+          # inputs reach the shell through env and quotes only, never interpolated into the script
+          DAYS: ${{ github.event.inputs.days || '3' }}
+        run: |
+          case "$DAYS" in ''|*[!0-9]*) echo "::error::days must be a number"; exit 1;; esac
+          python -m zdc_honeypot.run \
+            --days "$DAYS" \
+            --trigger "${{ github.event_name }}" \
+            --report honeypot-report.json
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f honeypot-report.json ]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r = json.load(open("honeypot-report.json"))
+          print(f"### Honeypot pipeline — {'OK' if r['ok'] else 'BLOCKED'}\n")
+          print(f"- days fetched: `{r['days']}` · rows: `{r['rows']:,}`\n")
+          print("| check | severity | result |")
+          print("|---|---|---|")
+          for e in r["evals"]:
+              print(f"| {e['name']} | {e['severity']} | {'PASS' if e['passed'] else 'FAIL'} — {e['summary']} |")
+          PY
+          fi
+
+  # Historical sweep. Separate and explicitly invoked, never mixed into the incremental
+  # stream: it writes raw.pipeline_runs with mode='backfill'. The API rejects date ranges
+  # (measured: HTTP 400), so this is one request per day, self-throttled to 1.5s, and
+  # resumable — --backfill skips days already stored, so a re-run continues rather than
+  # restarting. History begins ~2022-07; earlier dates return zero rows.
+  backfill:
+    if: github.event_name == 'workflow_dispatch' && inputs.backfill_start != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Mask database connection details
+        working-directory: .
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.parse
+          u = urllib.parse.urlsplit(os.environ.get("DATABASE_URL", ""))
+          for v in {u.hostname, u.username, u.password}:
+              if v:
+                  print(f"::add-mask::{v}")
+                  print(f"::add-mask::{urllib.parse.unquote(v)}")
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      # By hash, as the public pipelines install. No editable install: the module runs
+      # with `python -m` from pipeline/, so the working directory is already on sys.path.
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-run.txt
+      - name: Backfill
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SHADOWSERVER_API_KEY: ${{ secrets.SHADOWSERVER_API_KEY }}
+          SHADOWSERVER_API_SECRET: ${{ secrets.SHADOWSERVER_API_SECRET }}
+          BACKFILL_START: ${{ inputs.backfill_start }}
+          BACKFILL_END: ${{ inputs.backfill_end }}
+        run: |
+          for d in "$BACKFILL_START" "$BACKFILL_END"; do
+            [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "::error::dates must be YYYY-MM-DD"; exit 1; }
+          done
+          python -m zdc_honeypot.run \
+            --start "$BACKFILL_START" \
+            --end "$BACKFILL_END" \
+            --backfill --max-days 1600 \
+            --trigger backfill
