@@ -107,15 +107,16 @@ def upsert_leak_posts(cur, posts) -> dict:
         return counts
     groups = sorted({p.actor_group for p in posts})
     cur.execute("""select claim_key, actor_group, victim_domain, victim_norm, first_seen_at, last_seen_at,
-                          trackers, tracker_refs, country, sector, employees_stated
+                          trackers, tracker_refs, country, sector, employees_stated, demand_text
                      from breach_core.leak_claims
                     where actor_group = any(%s) and first_seen_at between %s and %s""",
                 (groups, posts[0].seen_at - LEAK_WINDOW, posts[-1].seen_at + LEAK_WINDOW))
     by_group: dict = {}
-    for key, grp, dom, norm, first, last, trackers, refs, country, sector, emp in cur.fetchall():
+    for key, grp, dom, norm, first, last, trackers, refs, country, sector, emp, dem in cur.fetchall():
         by_group.setdefault(grp, []).append({"key": key, "domain": dom, "norm": norm, "first": first, "last": last,
                                              "trackers": list(trackers), "refs": list(refs or []),
                                              "country": country, "sector": sector, "employees": emp,
+                                             "demand": (dem, None, None) if dem else None, "demand_new": False,
                                              "dirty": False, "new": False})
     for p in posts:
         ref = {"source_id": p.source_id, "id": p.source_record_id}
@@ -128,6 +129,8 @@ def upsert_leak_posts(cur, posts) -> dict:
                 counts["already"] += 1
                 if c["employees"] is None and p.employees:
                     c["employees"], c["dirty"] = p.employees, True
+                if c["demand"] is None and p.demand:
+                    c["demand"], c["demand_new"], c["dirty"] = p.demand, True, True
                 continue
             c["refs"].append(ref)
             c["trackers"] = sorted(set(c["trackers"]) | {p.source_id})
@@ -135,6 +138,8 @@ def upsert_leak_posts(cur, posts) -> dict:
             c["country"] = c["country"] or p.country
             c["sector"] = c["sector"] or p.sector
             c["employees"] = c["employees"] or p.employees
+            if c["demand"] is None and p.demand:
+                c["demand"], c["demand_new"] = p.demand, True
             c["first"], c["last"] = min(c["first"], p.seen_at), max(c["last"], p.seen_at)
             c["dirty"] = True
             counts["joined"] += 1
@@ -147,13 +152,16 @@ def upsert_leak_posts(cur, posts) -> dict:
             by_group.setdefault(p.actor_group, []).append(
                 {"key": key, "domain": p.victim_domain, "norm": p.victim_norm, "first": p.seen_at, "last": p.seen_at,
                  "trackers": [p.source_id], "refs": [ref], "country": p.country, "sector": p.sector,
-                 "employees": p.employees, "dirty": True, "new": True, "group": p.actor_group, "name": p.victim_name})
+                 "employees": p.employees, "demand": p.demand, "demand_new": p.demand is not None,
+                 "dirty": True, "new": True, "group": p.actor_group, "name": p.victim_name})
             counts["new_claims"] += 1
-    inserts, updates = [], []
+    inserts, updates, demands = [], [], []
     for grp, cs in by_group.items():
         for c in cs:
             if not c["dirty"]:
                 continue
+            if c.get("demand_new") and c["demand"]:
+                demands.append((c["demand"][0], c["demand"][1], c["demand"][2], c["key"]))
             if c["new"]:
                 inserts.append((c["key"], grp, c["name"], c["norm"], c["domain"], c["country"], c["sector"],
                                 c["first"], c["last"], c["trackers"], Jsonb(c["refs"]), c["employees"]))
@@ -166,6 +174,9 @@ def upsert_leak_posts(cur, posts) -> dict:
                                    victim_domain, country, sector, first_seen_at, last_seen_at, trackers, tracker_refs,
                                    employees_stated)
                                values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) on conflict (claim_key) do nothing""", inserts)
+        if demands:
+            cur.executemany("""update breach_core.leak_claims set demand_text = %s, demand_amount = %s,
+                                   demand_currency = %s where claim_key = %s""", demands)
         if updates:
             cur.executemany("""update breach_core.leak_claims set trackers = %s, tracker_refs = %s,
                                    victim_domain = %s, country = %s, sector = %s,

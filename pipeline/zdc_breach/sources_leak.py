@@ -44,6 +44,39 @@ def employees_stated(text: str | None) -> int | None:
     return None
 
 
+_AMOUNT = re.compile(
+    r"(?:\$\s?(\d[\d,]*(?:\.\d+)?)\s*(k|m|mn|million|thousand)?|"
+    r"(\d[\d,]*(?:\.\d+)?)\s*(k|m|million|thousand)?\s*(usd|us dollars|dollars|eur|euro|btc|bitcoin|xmr|monero|usdt)\b)", re.I)
+_DEMAND_CUE = re.compile(r"\b(pay|payment|ransom|demand|price|fee|amount|transfer)\b", re.I)
+_SCRUB = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+|\b[a-z2-7]{16,56}\.onion\S*|\b[0-9a-f]{24,}\b|https?://\S+|session\s*(id)?\s*:?\s*\S+", re.I)
+_CUR = {"usd": "USD", "us dollars": "USD", "dollars": "USD", "eur": "EUR", "euro": "EUR", "btc": "BTC",
+        "bitcoin": "BTC", "xmr": "XMR", "monero": "XMR", "usdt": "USDT"}
+_MULT = {"k": 1_000, "thousand": 1_000, "m": 1_000_000, "mn": 1_000_000, "million": 1_000_000}
+
+
+def demand_stated(text: str | None) -> tuple[str, float, str] | None:
+    """The attackers' own demand, as their post words it: the first sentence that both asks for
+    payment and names an amount. Email addresses, onion links, session ids and long hex are
+    removed - the page quotes the demand, never how to pay it."""
+    for sent in re.split(r"(?<=[.!?])\s+|\n+", text or ""):
+        if not _DEMAND_CUE.search(sent):
+            continue
+        m = _AMOUNT.search(sent)
+        if not m:
+            continue
+        num, mult = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+        cur = "USD" if m.group(1) else _CUR.get((m.group(5) or "").lower())
+        try:
+            amount = float(num.replace(",", "")) * _MULT.get((mult or "").lower(), 1)
+        except ValueError:
+            continue
+        if not cur or amount <= 0 or amount > 5e9:
+            continue
+        clean = _SCRUB.sub("[removed]", sent).strip()
+        return clean[:300], amount, cur
+    return None
+
+
 @dataclass(frozen=True)
 class LeakPost:
     source_id: str
@@ -55,6 +88,10 @@ class LeakPost:
     sector: str | None
     seen_at: datetime
     record: dict
+
+    @property
+    def demand(self) -> tuple[str, float, str] | None:
+        return demand_stated(str(self.record.get("description") or ""))
 
     @property
     def employees(self) -> int | None:

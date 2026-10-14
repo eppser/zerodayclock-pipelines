@@ -420,3 +420,31 @@ def test_headcount_from_leak_post():
     assert f("around 2,000 employees in 36 countries") == 2000
     assert f("We stole the data of 5,000 employees and customers") is None
     assert f("Files: 746,108 Data volume: 106.8 GB") is None
+
+
+def test_demand_from_leak_post():
+    d = sources_leak.demand_stated
+    t = "Dear Acme. If you would rather not have us contact your partners, we suggest you pay the following: $500,000 in BTC or XMR. Email: crook@example.com"
+    text, amount, cur = d(t)
+    assert amount == 500000 and cur == "USD" and "crook@" not in text
+    assert d("The ransom is 12 BTC, send to session 05651c7323273b723588d47455471ee9e27feb5187a30f2933554a705aacb38358")[1:] == (12.0, "BTC")
+    assert d("We stole 1.2M contact records and 920 MB of data.") is None
+
+
+def test_header_thumb_keeps_only_the_top_and_shrinks():
+    import io
+    from PIL import Image
+    from zdc_breach import thumbs
+    im = Image.new("RGB", (1280, 3000), "white")
+    buf = io.BytesIO(); im.save(buf, "PNG")
+    webp, w, h = thumbs.header_thumb(buf.getvalue())
+    assert w == 400 and h == round(520 * 400 / 1280)          # header only, capped at 520 px of 3000
+    assert thumbs.screenshot_url("screenshots/x/Acme Ltd.png").endswith("screenshots/x/Acme%20Ltd.png")
+    assert thumbs.screenshot_url("../etc/passwd") is None and thumbs.screenshot_url("http://evil/x.png") is None
+
+
+def test_wilson_interval():
+    from zdc_breach import confidence
+    r, lo, hi = confidence.wilson(5, 100)
+    assert r == 0.05 and 0.01 < lo < 0.05 < hi < 0.12
+    assert confidence.wilson(0, 0) == (None, None, None)

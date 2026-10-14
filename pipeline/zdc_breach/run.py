@@ -27,7 +27,7 @@ import psycopg
 
 from zdc_kev import db as runs_db
 
-from . import db, evals, extract, http, reconcile, resolve, sources_leak, sources_news, sources_reg, sources_size
+from . import confidence, db, evals, extract, http, reconcile, resolve, sources_leak, sources_news, sources_reg, sources_size, thumbs
 from .fx import Fx
 from .llm import MODEL, BudgetExceeded, OpenRouter
 from .normalize import norm_country, norm_domain
@@ -37,7 +37,7 @@ log = logging.getLogger("zdc_breach")
 
 # source_id -> minimum hours between fetches
 CADENCE_H = {"ransomlook": 1, "ransomfeed": 1, "sec_8k": 1, "wa_ag": 6, "de_ag": 6, "hibp": 6,
-             "ca_ag": 24, "hhs_ocr": 24, "wikidata": 1}
+             "ca_ag": 24, "hhs_ocr": 24, "wikidata": 1, "thumbs": 1}
 CADENCE_H.update({f.source_id: 1 for f in sources_news.FEEDS})
 
 RANSOMLOOK_URL = "https://www.ransomlook.io/api/last/2"
@@ -322,6 +322,47 @@ def run_size(ctx, cur) -> dict:
     return {"looked_up": len(todo), "found": found, "not_found": missing, "errors": errors}
 
 
+# ---- leak-post header thumbnails -------------------------------------------------------------
+THUMBS_PER_RUN = 30
+THUMB_DAYS = 90
+
+
+def run_thumbs(ctx, cur) -> dict:
+    cur.execute("""select c.claim_key, r.record->>'screen'
+                     from breach_core.leak_claims c
+                     cross join lateral jsonb_array_elements(c.tracker_refs) ref
+                     join lateral (select record from breach_raw.source_records x
+                                    where x.source_id = 'ransomlook' and x.source_record_id = ref->>'id'
+                                    order by version desc limit 1) r on true
+                     left join breach_core.leak_thumbs t using (claim_key)
+                     left join breach_core.thumb_attempts a using (claim_key)
+                    where ref->>'source_id' = 'ransomlook' and t.claim_key is null
+                      and coalesce(a.attempts, 0) < 3
+                      and c.first_seen_at > now() - make_interval(days => %s)
+                      and coalesce(r.record->>'screen', '') <> ''
+                      and not breach_core.is_generic_name(c.victim_name)
+                    order by c.first_seen_at desc limit %s""", (THUMB_DAYS, THUMBS_PER_RUN))
+    made = failed = 0
+    for key, path in cur.fetchall():
+        url = thumbs.screenshot_url(path)
+        if not url:
+            continue
+        f = ctx.get(url, accept="image/*", timeout=60, max_bytes=8_000_000)
+        try:
+            if not f.ok:
+                raise RuntimeError(f.error or f"HTTP {f.status}")
+            webp, w, h = thumbs.header_thumb(f.body)
+            cur.execute("""insert into breach_core.leak_thumbs (claim_key, source_url, webp, width, height)
+                           values (%s,%s,%s,%s,%s) on conflict (claim_key) do nothing""", (key, url, webp, w, h))
+            made += 1
+        except Exception as e:  # noqa: BLE001 - a bad image is recorded and retried, never fatal
+            failed += 1
+            cur.execute("""insert into breach_core.thumb_attempts (claim_key, last_error) values (%s,%s)
+                           on conflict (claim_key) do update set attempts = breach_core.thumb_attempts.attempts + 1,
+                               last_error = excluded.last_error, last_at = now()""", (key, f"{type(e).__name__}"[:200]))
+    return {"made": made, "failed": failed}
+
+
 # ---- news ------------------------------------------------------------------------------------
 def store_doc(cur, source_id, url, title, published_at, text, record_id=None) -> str:
     sha = sources_news.doc_sha(text)
@@ -555,6 +596,8 @@ def run(conn, args, getter=http.get, llm=None, fx=None) -> dict:
                         res = run_sec(ctx, cur)
                     elif source_id == "wikidata":
                         res = run_size(ctx, cur)
+                    elif source_id == "thumbs":
+                        res = run_thumbs(ctx, cur)
                     elif source_id in feeds:
                         res = run_feed(ctx, cur, feeds[source_id])
                     else:
@@ -579,6 +622,7 @@ def run(conn, args, getter=http.get, llm=None, fx=None) -> dict:
             # including the ones that ran after the trackers.
             ctx.report["actor_links"] = link_leak_claims(cur)
             ctx.report["incident_facts"] = reconcile.build(cur)
+            ctx.report["confidence_rows"] = confidence.build(cur)
             results = evals.run_all(cur, ctx)
             if args.dry_run:
                 raise _DryRun()
