@@ -508,6 +508,34 @@ def run_media(ctx, cur) -> dict:
     return {"searched": searched, "links": found, "not_searchable": skipped}
 
 
+def link_media_from_feeds(cur) -> dict:
+    """Every stored news-feed item whose TITLE names a victim (a distinctive name, as a whole
+    phrase) and a breach term becomes a media link for that victim (0124). Links only."""
+    cur.execute("select victim_id, name, seen_date from breach_core.victims_list where name is not null")
+    idx = sources_media.index_names(cur.fetchall())
+    cur.execute("""select distinct on (r.record->>'url') r.source_id, r.record->>'url', r.record->>'title', r.record->>'published_at'
+                     from breach_raw.source_records r join breach_core.sources s using (source_id)
+                    where s.kind = 'news' and r.source_id <> 'gdelt' and coalesce(r.record->>'url', '') ~ '^https?://'
+                    order by r.record->>'url', r.version desc""")
+    rows = []
+    for sid, url, title, published in cur.fetchall():
+        if not title or not sources_media._BREACH.search(title):
+            continue
+        try:
+            pub = datetime.fromisoformat(published).date() if published else None
+        except ValueError:
+            pub = None
+        for vid, seen in set(sources_media.find_in_title(title, idx)):
+            if sources_media.in_window(pub, seen):
+                rows.append((vid, url[:2000], title[:500], url.split("/")[2][:200], published, "rss:" + sid))
+    if rows:
+        with cur.connection.pipeline():
+            cur.executemany("""insert into breach_core.victim_media (victim_id, url, title, outlet, published_at, found_via, match_basis)
+                               values (%s,%s,%s,%s,%s,%s,'title_names_victim_and_breach')
+                               on conflict (victim_id, url) do nothing""", rows)
+    return {"names_indexed": len(idx), "links": len(rows)}
+
+
 # ---- news ------------------------------------------------------------------------------------
 def store_doc(cur, source_id, url, title, published_at, text, record_id=None) -> str:
     sha = sources_news.doc_sha(text)
@@ -780,6 +808,7 @@ def run(conn, args, getter=http.get, llm=None, fx=None) -> dict:
             ctx.report["incident_facts"] = reconcile.build(cur)
             ctx.report["confidence_rows"] = confidence.build(cur)
             ctx.report["leak_facts"] = parse_leak_facts(cur)
+            ctx.report["feed_media"] = link_media_from_feeds(cur)
             # The public list and its facet counts (0117, 0118): computed once per run, not per
             # request - the live view took 17 s with the API's column list.
             # The shared database's default statement timeout is minutes, not hours; the rebuild

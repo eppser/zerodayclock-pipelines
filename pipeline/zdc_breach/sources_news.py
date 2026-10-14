@@ -42,6 +42,17 @@ FEEDS = (
     Feed("news_krebs", "https://krebsonsecurity.com/feed/", False, True),
     Feed("news_cyberscoop", "https://cyberscoop.com/feed/", False, True),
     Feed("news_cybersecuritydive", "https://www.cybersecuritydive.com/feeds/news/", False, False),
+    # 0124: links only (titles matched to victims); pages never fetched.
+    Feed("news_darkreading", "https://www.darkreading.com/rss.xml", False, False),
+    Feed("news_infosecmag", "https://www.infosecurity-magazine.com/rss/news/", False, False),
+    Feed("news_helpnetsecurity", "https://www.helpnetsecurity.com/feed/", False, False),
+    Feed("news_securityaffairs", "https://securityaffairs.com/feed", False, False),
+    Feed("news_hackread", "https://hackread.com/feed/", False, False),
+    Feed("news_techcrunch", "https://techcrunch.com/category/security/feed/", False, False),
+    Feed("news_govinfosecurity", "https://www.govinfosecurity.com/rss-feeds", False, False),
+    Feed("news_industrialcyber", "https://industrialcyber.co/feed/", False, False),
+    Feed("news_csoonline", "https://www.csoonline.com/feed/", False, False),
+    Feed("news_comparitech", "https://www.comparitech.com/news/feed/", False, False),
 )
 
 INCIDENT = re.compile(

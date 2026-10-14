@@ -19,7 +19,7 @@ INDEX_START = date(2017, 1, 1)
 PACE_S = 8.0          # GDELT asks for one request per 5 s; shared runner IPs need more
 RETRIES_429 = 3       # GDELT is often congested: a 429 that is retried 15 s later usually answers
 RETRY_SLEEP_S = 15.0
-GIVE_UP_AFTER = 5     # consecutive searches that never got an answer
+GIVE_UP_AFTER = 3     # consecutive searches that never got an answer
 _BREACH = re.compile(r"(ransom|breach|hack|cyber|attack|leak|stolen|extort|data theft|compromis|incident|"
                      r"datenleck|cyberangriff|piratage|fuite|ciberataque|violaci|attacco|lek|aanval)", re.I)
 
@@ -72,3 +72,46 @@ def parse(payload: dict, name: str) -> list[dict]:
         out.append({"url": url[:2000], "title": title[:500], "outlet": (a.get("domain") or "")[:200] or None,
                     "published_at": when, "language": (a.get("language") or "")[:40] or None})
     return out
+
+
+# ---- links from the news feeds we already read -----------------------------------------------
+def distinctive(name: str | None) -> bool:
+    """A victim name safe to look for in a headline: two or more words, or one word that cannot
+    be an ordinary word ("Target" is a verb in "Hackers target hospitals"): CamelCase, a digit,
+    or at least nine letters."""
+    n = (name or "").strip()
+    if not searchable(n) or "?" in n:
+        return False
+    words = norm(n).split()
+    if len(words) >= 2:
+        return len(norm(n)) >= 6
+    w = n.strip()
+    return bool(re.search(r"[a-z][A-Z]|\d", w)) or len(w) >= 9
+
+
+def index_names(victims) -> dict[str, list]:
+    """{normalised name: [victim ids, or (victim id, seen date)]} for distinctive names."""
+    idx: dict[str, list] = {}
+    for v in victims:
+        vid, name = v[0], v[1]
+        if distinctive(name):
+            idx.setdefault(norm(name), []).append(vid if len(v) == 2 else (vid, v[2]))
+    return idx
+
+
+def in_window(published: date | None, seen: date | None) -> bool:
+    """An article belongs to a breach only if it appeared from 30 days before the victim was first
+    seen to a year after: the same big name in an unrelated story is usually from another time."""
+    if published is None or seen is None:
+        return False
+    return seen - timedelta(days=30) <= published <= seen + timedelta(days=365)
+
+
+def find_in_title(title: str, idx: dict[str, list[str]], max_words: int = 8) -> list[str]:
+    """Victim ids whose normalised name occurs as a whole phrase in the title."""
+    words = norm(title).split()
+    hits = []
+    for i in range(len(words)):
+        for j in range(i + 1, min(len(words), i + max_words) + 1):
+            hits += idx.get(" ".join(words[i:j]), [])
+    return hits

@@ -534,3 +534,19 @@ def test_category_fact_is_gated_on_quote_cue_and_hedge():
     assert cands[2].reject_reason == "category_cue_missing"    # nothing about skimming in it
     assert cands[3].reject_reason == "quote_not_in_document"   # paraphrase
     assert cands[4].accepted and cands[4].value == "APT28"     # a named state group is an actor
+
+
+def test_feed_title_matching_is_whole_phrase_and_distinctive():
+    from zdc_breach import sources_media as sm
+    idx = sm.index_names([("v1", "Target"), ("v2", "Change Healthcare"), ("v3", "PowerSchool"),
+                          ("v4", "Hospital Sisters Health System"), ("v5", "acme.com"), ("v6", "Ascension")])
+    assert "target" not in idx and "acme com" not in idx           # an ordinary word; a bare domain
+    assert sm.find_in_title("Hackers target hospitals with ransomware", idx) == []
+    assert sm.find_in_title("Change Healthcare ransomware attack cost $2.9bn", idx) == ["v2"]
+    assert sm.find_in_title("PowerSchool breach: hacker extorted districts", idx) == ["v3"]
+    assert sm.find_in_title("Ascension restores systems after ransomware", idx) == ["v6"]    # 9 letters
+    assert sm.find_in_title("Changes to healthcare law", idx) == []
+    assert "dutch" not in sm.index_names([("v7", "Dutch ???")])
+    from datetime import date
+    assert sm.in_window(date(2026, 3, 1), date(2026, 2, 15)) and not sm.in_window(date(2026, 3, 1), date(2024, 1, 1))
+    assert not sm.in_window(None, date(2026, 1, 1))
