@@ -296,3 +296,20 @@ def test_deadline_skips_remaining_work_but_finishes(conn):
     rep = brun.run(conn, args(deadline_minutes=-1), getter=fake_get, llm=FakeLLM(), fx=NoFx())
     assert all(v.get("skipped") == "run deadline" for v in rep["sources"].values())
     assert "ok" in rep and rep["evals"]
+
+
+def test_human_review_publishes_one_fact(conn):
+    brun.run(conn, args(), getter=fake_get, llm=FakeLLM(), fx=NoFx())
+    cve = q(conn, """select c.claim_id from breach_core.claims c join breach_core.incidents i using (incident_id)
+                      join breach_core.organizations o using (org_id)
+                     where o.sec_cik = '999999' and c.field = 'cve_id' and c.accepted""")[0][0]
+    with conn.cursor() as cur:
+        cur.execute("""update breach_core.claims set review_verdict = 'confirmed', reviewer = 'test', reviewed_at = now()
+                        where claim_id = %s""", (cve,))
+        from zdc_breach import reconcile
+        reconcile.build(cur)
+    conn.commit()
+    facts = q(conn, """select f.cve_ids, f.people_affected from breach_core.incident_facts f
+                         join breach_core.incidents i using (incident_id) join breach_core.organizations o using (org_id)
+                        where o.sec_cik = '999999'""")
+    assert facts == [(["CVE-2026-40404"], None)]     # the reviewed CVE only; the unreviewed count stays private

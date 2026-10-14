@@ -76,7 +76,10 @@ def build(cur) -> int:
                     where c.accepted and c.superseded_by is null and not i.suppressed
                       -- machine-extracted facts count only from an extractor version that
                       -- passed its gold-set check and was activated
-                      and (c.extraction_id is null or (v.active and c.field = any(v.active_fields)))
+                      -- (0104) a person's confirmation also counts; a rejection never does
+                      and coalesce(c.review_verdict, '') <> 'rejected'
+                      and (c.extraction_id is null or c.review_verdict = 'confirmed'
+                           or (v.active and c.field = any(v.active_fields)))
                     order by c.incident_id, c.field, c.claim_id""")
     cols = [d.name for d in cur.description]
     by = defaultdict(lambda: defaultdict(list))
@@ -94,7 +97,9 @@ def build(cur) -> int:
                                    where c.incident_id = ic.incident_id and c.field = 'cve_id'
                                      and upper(c.value_text) = ic.cve_id and c.accepted
                                      and c.superseded_by is null
-                                     and (c.extraction_id is null or (v.active and 'cve_id' = any(v.active_fields))))
+                                     and coalesce(c.review_verdict, '') <> 'rejected'
+                                     and (c.extraction_id is null or c.review_verdict = 'confirmed'
+                                          or (v.active and 'cve_id' = any(v.active_fields))))
                     group by 1""")
     cves = dict(cur.fetchall())
     cur.execute("""select s.incident_id, count(distinct s.source_id) from breach_core.incident_sources s
