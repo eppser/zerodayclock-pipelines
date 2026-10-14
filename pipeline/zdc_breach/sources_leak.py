@@ -91,7 +91,10 @@ class LeakPost:
 
     @property
     def demand(self) -> tuple[str, float, str] | None:
-        return demand_stated(str(self.record.get("description") or ""))
+        # Withdrawn by 0115: of 57 regex "demands" ~7 were a ransom demand with the right amount;
+        # the rest quoted stolen data or a victim's revenue. demand_stated() stays, tested, for a
+        # future version that feeds the 0104 human review queue instead of the public list.
+        return None
 
     @property
     def employees(self) -> int | None:

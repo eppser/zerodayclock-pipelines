@@ -37,7 +37,8 @@ log = logging.getLogger("zdc_breach")
 
 # source_id -> minimum hours between fetches
 CADENCE_H = {"ransomlook": 1, "ransomfeed": 1, "sec_8k": 1, "wa_ag": 6, "de_ag": 6, "hibp": 6,
-             "ca_ag": 24, "hhs_ocr": 24, "wikidata": 1, "thumbs": 1}
+             "ca_ag": 24, "hhs_ocr": 24, "wikidata": 1}
+# "thumbs" is withdrawn (migration 0115): at 400 px a text-only leak page stayed readable.
 CADENCE_H.update({f.source_id: 1 for f in sources_news.FEEDS})
 
 RANSOMLOOK_URL = "https://www.ransomlook.io/api/last/2"
@@ -328,6 +329,9 @@ THUMB_DAYS = 90
 
 
 def run_thumbs(ctx, cur) -> dict:
+    # Withdrawn by 0115 (advisor review 2026-10-14): header crops still showed stolen-data text.
+    # Kept callable only so an explicit --sources thumbs fails safe instead of erroring.
+    return {"withdrawn": True}
     cur.execute("""select c.claim_key, r.record->>'screen'
                      from breach_core.leak_claims c
                      cross join lateral jsonb_array_elements(c.tracker_refs) ref
