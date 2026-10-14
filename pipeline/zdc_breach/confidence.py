@@ -82,7 +82,7 @@ def build(cur) -> int:
     for source, kind in cur.fetchall():
         note = {"regulator": "primary record: the organisation's own filing with a regulator",
                 "breach_index": "verified breach dataset (HIBP); counts are accounts",
-                "leak_tracker": "copies of ransomware leak-site posts: claims by attackers, see each group's rate"}[kind]
+                "leak_tracker": "a copy of the attackers' own post: a claim, not a confirmation"}[kind]
         rows.append(("source", source, 0, 0, None, None, None, note))
     cur.execute("delete from breach_core.source_confidence")
     if rows:
