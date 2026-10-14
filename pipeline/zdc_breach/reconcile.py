@@ -48,14 +48,20 @@ def choose(claims, order):
 
 
 def _count(claims):
+    """The chosen count, the range ACROSS SOURCES and whether they disagree.
+
+    A range is only ever between sources. Two values from one source (two Delaware notices
+    filed the same day) are not a disagreement between sources - an earlier version printed
+    "sources differ: 6,083-1,185,755" for exactly that (advisor review 2, 2026-10-14). The
+    page reads people_n_sources to say which it is."""
     best = choose(claims, COUNT_ORDER)
     if not best:
         return None
-    comparable = [Decimal(c["value_num"]) for c in claims
-                  if c["value_num"] is not None and c["qualifier"] in ("exact", "approx")]
-    lo, hi = (min(comparable), max(comparable)) if comparable else (None, None)
-    disagree = bool(lo and hi and hi > lo * Decimal("1.10"))
-    n = len({c["source_id"] for c in claims})
+    comparable = [c for c in claims if c["value_num"] is not None and c["qualifier"] in ("exact", "approx")]
+    values = [Decimal(c["value_num"]) for c in comparable]
+    lo, hi = (min(values), max(values)) if values else (None, None)
+    n = len({c["source_id"] for c in comparable})
+    disagree = bool(n > 1 and lo and hi and hi > lo * Decimal("1.10"))
     return best, lo, hi, disagree, n
 
 

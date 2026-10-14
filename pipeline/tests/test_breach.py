@@ -383,3 +383,15 @@ def test_hedged_false_is_not_a_fact():
     doc = "The SEC filing does not state whether payment was made to the attacker by Acme Health."
     [inc] = extract.validate(_out(_f("ransom_paid", False, doc)), doc)
     assert inc.candidates[0].reject_reason == "hedged"
+
+
+def test_two_values_from_one_source_are_not_a_disagreement():
+    best, lo, hi, dis, n = reconcile._count([_c("regulator_filing", 6083, cid="1", source="de_ag"),
+                                              _c("regulator_filing", 1185755, cid="2", source="de_ag")])
+    assert (lo, hi) == (6083, 1185755) and n == 1 and not dis
+
+
+def test_placeholder_dates_rejected():
+    ds, _ = sources_reg.parse_de([{"company_name": "Acme", "date_of_notice": "2026-09-25T00:00:00.000",
+                                    "date_of_breach": "1971-01-01T00:00:00.000", "total_affected": "10"}])
+    assert ds[0].event_date is None and ds[0].as_of.year == 2026

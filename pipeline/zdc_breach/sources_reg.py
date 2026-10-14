@@ -52,6 +52,13 @@ class Disclosure:
 
 
 def _d(v) -> date | None:
+    """A date as the filer wrote it, or None. Dates before 1990 are placeholders, not facts:
+    Delaware carries 19 notices dated 1971-01-01 (advisor review 2)."""
+    d = _parse_d(v)
+    return d if d is None or d.year >= 1990 else None
+
+
+def _parse_d(v) -> date | None:
     if not v:
         return None
     v = str(v).strip()

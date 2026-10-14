@@ -30,6 +30,10 @@ on:
         description: 'Ignore per-source cadence'
         type: boolean
         default: false
+      sec_days:
+        description: 'SEC 8-K Item 1.05 look-back in days (default 3; 700 backfills to Dec 2023)'
+        type: string
+        default: '3'
       backfill_leak_months:
         description: 'Backfill RansomLook leak claims for N past months instead of the normal run (0 = normal run)'
         type: string
@@ -107,9 +111,11 @@ jobs:
           SOURCES: ${{ github.event.inputs.sources }}
           FORCE: ${{ github.event.inputs.force }}
           BACKFILL: ${{ github.event.inputs.backfill_leak_months || '0' }}
+          SEC_DAYS: ${{ github.event.inputs.sec_days || '3' }}
         run: |
           # A backfill is explicitly invoked and separate from the hourly stream (CLAUDE.md).
           case "$BACKFILL" in ''|*[!0-9]*) echo "backfill_leak_months must be a number"; exit 1;; esac
+          case "$SEC_DAYS" in ''|*[!0-9]*) echo "sec_days must be a number"; exit 1;; esac
           if [ "$BACKFILL" -gt 0 ]; then
             python -m zdc_breach.run --backfill-leak-months "$BACKFILL" --report breach-backfill.json > /dev/null
             exit 0
@@ -117,6 +123,7 @@ jobs:
           python -m zdc_breach.run \
             ${SOURCES:+--sources "$SOURCES"} \
             $( [ "$FORCE" = "true" ] && echo --force ) \
+            --sec-days "$SEC_DAYS" \
             --trigger "${{ github.event_name }}" \
             --report breach-report.json
 

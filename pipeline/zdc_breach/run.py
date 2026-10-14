@@ -43,9 +43,6 @@ CADENCE_H.update({f.source_id: 1 for f in sources_news.FEEDS})
 RANSOMLOOK_URL = "https://www.ransomlook.io/api/last/2"
 RANSOMFEED_URL = "https://api.ransomfeed.it/offset/300"
 ACTOR_LINK_WINDOW = timedelta(days=60)
-CONFIRM = re.compile(r"\b(confirmed|said in a statement|announced|disclosed|notif(?:ied|ying)|"
-                     r"acknowledged|told (?:\w+ ){0,3}(?:that|it)|a spokesperson)\b", re.I)
-
 
 def extractor_id(model: str) -> str:
     return f"llm:{model}@{extract.prompt_hash(model)}"
@@ -243,15 +240,21 @@ def run_sec(ctx, cur) -> dict:
     start = today - timedelta(days=ctx.args.sec_days)
     items, bad, n_fetch = [], 0, 0
     for form in ("8-K", "8-K/A"):
-        f = _fetch(ctx, cur, "sec_8k", sources_reg.efts_url(start, today, form=form), accept="application/json")
-        n_fetch += 1
-        if not f.ok:
-            db.record_fetch(cur, ctx.run_id, "sec_8k", f, None)
-            raise RuntimeError(f.error or f"HTTP {f.status}")
-        got, b = sources_reg.parse_efts(f.json())
-        db.record_fetch(cur, ctx.run_id, "sec_8k", f, len(got))
-        items += got
-        bad += b
+        # efts returns 100 hits a page; a backfill (--sec-days 700) needs every page.
+        for offset in range(0, 2000, 100):
+            f = _fetch(ctx, cur, "sec_8k", sources_reg.efts_url(start, today, offset=offset, form=form),
+                       accept="application/json")
+            n_fetch += 1
+            if not f.ok:
+                db.record_fetch(cur, ctx.run_id, "sec_8k", f, None)
+                raise RuntimeError(f.error or f"HTTP {f.status}")
+            payload = f.json()
+            got, b = sources_reg.parse_efts(payload)
+            db.record_fetch(cur, ctx.run_id, "sec_8k", f, len(got))
+            items += got
+            bad += b
+            if len((payload.get("hits") or {}).get("hits") or []) < 100:
+                break
     counts, changed = db.store_records(cur, "sec_8k", [(d.source_record_id, d.record) for d in items], None)
     extracted = 0
     for d in items:
@@ -403,9 +406,10 @@ def extract_doc(ctx, cur, sha, text, url, title, *, forced_incident=None, forced
             # From an article, the only flags set directly are "reported" and "claimed". A model's
             # reading that a regulator or the victim said something does not unlock a name.
             resolve.set_flag(cur, inc, "threat_actor_claim" if basis == "threat_actor_claim" else "news")
-            if active and basis in ("victim_statement", "news_citing_victim") and any(
-                    c.accepted and CONFIRM.search(c.quote) for c in ei.candidates):
-                resolve.set_flag(cur, inc, "victim_statement")
+            # No victim confirmation from an article, ever, even with an active extractor:
+            # activating one field must not unlock names (advisor review 2). Confirmation
+            # comes only from a first-party document - a regulator filing or the victim's own
+            # notice - which arrive through the structured sources.
         for c in ei.candidates:
             # The candidate's own basis wins when its sentence reports an attacker's claim.
             cb = c.basis if (c.basis == "threat_actor_claim" and not forced_basis) else basis
