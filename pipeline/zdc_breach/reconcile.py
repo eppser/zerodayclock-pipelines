@@ -97,6 +97,7 @@ def build(cur) -> int:
 
     cur.execute("delete from breach_core.incident_facts")
     n = 0
+    rows: list[dict] = []
     for inc in sorted(set(by) | set(nsrc), key=str):
         f = by.get(inc, {})
         row = {"incident_id": inc, "n_sources": nsrc.get(inc, 0), "method_version": METHOD_VERSION,
@@ -137,8 +138,14 @@ def build(cur) -> int:
         dtext = choose(f.get("demand_text", []), RANSOM_ORDER)
         if dtext:
             row["demand_text"] = dtext["value_text"][:600]
-        keys = sorted(row)
-        cur.execute(f"insert into breach_core.incident_facts ({', '.join(keys)}) values ({', '.join(['%s'] * len(keys))})",
-                    [row[k] for k in keys])
+        rows.append(row)
         n += 1
+    # One pipelined batch with a fixed column list: one insert per incident cost ~7 minutes
+    # from a runner ~100 ms from the database (4,500 incidents, measured 2026-10-14).
+    if rows:
+        cols = sorted({k for r in rows for k in r})
+        with cur.connection.pipeline():
+            cur.executemany(f"insert into breach_core.incident_facts ({', '.join(cols)}) "
+                            f"values ({', '.join(['%s'] * len(cols))})",
+                            [[r.get(c, False if c == "has_disagreement" else None) for c in cols] for r in rows])
     return n

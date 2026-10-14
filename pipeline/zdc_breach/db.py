@@ -97,45 +97,75 @@ def watermark(cur, source_id: str) -> dict:
 def upsert_leak_posts(cur, posts) -> dict:
     """Fold tracker posts into posting episodes. A post joins an existing claim when the
     group matches and the victim matches by domain or normalised name within 14 days;
-    otherwise it opens a new claim. Re-running over the same posts changes nothing."""
+    otherwise it opens a new claim. Re-running over the same posts changes nothing.
+
+    In memory, then one pipelined write batch: the 12-month backfill is ~11,000 posts, and two
+    round trips each from a runner ~100 ms away would outlive the job (2026-10-14)."""
     counts = {"new_claims": 0, "joined": 0, "already": 0}
-    for p in sorted(posts, key=lambda p: p.seen_at):
+    posts = sorted(posts, key=lambda p: p.seen_at)
+    if not posts:
+        return counts
+    groups = sorted({p.actor_group for p in posts})
+    cur.execute("""select claim_key, actor_group, victim_domain, victim_norm, first_seen_at, last_seen_at,
+                          trackers, tracker_refs, country, sector
+                     from breach_core.leak_claims
+                    where actor_group = any(%s) and first_seen_at between %s and %s""",
+                (groups, posts[0].seen_at - LEAK_WINDOW, posts[-1].seen_at + LEAK_WINDOW))
+    by_group: dict = {}
+    for key, grp, dom, norm, first, last, trackers, refs, country, sector in cur.fetchall():
+        by_group.setdefault(grp, []).append({"key": key, "domain": dom, "norm": norm, "first": first, "last": last,
+                                             "trackers": list(trackers), "refs": list(refs or []),
+                                             "country": country, "sector": sector, "dirty": False, "new": False})
+    for p in posts:
         ref = {"source_id": p.source_id, "id": p.source_record_id}
-        cur.execute(
-            """select claim_key, tracker_refs from breach_core.leak_claims
-                where actor_group = %s
-                  and ((victim_domain is not null and victim_domain = %s) or victim_norm = %s)
-                  and first_seen_at between %s and %s
-                order by abs(extract(epoch from first_seen_at - %s)) limit 1""",
-            (p.actor_group, p.victim_domain, p.victim_norm, p.seen_at - LEAK_WINDOW,
-             p.seen_at + LEAK_WINDOW, p.seen_at))
-        row = cur.fetchone()
-        if row:
-            key, refs = row
-            if ref in (refs or []):
+        cands = [c for c in by_group.get(p.actor_group, [])
+                 if ((c["domain"] is not None and c["domain"] == p.victim_domain) or c["norm"] == p.victim_norm)
+                 and abs(c["first"] - p.seen_at) <= LEAK_WINDOW]
+        if cands:
+            c = min(cands, key=lambda c: abs((c["first"] - p.seen_at).total_seconds()))
+            if ref in c["refs"]:
                 counts["already"] += 1
                 continue
-            cur.execute(
-                """update breach_core.leak_claims set
-                       trackers = (select array_agg(distinct t order by t) from unnest(trackers || %s::text) t),
-                       tracker_refs = tracker_refs || %s::jsonb,
-                       victim_domain = coalesce(victim_domain, %s),
-                       country = coalesce(country, %s), sector = coalesce(sector, %s),
-                       first_seen_at = least(first_seen_at, %s), last_seen_at = greatest(last_seen_at, %s)
-                    where claim_key = %s""",
-                (p.source_id, json.dumps([ref]), p.victim_domain, p.country, p.sector,
-                 p.seen_at, p.seen_at, key))
+            c["refs"].append(ref)
+            c["trackers"] = sorted(set(c["trackers"]) | {p.source_id})
+            c["domain"] = c["domain"] or p.victim_domain
+            c["country"] = c["country"] or p.country
+            c["sector"] = c["sector"] or p.sector
+            c["first"], c["last"] = min(c["first"], p.seen_at), max(c["last"], p.seen_at)
+            c["dirty"] = True
             counts["joined"] += 1
         else:
             key = f"{p.actor_group}|{p.victim_domain or p.victim_norm}|{p.seen_at.date().isoformat()}"
-            cur.execute(
-                """insert into breach_core.leak_claims (claim_key, actor_group, victim_name, victim_norm,
-                       victim_domain, country, sector, first_seen_at, last_seen_at, trackers, tracker_refs)
-                   values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                   on conflict (claim_key) do nothing""",
-                (key, p.actor_group, p.victim_name, p.victim_norm, p.victim_domain, p.country,
-                 p.sector, p.seen_at, p.seen_at, [p.source_id], Jsonb([ref])))
-            counts["new_claims"] += cur.rowcount
+            existing = next((c for c in by_group.get(p.actor_group, []) if c["key"] == key), None)
+            if existing:            # the same key opened earlier in this batch or a previous run
+                counts["already"] += 1
+                continue
+            by_group.setdefault(p.actor_group, []).append(
+                {"key": key, "domain": p.victim_domain, "norm": p.victim_norm, "first": p.seen_at, "last": p.seen_at,
+                 "trackers": [p.source_id], "refs": [ref], "country": p.country, "sector": p.sector,
+                 "dirty": True, "new": True, "group": p.actor_group, "name": p.victim_name})
+            counts["new_claims"] += 1
+    inserts, updates = [], []
+    for grp, cs in by_group.items():
+        for c in cs:
+            if not c["dirty"]:
+                continue
+            if c["new"]:
+                inserts.append((c["key"], grp, c["name"], c["norm"], c["domain"], c["country"], c["sector"],
+                                c["first"], c["last"], c["trackers"], Jsonb(c["refs"])))
+            else:
+                updates.append((c["trackers"], Jsonb(c["refs"]), c["domain"], c["country"], c["sector"],
+                                c["first"], c["last"], c["key"]))
+    with cur.connection.pipeline():
+        if inserts:
+            cur.executemany("""insert into breach_core.leak_claims (claim_key, actor_group, victim_name, victim_norm,
+                                   victim_domain, country, sector, first_seen_at, last_seen_at, trackers, tracker_refs)
+                               values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) on conflict (claim_key) do nothing""", inserts)
+        if updates:
+            cur.executemany("""update breach_core.leak_claims set trackers = %s, tracker_refs = %s,
+                                   victim_domain = %s, country = %s, sector = %s,
+                                   first_seen_at = %s, last_seen_at = %s
+                                where claim_key = %s""", updates)
     return counts
 
 
