@@ -451,3 +451,27 @@ def test_organization_en_not_written_in_the_document_is_never_a_key(conn):
         cur.execute("select aliases, alias_norms from breach_core.organizations where org_id = %s", (en,))
         assert cur.fetchone() == ([], [])
     conn.rollback()
+
+
+def test_one_group_spelled_two_ways_across_trackers_is_one_claim(conn):
+    """RansomFeed writes "thegentlemen" and "incransom" where RansomLook writes "the gentlemen" and
+    "inc ransom": measured 2026-10-19, ~110 October victims were counted twice. Groups compare by
+    actor_norm, the same key the actor table uses."""
+    from zdc_breach import db as bdb
+    from zdc_breach.sources_leak import LeakPost
+    posts = [LeakPost("ransomlook", "g-1", "the gentlemen", "Aquatech Ltd", None, None, None, D(3), {}),
+             LeakPost("ransomfeed", "g-2", "thegentlemen", "Aquatech Ltd", None, None, None, D(2), {}),
+             LeakPost("ransomlook", "v-1", "vexy", "Small Bakery GmbH", None, None, None, D(3), {}),
+             LeakPost("ransomfeed", "v-2", "vexy ransomware", "Small Bakery GmbH", None, None, None, D(3), {}),
+             # a different group naming the same victim is still a second claim
+             LeakPost("ransomlook", "q-1", "qilin", "Aquatech Ltd", None, None, None, D(3), {})]
+    with conn.cursor() as cur:
+        bdb.upsert_leak_posts(cur, posts)
+    conn.commit()
+    got = q(conn, """select victim_name, array_to_string(trackers, ','), jsonb_array_length(tracker_refs)
+                       from breach_core.leak_claims order by 1, 2""")
+    assert got == [("Aquatech Ltd", "ransomfeed,ransomlook", 2), ("Aquatech Ltd", "ransomlook", 1),
+                   ("Small Bakery GmbH", "ransomfeed,ransomlook", 2)], got
+    # a new claim keeps the group as the post that opened it wrote it
+    assert q(conn, "select distinct actor_group from breach_core.leak_claims order by 1") == \
+        [("qilin",), ("the gentlemen",), ("vexy",)]

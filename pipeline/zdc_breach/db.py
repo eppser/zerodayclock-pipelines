@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from psycopg.types.json import Jsonb
 
 from .http import Fetched
+from .sources_actors import norm as actor_norm
 
 LEAK_WINDOW = timedelta(days=14)
 
@@ -109,15 +110,20 @@ def upsert_leak_posts(cur, posts) -> dict:
     posts = sorted(posts, key=lambda p: p.seen_at)
     if not posts:
         return counts
-    groups = sorted({p.actor_group for p in posts})
+    # Groups compare by actor_norm, not as written: RansomFeed writes "thegentlemen" and "incransom"
+    # where RansomLook writes "the gentlemen" and "inc ransom" (measured 2026-10-19: ~110 October
+    # victims counted twice). A new claim's key keeps the spelling of the post that opened it.
+    gkey = lambda g: actor_norm(g) or (g or "")  # noqa: E731
+    groups = sorted({gkey(p.actor_group) for p in posts})
     cur.execute("""select claim_key, actor_group, victim_domain, victim_norm, first_seen_at, last_seen_at,
                           trackers, tracker_refs, country, sector, employees_stated, demand_text, victim_name
                      from breach_core.leak_claims
-                    where actor_group = any(%s) and first_seen_at between %s and %s""",
+                    where coalesce(breach_core.actor_norm(actor_group), actor_group) = any(%s)
+                      and first_seen_at between %s and %s""",
                 (groups, posts[0].seen_at - LEAK_WINDOW, posts[-1].seen_at + LEAK_WINDOW))
     by_group: dict = {}
     for key, grp, dom, norm, first, last, trackers, refs, country, sector, emp, dem, vname in cur.fetchall():
-        by_group.setdefault(grp, []).append({"key": key, "domain": dom, "norm": norm, "first": first, "last": last,
+        by_group.setdefault(gkey(grp), []).append({"key": key, "domain": dom, "norm": norm, "first": first, "last": last,
                                              "name": vname,
                                              "trackers": list(trackers), "refs": list(refs or []),
                                              "country": country, "sector": sector, "employees": emp,
@@ -125,7 +131,7 @@ def upsert_leak_posts(cur, posts) -> dict:
                                              "dirty": False, "new": False})
     for p in posts:
         ref = {"source_id": p.source_id, "id": p.source_record_id}
-        cands = [c for c in by_group.get(p.actor_group, [])
+        cands = [c for c in by_group.get(gkey(p.actor_group), [])
                  # an empty normalised name (a Korean, Cyrillic, Greek or Arabic name) matches nothing
                  # (the raw name, spacing and case aside, stands in for it there)
                  if ((c["domain"] is not None and c["domain"] == p.victim_domain)
@@ -157,25 +163,25 @@ def upsert_leak_posts(cur, posts) -> dict:
             # victims of one group on one day stay two claims
             who = p.victim_domain or p.victim_norm or "name:" + _raw(p.victim_name)
             key = f"{p.actor_group}|{who}|{p.seen_at.date().isoformat()}"
-            existing = next((c for c in by_group.get(p.actor_group, []) if c["key"] == key), None)
+            existing = next((c for c in by_group.get(gkey(p.actor_group), []) if c["key"] == key), None)
             if existing:            # the same key opened earlier in this batch or a previous run
                 counts["already"] += 1
                 continue
-            by_group.setdefault(p.actor_group, []).append(
+            by_group.setdefault(gkey(p.actor_group), []).append(
                 {"key": key, "domain": p.victim_domain, "norm": p.victim_norm, "first": p.seen_at, "last": p.seen_at,
                  "trackers": [p.source_id], "refs": [ref], "country": p.country, "sector": p.sector,
                  "employees": p.employees, "demand": p.demand, "demand_new": p.demand is not None,
                  "dirty": True, "new": True, "group": p.actor_group, "name": p.victim_name})
             counts["new_claims"] += 1
     inserts, updates, demands = [], [], []
-    for grp, cs in by_group.items():
+    for cs in by_group.values():
         for c in cs:
             if not c["dirty"]:
                 continue
             if c.get("demand_new") and c["demand"]:
                 demands.append((c["demand"][0], c["demand"][1], c["demand"][2], c["key"]))
             if c["new"]:
-                inserts.append((c["key"], grp, c["name"], c["norm"], c["domain"], c["country"], c["sector"],
+                inserts.append((c["key"], c["group"], c["name"], c["norm"], c["domain"], c["country"], c["sector"],
                                 c["first"], c["last"], c["trackers"], Jsonb(c["refs"]), c["employees"]))
             else:
                 updates.append((c["trackers"], Jsonb(c["refs"]), c["domain"], c["country"], c["sector"],
