@@ -21,6 +21,7 @@ repository, so pull requests here cannot be merged. Please open an issue instead
 | `crowdsec-pipeline.yml` | `zdc_crowdsec` | CrowdSec tracker exploitation counts per CVE (licensed API) |
 | `osm-pipeline.yml` | `zdc_osm` | OpenSourceMalware's latest verified malicious packages (token-gated) |
 | `netthreat-pipeline.yml` | `zdc_netthreat` | Weekly per-network threat scores from nine licensed and public sources |
+| `aicap-pipeline.yml` | `zdc_aicap` | Weekly AI cyber capability results from independent evaluators, and new-benchmark discovery |
 
 The licensed pipelines log, summarise and report aggregates only (counts, model parameters,
 check results): never an IP address, a feed record, a network name or a per-network score.

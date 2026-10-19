@@ -1,0 +1,7 @@
+[
+  {"id": "vals", "name": "Vals AI", "kind": "independent", "url": "https://www.vals.ai", "develops_models": [], "note": "Independent evaluation company; runs every model in its own harness."},
+  {"id": "us-caisi", "name": "US Center for AI Standards and Innovation (NIST)", "kind": "government", "url": "https://www.nist.gov/caisi", "develops_models": [], "note": "Government evaluator; tests US models with cyber safeguards disabled where applicable."},
+  {"id": "uk-aisi", "name": "UK AI Security Institute", "kind": "government", "url": "https://www.aisi.gov.uk", "develops_models": [], "note": "Government evaluator."},
+  {"id": "berkeley-rdi", "name": "ExploitGym authors (UC Berkeley RDI with Anthropic, OpenAI and Google researchers)", "kind": "academic", "url": "https://rdi.berkeley.edu", "develops_models": ["Anthropic", "OpenAI", "Google"], "note": "Co-written with researchers from Anthropic, OpenAI and Google; Claude results \"obtained in collaboration with Anthropic\". Results on those developers' models are not independent and are refused."},
+  {"id": "microsoft-research", "name": "Microsoft researchers (benchmark authors)", "kind": "vendor_research", "url": "https://www.microsoft.com/research", "develops_models": ["Microsoft"], "note": "Develops models itself: its results on Microsoft models are self-evaluations and are refused. Microsoft is also an investor in OpenAI and Anthropic; neither CTI-REALM nor ExCyTIn states that either commissioned it."}
+]

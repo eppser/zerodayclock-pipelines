@@ -1,0 +1,121 @@
+name: AI cyber capability pipeline
+
+# Weekly, Mondays 08:00 UTC: reads vals.ai's CyberBench board and its index, loads the curated
+# registry (results published by government evaluators and benchmark authors), searches arXiv,
+# GitHub, Hugging Face and vals.ai for candidate new cyber benchmarks, runs every gate, and writes
+# only if nothing blocks (migration 0129, pipeline/zdc_aicap). Only results from evaluators who did
+# not build the model are stored; nothing a lab reports about its own model is read.
+#
+# Runs in the PUBLIC pipelines repository (free minutes). The logs, the summary and the report carry
+# aggregates and check results only: counts, versions, candidate links. vals.ai's board is "all
+# rights reserved" and is never printed here or uploaded as an artifact.
+#
+# DELIBERATELY NO LOCAL-HOUR GUARD: every write is a new snapshot keyed on the run, and a gate
+# blocks any score that moves within a board version, so a run landing late or twice is harmless.
+
+on:
+  schedule:
+    - cron: '0 8 * * 1'
+  workflow_dispatch:
+    inputs:
+      environment:
+        # staging only until Vals AI grants permission to republish its board
+        description: 'Target environment'
+        type: choice
+        options: [staging]
+        default: staging
+      skip_discovery:
+        description: 'Skip the search for new benchmarks'
+        type: boolean
+        default: false
+
+concurrency:
+  group: aicap-pipeline-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Tests run in their own job with no environment, so neither the test tooling nor anything it
+  # installs can reach the database.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-ci.txt
+      - name: Unit tests and registry validation
+        run: python -m pytest -q tests/test_aicap.py
+
+  weekly:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Mask database connection details
+        working-directory: .
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.parse
+          u = urllib.parse.urlsplit(os.environ.get("DATABASE_URL", ""))
+          for v in {u.hostname, u.username, u.password}:
+              if v:
+                  print(f"::add-mask::{v}")
+                  print(f"::add-mask::{urllib.parse.unquote(v)}")
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-run.txt
+
+      - name: Run pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SKIP_DISCOVERY: ${{ github.event.inputs.skip_discovery }}
+        run: |
+          args=(--trigger "$GITHUB_EVENT_NAME" --report aicap-report.json)
+          if [ "$SKIP_DISCOVERY" = "true" ]; then args+=(--skip-discovery); fi
+          python -m zdc_aicap.run "${args[@]}"
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f aicap-report.json ]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r = json.load(open("aicap-report.json"))
+          print(f"### AI cyber capability — {'OK' if r.get('ok') else 'BLOCKED'}\n")
+          print(f"- vals.ai board: v{r.get('vals_version')} · {r.get('vals_models')} models")
+          print(f"- curated results: {r.get('curated_results')} · observations written: {r.get('observations') if r.get('ok') else 0}")
+          print(f"- candidate benchmarks found: {r.get('candidates_found')} · new this week: {len(r.get('candidates_new') or [])}\n")
+          for u in (r.get("candidates_new") or [])[:20]:
+              print(f"  - {u}")
+          print("\n| check | severity | result |")
+          print("|---|---|---|")
+          for c in r.get("checks", []):
+              print(f"| {c['name']} | {c['severity']} | {'PASS' if c['passed'] else 'FAIL'} — {c['summary']} |")
+          PY
+          else
+            echo "No report produced — the run failed before evaluation." >> "$GITHUB_STEP_SUMMARY"
+          fi
