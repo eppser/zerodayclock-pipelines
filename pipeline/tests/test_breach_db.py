@@ -475,3 +475,39 @@ def test_one_group_spelled_two_ways_across_trackers_is_one_claim(conn):
     # a new claim keeps the group as the post that opened it wrote it
     assert q(conn, "select distinct actor_group from breach_core.leak_claims order by 1") == \
         [("qilin",), ("the gentlemen",), ("vexy",)]
+
+
+def test_news_backfill_stores_short_japanese_summaries_and_repairs_earlier_runs(conn):
+    """The archive backfill used a fixed 200-character minimum, so every Japanese feed summary
+    (50-180 characters) was stored as a record and never as a document: 945 items, 0 documents
+    on 2026-10-19. It now uses the per-language minimum, and re-running it gives an already-stored
+    item the document it should have had."""
+    import types
+    from datetime import datetime as _dt, timezone as _tz
+    from zdc_breach import run, http
+    summary = ("株式会社サンプル物流は、外部からの不正アクセスにより顧客の個人情報約1万2000件が流出したと発表した。"
+               "同社は警察に相談し、対象となる顧客に個別に連絡している。")
+    rss = (f"""<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>t</title>
+<item><title>サンプル物流に不正アクセス</title><link>https://www.security-next.com/999999</link>
+<guid>https://www.security-next.com/999999</guid><pubDate>Mon, 12 Oct 2026 01:00:00 +0000</pubDate>
+<description>{summary}</description></item></channel></rss>""").encode()
+    now = _dt.now(_tz.utc)
+
+    def getter(url, **kw):
+        body = rss if url.endswith("paged=2") else b'<?xml version="1.0"?><rss version="2.0"><channel></channel></rss>'
+        return http.Fetched(url, 200, body, None, now, now, {})
+    args = types.SimpleNamespace(backfill_news_since="2024-01-01", sources="news_jp_securitynext",
+                                 deadline_minutes=5, backfill_news_start_page=2, backfill_news_pages=2)
+    assert 60 <= len(summary) < 200
+    # the broken run stored the record and no document (documents are insert-only, so the test
+    # recreates that state rather than deleting a document)
+    from zdc_breach import sources_news, db as bdb
+    item = sources_news.parse_feed("news_jp_securitynext", rss)[0]
+    with conn.cursor() as cur:
+        bdb.store_records(cur, "news_jp_securitynext", [(item.guid, {"url": item.url, "title": item.title,
+                          "published_at": item.published_at.isoformat(), "summary": item.summary})], None)
+    conn.commit()
+    assert q(conn, "select count(*) from breach_raw.documents where source_id = 'news_jp_securitynext'") == [(0,)]
+    again = run.backfill_news(conn, args, getter=getter)
+    assert q(conn, "select count(*) from breach_raw.documents where source_id = 'news_jp_securitynext'") == [(1,)], again
+    assert again["news_jp_securitynext"]["documents"] == 1

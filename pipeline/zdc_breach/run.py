@@ -932,10 +932,13 @@ def backfill_news(conn, args, getter=http.get) -> dict:
                 counts, changed = db.store_records(cur, sid, [(i.guid, {"url": i.url, "title": i.title,
                                                    "published_at": i.published_at.isoformat() if i.published_at else None,
                                                    "summary": i.summary[:4000]}) for i in rel], fid)
+                # every relevant item meeting its language's minimum gets its document, changed or
+                # not: store_doc is idempotent, and a re-run repairs items an earlier run stored
+                # without one (the fixed 200-character floor dropped every Japanese summary)
                 for it in rel:
-                    if it.guid in changed and len(it.summary) >= 200:
+                    if feed.extract and len(it.summary) >= MIN_DOC_CHARS[extract.language(it.summary, sid)]:
                         store_doc(cur, sid, it.url, it.title, it.published_at, it.summary, it.guid)
-                        docs += 1
+                        docs += cur.rowcount
                 stored += len(changed)
             pages += 1
             if all(i.published_at is not None and i.published_at < since for i in items):
