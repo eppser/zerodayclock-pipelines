@@ -34,6 +34,14 @@ on:
         description: 'SEC 8-K Item 1.05 look-back in days (default 3; 700 backfills to Dec 2023)'
         type: string
         default: '3'
+      backfill_news_pages:
+        description: 'Backfill N archive pages per news outlet (WordPress ?paged=N; 0 = normal run). "sources" picks outlets'
+        type: string
+        default: '0'
+      backfill_news_start_page:
+        description: 'First archive page for the news backfill (resume with the previous run''s next_page)'
+        type: string
+        default: '2'
       backfill_leak_months:
         description: 'Backfill RansomLook leak claims for N past months instead of the normal run (0 = normal run)'
         type: string
@@ -112,11 +120,19 @@ jobs:
           SOURCES: ${{ github.event.inputs.sources }}
           FORCE: ${{ github.event.inputs.force }}
           BACKFILL: ${{ github.event.inputs.backfill_leak_months || '0' }}
+          NEWS_PAGES: ${{ github.event.inputs.backfill_news_pages || '0' }}
+          NEWS_START: ${{ github.event.inputs.backfill_news_start_page || '2' }}
           SEC_DAYS: ${{ github.event.inputs.sec_days || '3' }}
         run: |
           # A backfill is explicitly invoked and separate from the hourly stream (CLAUDE.md).
           case "$BACKFILL" in ''|*[!0-9]*) echo "backfill_leak_months must be a number"; exit 1;; esac
           case "$SEC_DAYS" in ''|*[!0-9]*) echo "sec_days must be a number"; exit 1;; esac
+          case "$NEWS_PAGES$NEWS_START" in *[!0-9]*) echo "news backfill inputs must be numbers"; exit 1;; esac
+          if [ "$NEWS_PAGES" -gt 0 ]; then
+            python -m zdc_breach.run --backfill-news-pages "$NEWS_PAGES" --backfill-news-start-page "$NEWS_START" \
+              ${SOURCES:+--sources "$SOURCES"} --deadline-minutes 42 --report breach-backfill.json > /dev/null
+            exit 0
+          fi
           if [ "$BACKFILL" -gt 0 ]; then
             python -m zdc_breach.run --backfill-leak-months "$BACKFILL" --report breach-backfill.json > /dev/null
             exit 0

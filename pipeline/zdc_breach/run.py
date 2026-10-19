@@ -869,6 +869,67 @@ def backfill_leaks(conn, args, getter=http.get) -> dict:
     return out
 
 
+# Outlets whose WordPress feed pages back through its archive (?paged=N), checked 2026-10-19.
+ARCHIVE_FEEDS = ("news_hipaajournal", "news_databreaches", "news_securityaffairs", "news_hackread",
+                 "news_comparitech", "news_securityweek", "news_cyberscoop", "news_industrialcyber")
+
+
+def backfill_news(conn, args, getter=http.get) -> dict:
+    """Explicitly invoked, never hourly (CLAUDE.md: backfills are separate): an outlet's feed
+    archive, page by page (?paged=N, 10 items a page), back to --backfill-news-since. Items are
+    stored exactly as the hourly feed run stores them - relevant ones only, feed text only, pages
+    never fetched - so the headline-to-victim links and the extractor treat them alike. Stops at
+    the first page that fails, is empty, or is entirely older than the cut-off."""
+    import time
+    since = datetime.fromisoformat(args.backfill_news_since).replace(tzinfo=timezone.utc)
+    feeds = {f.source_id: f for f in sources_news.FEEDS}
+    wanted = [s for s in (args.sources.split(",") if args.sources else ARCHIVE_FEEDS) if s in ARCHIVE_FEEDS]
+    deadline = datetime.now(timezone.utc) + timedelta(minutes=args.deadline_minutes)
+    out = {}
+    for sid in wanted:
+        feed = feeds[sid]
+        pages = stored = docs = 0
+        stop = "page limit"
+        for n in range(args.backfill_news_start_page, args.backfill_news_start_page + args.backfill_news_pages):
+            if datetime.now(timezone.utc) > deadline:
+                stop = "run deadline"
+                break
+            url = feed.url + ("&" if "?" in feed.url else "?") + f"paged={n}"
+            f = getter(url, accept="application/rss+xml, application/atom+xml, */*", timeout=60)
+            with conn.transaction(), conn.cursor() as cur:
+                if not f.ok:
+                    db.record_fetch(cur, None, sid, f, None)
+                    stop = f"HTTP {f.status} at page {n}"
+                    break
+                try:
+                    items = sources_news.parse_feed(sid, f.body)
+                except Exception:  # noqa: BLE001 - an unparseable page ends this outlet's backfill
+                    db.record_fetch(cur, None, sid, f, None)
+                    stop = f"unparseable page {n}"
+                    break
+                fid = db.record_fetch(cur, None, sid, f, len(items))
+                if not items:
+                    stop = f"empty page {n}"
+                    break
+                rel = [i for i in items if i.relevant and (i.published_at is None or i.published_at >= since)]
+                counts, changed = db.store_records(cur, sid, [(i.guid, {"url": i.url, "title": i.title,
+                                                   "published_at": i.published_at.isoformat() if i.published_at else None,
+                                                   "summary": i.summary[:4000]}) for i in rel], fid)
+                for it in rel:
+                    if it.guid in changed and len(it.summary) >= 200:
+                        store_doc(cur, sid, it.url, it.title, it.published_at, it.summary, it.guid)
+                        docs += 1
+                stored += len(changed)
+            pages += 1
+            if all(i.published_at is not None and i.published_at < since for i in items):
+                stop = f"reached {args.backfill_news_since} at page {n}"
+                break
+            time.sleep(1.5)
+        out[sid] = {"pages": pages, "stored": stored, "documents": docs, "stopped": stop,
+                    "next_page": args.backfill_news_start_page + pages}
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="zdc-breach")
     ap.add_argument("--sources", default="")
@@ -885,9 +946,21 @@ def main(argv=None) -> int:
     ap.add_argument("--report")
     ap.add_argument("--backfill-leak-months", type=int, default=0,
                     help="backfill RansomLook's monthly archive for N months, then exit")
+    ap.add_argument("--backfill-news-pages", type=int, default=0,
+                    help="backfill N archive pages per outlet (WordPress ?paged=N), then exit")
+    ap.add_argument("--backfill-news-start-page", type=int, default=2)
+    ap.add_argument("--backfill-news-since", default="2024-01-01")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
     conn = psycopg.connect(os.environ["DATABASE_URL"], autocommit=False)
+    if args.backfill_news_pages:
+        res = backfill_news(conn, args)
+        text = json.dumps({"backfill_news": res}, indent=2, default=str)
+        if args.report:
+            with open(args.report, "w") as fh:
+                fh.write(text)
+        print(text)
+        return 0
     if args.backfill_leak_months:
         res = backfill_leaks(conn, args)
         text = json.dumps({"backfill": res}, indent=2)
