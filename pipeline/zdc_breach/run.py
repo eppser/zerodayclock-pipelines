@@ -886,7 +886,9 @@ def backfill_leaks(conn, args, getter=http.get) -> dict:
 
 # Outlets whose WordPress feed pages back through its archive (?paged=N), checked 2026-10-19.
 ARCHIVE_FEEDS = ("news_hipaajournal", "news_databreaches", "news_securityaffairs", "news_hackread",
-                 "news_comparitech", "news_securityweek", "news_cyberscoop", "news_industrialcyber")
+                 "news_comparitech", "news_securityweek", "news_cyberscoop", "news_industrialcyber",
+                 # Japanese publishers on WordPress: ?paged=N reaches back months (checked 2026-10-19)
+                 "news_jp_securitynext", "news_jp_cybersecurityjp")
 
 
 def backfill_news(conn, args, getter=http.get) -> dict:
