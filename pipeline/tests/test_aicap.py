@@ -502,6 +502,9 @@ def test_no_board_content_reaches_the_public_log_or_report(db, monkeypatch, capl
     # the detail is kept, privately, on the run record
     notes = db.execute("select notes from raw.pipeline_runs where pipeline = 'aicap' order by started_at desc limit 1").fetchone()[0]
     assert "lab2/model-2" in json.dumps(notes)
+    # the whole list, not the first four in a summary
+    share = next(c for c in notes["checks"] if c["name"] == "vals_error_share")
+    assert any("lab3/model-3" in m for m in share["detail"]["models"])
     # an exception whose text quotes a row (psycopg's DETAIL line) is not printed either
     from zdc_aicap import db as adb
     def boom(conn, rows):

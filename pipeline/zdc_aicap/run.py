@@ -266,8 +266,8 @@ def run(args, http: Http, today: dt.date) -> int:
                                    entries_seen=len(rows), entries_inserted=report.get("written", 0),
                                    # the full check detail, board content included, lives only in the private database
                                    notes={"vals_version": report.get("vals_version"), "candidates_found": len(cands),
-                                          "checks": [{"name": r.name, "severity": r.severity, "passed": r.passed, "summary": r.summary}
-                                                     for r in results]})
+                                          "checks": [{"name": r.name, "severity": r.severity, "passed": r.passed, "summary": r.summary,
+                                                      "detail": r.detail} for r in results]})
                 c.commit()
             finally:
                 if c is not conn:
