@@ -16,27 +16,71 @@ Incident identity for one organisation:
   not equal: both incidents stay, and the page counts the pair once;
 - otherwise a new incident.
 A manual override (breach_core.match_overrides) beats every rule.
+
+ACROSS LANGUAGES (0130). An extractor may give an organisation's English or romanised name
+(organization_en) beside the name as written in a Japanese article. It is stored as an alias
+(organizations.aliases) and, ONLY when the article itself writes that name, as a match key
+(alias_norms). A key is used for ONE thing: finding the same organisation by name when the
+article's own name does not match - "アスクル" with alias
+"ASKUL" is found by a later English "Askul", and the reverse. It is a NAME match, with the same
+country rule and the same consequence (incidents merge only on the same stated event date,
+otherwise possible_duplicate_of); it never makes a hard key and is never evidence.
 """
 
 from __future__ import annotations
 
 from datetime import date, timedelta
 
-from .normalize import norm_domain, norm_name
+from .normalize import has_cjk, norm_domain, norm_name
 
 EVENT_WINDOW = timedelta(days=30)
 PUBLIC_WINDOW = timedelta(days=90)
 
 
+# An alias shorter than this is not used to find an organisation: "NTT" or "AGC" alone names
+# too many things to carry a model's romanisation across languages.
+MIN_ALIAS_LEN = 4
+
+
+def _alias(name_en: str | None, nn: str, name: str, in_text: bool) -> tuple[str, str, bool] | None:
+    """(alias, its norm, is_key) when name_en is worth storing: given for a name written in Han or
+    kana (this is for crossing languages, not for a model's view that "Change Healthcare" is
+    "UnitedHealth"), long enough, and distinct from the name itself. is_key - whether it may be
+    used to MATCH - only when the document itself writes the name (review 2026-10-19: a model's
+    "Toyota" for トヨタ紡織 would otherwise join every Toyota report to the subsidiary)."""
+    if not name_en or not has_cjk(name):
+        return None
+    an = norm_name(name_en)
+    if len(an.replace(" ", "")) < MIN_ALIAS_LEN or an == nn:
+        return None
+    return name_en.strip()[:300], an, bool(in_text)
+
+
+def _add_alias(cur, org_id, alias):
+    """Store the alias on a Han/kana-named organisation; add its norm to alias_norms (the match
+    keys) only when it is a key. An organisation named in Latin script never takes one."""
+    if not alias:
+        return
+    cur.execute("""update breach_core.organizations
+                      set aliases = case when %s = any(aliases) then aliases else array_append(aliases, %s) end,
+                          alias_norms = case when not %s or alias_norms @> array[%s] then alias_norms
+                                             else array_append(alias_norms, %s) end
+                    where org_id = %s and breach_core.norm_name_cjk(display_name) is not null""",
+                (alias[0], alias[0], alias[2], alias[1], alias[1], org_id))
+
+
 def find_or_create_org(cur, *, name: str, domain: str | None = None, cik: str | None = None,
-                       country: str | None = None, sector: str | None = None) -> tuple[str, str]:
-    """(org_id, how) where how is 'sec_cik' | 'domain' | 'name' | 'new'."""
+                       country: str | None = None, sector: str | None = None,
+                       name_en: str | None = None, name_en_in_text: bool = False) -> tuple[str, str]:
+    """(org_id, how) where how is 'sec_cik' | 'domain' | 'name' | 'name_en' | 'new'."""
     nn = norm_name(name)
     domain = norm_domain(domain)
+    alias = _alias(name_en, nn, name, name_en_in_text)
     if cik:
         cur.execute("select org_id from breach_core.organizations where sec_cik = %s", (cik,))
         r = cur.fetchone()
         if r:
+            _add_alias(cur, r[0], alias)
             return r[0], "sec_cik"
     if domain:
         cur.execute("select org_id from breach_core.organizations where domain = %s order by created_at limit 1", (domain,))
@@ -44,22 +88,34 @@ def find_or_create_org(cur, *, name: str, domain: str | None = None, cik: str | 
         if r:
             if cik:
                 cur.execute("update breach_core.organizations set sec_cik = coalesce(sec_cik, %s) where org_id = %s", (cik, r[0]))
+            _add_alias(cur, r[0], alias)
             return r[0], "domain"
-    if nn:
-        cur.execute("""select org_id from breach_core.organizations
-                        where norm_name = %s and coalesce(country, '') = coalesce(%s, '')
-                          and (%s::text is null or sec_cik is null or sec_cik = %s)
-                        order by created_at limit 1""", (nn, country, cik, cik))
+    # By name: the organisation's own normalised name first, then a match key another language
+    # gave it, then this row's alias - only if it is a key - against names and keys stored (0130).
+    # `alias_norms @> array[...]` rather than `= any(...)`, so the GIN index serves it.
+    steps = [(nn, "name", "norm_name = %s", 1), (nn, "name", "alias_norms @> array[%s]", 1)]
+    if alias and alias[2]:
+        steps.append((alias[1], "name_en", "(norm_name = %s or alias_norms @> array[%s])", 2))
+    for key, how, where, n in steps:
+        if not key or ("alias_norms" in where and len(key.replace(" ", "")) < MIN_ALIAS_LEN):
+            continue
+        cur.execute(f"""select org_id from breach_core.organizations
+                         where {where} and coalesce(country, '') = coalesce(%s, '')
+                           and (%s::text is null or sec_cik is null or sec_cik = %s)
+                         order by created_at limit 1""", (key,) * n + (country, cik, cik))
         r = cur.fetchone()
         if r:
             cur.execute("""update breach_core.organizations set
                                domain = coalesce(domain, %s), sec_cik = coalesce(sec_cik, %s),
                                sector = coalesce(sector, %s)
                             where org_id = %s""", (domain, cik, sector, r[0]))
-            return r[0], "name"
-    cur.execute("""insert into breach_core.organizations (display_name, norm_name, domain, country, sector, sec_cik)
-                   values (%s,%s,%s,%s,%s,%s) returning org_id""",
-                (name.strip()[:300], nn, domain, country, sector, cik))
+            _add_alias(cur, r[0], alias)
+            return r[0], how
+    cur.execute("""insert into breach_core.organizations (display_name, norm_name, domain, country, sector, sec_cik,
+                                                          aliases, alias_norms)
+                   values (%s,%s,%s,%s,%s,%s,%s,%s) returning org_id""",
+                (name.strip()[:300], nn, domain, country, sector, cik,
+                 [alias[0]] if alias else [], [alias[1]] if alias and alias[2] else []))
     return cur.fetchone()[0], "new"
 
 
@@ -177,12 +233,14 @@ class Resolver:
     def __init__(self, cur):
         self.cur = cur
         self.writes: list[tuple[str, tuple]] = []
-        cur.execute("""select org_id, norm_name, domain, country, sec_cik from breach_core.organizations
+        cur.execute("""select org_id, norm_name, domain, country, sec_cik, alias_norms from breach_core.organizations
                         order by created_at, org_id""")
-        self.by_cik, self.by_domain, self.by_name = {}, {}, {}
+        self.by_cik, self.by_domain, self.by_name, self.by_alias = {}, {}, {}, {}
         self.org_cik = {}
-        for oid, nn, dom, ctry, cik in cur.fetchall():
+        for oid, nn, dom, ctry, cik, aliases in cur.fetchall():
             self._index_org(oid, nn, dom, ctry, cik)
+            for an in aliases or ():
+                self.by_alias.setdefault((an, ctry or ""), oid)
         cur.execute("""select org_id, incident_id, event_date, first_public_date from breach_core.incidents
                         order by first_public_date, incident_id""")
         self.incidents: dict = {}
@@ -215,6 +273,8 @@ class Resolver:
             return oid, "domain"
         if nn:
             oid = self.by_name.get((nn, country or ""))
+            if oid is None and len(nn.replace(" ", "")) >= MIN_ALIAS_LEN:
+                oid = self.by_alias.get((nn, country or ""))     # an alias another language gave (0130)
             if oid and (cik is None or self.org_cik.get(oid) in (None, cik)):
                 self.writes.append(("""update breach_core.organizations set domain = coalesce(domain, %s),
                                           sec_cik = coalesce(sec_cik, %s), sector = coalesce(sector, %s)

@@ -9,6 +9,25 @@ republished: the site shows a short quote and the link.
 
 CHEAP FILTER FIRST. Only items whose title or summary mention an incident reach the model;
 product news, opinion and vulnerability write-ups without a victim cost nothing.
+
+JAPANESE FEEDS (0130, owner approval 2026-10-19; docs/decisions/0007). Original publishers only,
+never an aggregator. Terms checked 2026-10-19, one fetch each; all four are FEED TEXT ONLY, LINK
+ONLY, article pages never fetched:
+- Security NEXT (NEWSGAIA): robots.txt allows all. /copyright forbids quotation, reproduction and
+  supply to third parties of articles "and databases" without permission beyond what copyright
+  law allows; secondary use by individual agreement. Feed text only; a quote on the page relies
+  on the statutory quotation right (Copyright Act art. 32) and needs the owner's decision first.
+- ScanNetSecurity (IID): robots.txt allows all but /test/, Crawl-delay 5 for ClaudeBot. No terms
+  page is linked from the site; the feed is RSS 1.0 (RDF) with TITLES ONLY, so it is never sent
+  to the extractor: its headlines are matched to known victims for links (run.link_media_from_feeds).
+- Cybersecurity.jp (サイバーセキュリティ.com): robots.txt allows all but /wp-admin/. Its secondary-use
+  page permits use with "サイバーセキュリティ.com" and the source URL shown next to the content.
+  Feed text only (page fetching would be allowed; not needed for links).
+- ITmedia NEWS security: terms permit links except for commercial purposes and quotation within
+  copyright law; reproduction needs permission. Feed text only.
+Not used: aggregators (Google News, Bing, Yahoo! News Japan, westeria.jp, legalagent.co.jp,
+satimo.org, piyolog) - secondary, and a link must lead to the original report; TDnet - robots.txt
+disallows all.
 """
 
 from __future__ import annotations
@@ -30,6 +49,7 @@ class Feed:
     url: str
     fetch_page: bool           # may the article page be fetched?
     full_text_in_feed: bool
+    extract: bool = True       # False: titles only, read for headline links, never sent to a model
 
 
 FEEDS = (
@@ -53,12 +73,22 @@ FEEDS = (
     Feed("news_industrialcyber", "https://industrialcyber.co/feed/", False, False),
     Feed("news_csoonline", "https://www.csoonline.com/feed/", False, False),
     Feed("news_comparitech", "https://www.comparitech.com/news/feed/", False, False),
+    # 0130: Japanese original publishers. Feed text only, links only (terms above).
+    Feed("news_jp_securitynext", "https://www.security-next.com/feed", False, False),
+    # titles only: no summary to extract from; its headlines feed the media linker only
+    Feed("news_jp_scannetsecurity", "https://scan.netsecurity.ne.jp/rss/index.rdf", False, False, extract=False),
+    Feed("news_jp_cybersecurityjp", "https://cybersecurity-jp.com/feed", False, False),
+    Feed("news_jp_itmedia", "https://rss.itmedia.co.jp/rss/2.0/news_security.xml", False, False),
 )
 
 INCIDENT = re.compile(
     r"\b(breach|breached|ransomware|ransom|extort|hack(?:ed|ers?)?|cyberattack|cyber[- ]attack|"
     r"cyber incident|security incident|data leak|leaked|stolen data|data theft|compromis|"
     r"exposed (?:data|records|database)|intrusion|notif(?:y|ies|ied|ication) (?:patients|customers|individuals))", re.I)
+# Japanese, applied alongside: unauthorised access, information leak (漏えい/漏洩), outflow,
+# ransomware, cyberattack, ransom, malware, infection, theft, compromise, mis-sent mail, loss.
+INCIDENT_JA = re.compile(r"不正アクセス|情報漏え?い|漏洩|流出|ランサムウェア|サイバー攻撃|身代金|マルウェア|感染|"
+                         r"窃取|侵害|誤送信|紛失")
 
 
 @dataclass
@@ -72,7 +102,8 @@ class Item:
 
     @property
     def relevant(self) -> bool:
-        return bool(INCIDENT.search(self.title) or INCIDENT.search(self.summary[:1500]))
+        return bool(INCIDENT.search(self.title) or INCIDENT.search(self.summary[:1500])
+                    or INCIDENT_JA.search(self.title) or INCIDENT_JA.search(self.summary[:1500]))
 
 
 _TAG = re.compile(r"<[^>]+>")
@@ -86,7 +117,9 @@ def strip_html(fragment: str) -> str:
     return clean(_WS.sub(" ", text).strip())
 
 
-_NS = {"atom": "http://www.w3.org/2005/Atom", "content": "http://purl.org/rss/1.0/modules/content/"}
+_NS = {"atom": "http://www.w3.org/2005/Atom", "content": "http://purl.org/rss/1.0/modules/content/",
+       "rss1": "http://purl.org/rss/1.0/", "dc": "http://purl.org/dc/elements/1.1/",
+       "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"}
 
 
 def _date(v: str | None) -> datetime | None:
@@ -111,6 +144,14 @@ def parse_feed(source_id: str, body: bytes) -> list[Item]:
         guid = (it.findtext("guid") or link).strip()
         out.append(Item(source_id, guid, link, clean((it.findtext("title") or "").strip()),
                         _date(it.findtext("pubDate")), strip_html(body_html)))
+    # RSS 1.0 (RDF): items are namespaced siblings of the channel, dated by dc:date (0130,
+    # ScanNetSecurity).
+    for it in root.iter("{http://purl.org/rss/1.0/}item"):
+        link = (it.findtext("rss1:link", namespaces=_NS) or "").strip()
+        body_html = it.findtext("content:encoded", namespaces=_NS) or it.findtext("rss1:description", namespaces=_NS) or ""
+        guid = (it.get("{http://www.w3.org/1999/02/22-rdf-syntax-ns#}about") or link).strip()
+        out.append(Item(source_id, guid, link, clean((it.findtext("rss1:title", namespaces=_NS) or "").strip()),
+                        _date(it.findtext("dc:date", namespaces=_NS)), strip_html(body_html)))
     for e in root.iter("{http://www.w3.org/2005/Atom}entry"):
         link_el = e.find("atom:link[@rel='alternate']", _NS) or e.find("atom:link", _NS)
         link = link_el.get("href") if link_el is not None else ""

@@ -554,3 +554,446 @@ def test_feed_title_matching_is_whole_phrase_and_distinctive():
     from datetime import date
     assert sm.in_window(date(2026, 3, 1), date(2026, 2, 15)) and not sm.in_window(date(2026, 3, 1), date(2024, 1, 1))
     assert not sm.in_window(None, date(2026, 1, 1))
+
+
+# ---- Japanese coverage (0130, docs/decisions/0007) ---------------------------------------------
+# Synthetic sentences written for these tests, in the shape Japanese incident notices and press
+# use. No publisher text.
+import glob as _glob
+import re as _re
+import unicodedata as _ud
+from pathlib import Path as _Path
+
+_LEGAL_0129 = _re.compile(
+    r"\b(incorporated|inc|corp|corporation|co|company|llc|l\.l\.c|ltd|limited|plc|gmbh|ag|sa|"
+    r"s\.a|sas|sarl|srl|spa|s\.p\.a|bv|b\.v|nv|n\.v|oy|ab|as|a/s|pty|pvt|kg|kgaa|se|lp|llp|pc|"
+    r"pllc|the)\b\.?", _re.I)
+
+
+def _norm_name_0129(name: str) -> str:
+    """normalize.norm_name exactly as it stood before 0130, frozen here as the reference."""
+    s = _ud.normalize("NFKD", name or "").encode("ascii", "ignore").decode().lower()
+    s = s.replace("&", " and ")
+    s = _LEGAL_0129.sub(" ", s)
+    return _re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+
+def _fixture_names() -> set[str]:
+    names: set[str] = set()
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if isinstance(v, str) and _re.search(r"vendor|product|organi|victim|name$", k, _re.I):
+                    names.add(v)
+                else:
+                    walk(v)
+        elif isinstance(o, list):
+            for x in o:
+                walk(x)
+    fx = _Path(__file__).parent / "fixtures"
+    for f in _glob.glob(str(fx / "*.json")):
+        walk(json.load(open(f)))
+    for f in _glob.glob(str(fx / "*.ndjson")):
+        for line in open(f):
+            if line.strip():
+                walk(json.loads(line))
+    return names
+
+
+# Real organisation names in Latin script, several with diacritics, ligatures and legal forms -
+# the cases the ASCII path's NFKD + drop exists for.
+LATIN_NAMES = [
+    "Change Healthcare", "Acme, Inc.", "ACME INC", "Hospital Sisters Health System", "PowerSchool",
+    "Société Générale S.A.", "Nestlé S.A.", "Ørsted A/S", "Müller GmbH & Co. KG", "Banco Santander, S.A.",
+    "Telefónica, S.A.", "Ascension", "McKesson", "Keio Corporation", "Asahi Group Holdings, Ltd.",
+    "Æon Credit", "Straße AG", "Çelik Holding A.Ş.", "Kraków Airport sp. z o.o.", "The Co-operative Bank p.l.c.",
+    "L'Oréal", "Dansk Supermarked A/S", "  spaced   out  LLC ", "", "Иванов и партнёры", "삼성전자",
+    "Ελληνικά Πετρέλαια", "شركة", "N.V. Nederlandse Spoorwegen", "Imagine the Possibilities",
+]
+
+
+def test_norm_name_unchanged_for_every_name_without_han_or_kana():
+    """The no-change property: 0130 adds a path for names with Han or kana and must not move one
+    byte of any other name. Fixture names (real vendors and products) plus real organisation
+    names with diacritics, and the non-Latin scripts that still normalise to "" (Korean,
+    Cyrillic, Greek, Arabic - a known limit, ADR 0007)."""
+    names = _fixture_names() | set(LATIN_NAMES)
+    assert len(names) > 100
+    for n in names:
+        assert not normalize.has_cjk(n), n
+        assert normalize.norm_name(n) == _norm_name_0129(n), n
+
+
+def test_norm_name_keeps_japanese_and_strips_legal_forms():
+    nn = normalize.norm_name
+    # every spelling of one company: prefix or suffix legal form, bracketed abbreviations,
+    # half-width katakana
+    assert {nn(x) for x in ("アスクル株式会社", "株式会社アスクル", "㈱アスクル", "（株）アスクル", "(株)アスクル",
+                            "ｱｽｸﾙ株式会社", "アスクル")} == {"アスクル"}
+    assert nn("ＮＴＴデータ") == nn("NTT データ") == nn("NTTデータ株式会社") == "ntt データ"
+    assert nn("ソフトバンク・テクノロジー株式会社") == nn("ソフトバンクテクノロジー")
+    # Holdings and Group are part of the name in Japanese as in English
+    assert nn("アサヒグループホールディングス株式会社") == "アサヒグループホールディングス"
+    assert nn("アサヒグループホールディングス") != nn("アサヒグループ")
+    # corporation-type prefixes of non-profits and hospitals go; what the organisation is stays
+    assert nn("医療法人社団 健康会 さくら病院") == "健康会さくら病院"
+    assert nn("一般社団法人日本音楽著作権協会") == "日本音楽著作権協会"
+    # voicing marks survive (NFKC recomposes them), hiragana and the iteration mark are kept
+    assert nn("ガンホー") == "ガンホー" and nn("みずほ銀行") == "みずほ銀行" and nn("佐々木病院") == "佐々木病院"
+    # two Japanese organisations no longer share a normalised name
+    assert nn("株式会社ニフティ") != nn("ソースネクスト株式会社") and nn("株式会社ニフティ") != ""
+    # English legal words in a mixed name still go, even run into Han characters
+    assert nn("ABC Co株式会社") == "abc" and nn("トヨタ Toyota Motor Corp") == "トヨタ toyota motor"
+    assert normalize.has_cjk("ｱｽｸﾙ") and normalize.has_cjk("ＮＴＴデータ") and not normalize.has_cjk("NTT Data")
+
+
+def test_japanese_numbers():
+    n = grounding.numbers_in
+    assert Decimal(1260000) in n("顧客情報約126万件が流出した")
+    assert Decimal(120000000) in n("1億2000万人分")
+    assert Decimal(542513) in n("最大54万2513件の情報")
+    assert Decimal(22519960) in n("会員情報2,251万9,960件が流出")
+    assert Decimal(5310000) in n("5,310,000件") and Decimal(5310000) in n("５３１万件")
+    assert Decimal(50000000) in n("身代金5千万円を要求")
+    assert Decimal(3000) in n("顧客3千人")
+    # English is read exactly as before: no new numbers appear in an English sentence
+    assert n("4.2 million patients") == {Decimal("4200000.0")}
+    assert n("the 1.5 TB archive of 2,000 files") == {Decimal("1.5"), Decimal(2000)}
+    assert 1_500_000_000_000 in grounding.sizes_in("約1.5TB分のデータ")
+    assert 2 * 10**12 in grounding.sizes_in("2テラバイトのファイル")
+
+
+def test_japanese_qualifier_is_read_from_the_sentence():
+    q = grounding.ja_qualifier
+    assert q("約126万件が漏えいした", 1260000) == "approx"
+    assert q("最大54万2513件の情報", 542513) == "at_most"
+    assert q("1万人以上の顧客情報", 10000) == "at_least"
+    assert q("3万件を超える個人情報", 30000) == "at_least"
+    assert q("126万件の個人情報が流出した", 1260000) == "exact"
+    assert q("4.2 million patients", 4200000) is None             # English: the model's qualifier stands
+
+
+def test_japanese_negation_is_clause_local_and_not_fooled_by_nai_words():
+    assert grounding.negated("流出は確認されていません。")
+    assert grounding.negated("情報の流出はなかった")
+    assert grounding.negated("流出していないことを確認した")
+    assert grounding.negated("同社は不正アクセスを否定した")
+    assert not grounding.negated("個人情報が流出した")
+    assert not grounding.negated("被害は少ないとみられる")          # 少ない "few" is not a negation
+    assert not grounding.negated("発覚して間もない時期だった")       # 間もない "soon after"
+    doc = "顧客約126万人の個人情報が流出し、クレジットカード情報の流出は確認されていない。"
+    assert grounding.check("people_affected", 1260000, doc, doc) is None      # negation is in the other clause
+    doc2 = "顧客約126万人の個人情報の流出は確認されていない。"
+    assert grounding.check("people_affected", 1260000, doc2, doc2) == "negated"
+
+
+JA_DOC = ("株式会社サンプル物流は2026年10月15日、同社のサーバーがランサムウェアに感染し、ファイルが暗号化されたと発表した。"
+          "顧客約126万人の氏名、住所、電話番号が外部に流出した。"
+          "クレジットカード情報の流出は確認されていません。"
+          "攻撃者は委託先のVPN機器の脆弱性を悪用して侵入したとみられる。"
+          "同社によると、社員を装ったフィッシングメールが侵入の起点だった。"
+          "コールセンターには問い合わせが1200件寄せられた。"
+          "ランサムウェアグループ「Qilin」はリークサイトで、従業員3万人分のデータを盗んだと主張している。"
+          "同社は2026年10月13日に不審な通信を検知した。")
+
+
+def _ja(*facts, org="株式会社サンプル物流", org_en="Sample Butsuryu", more=None):
+    incs = [{"organization": org, "organization_en": org_en, "country": "JP",
+             "source_of_account": "news", "facts": list(facts)}]
+    return {"is_incident_report": True, "incidents": incs + (more or [])}
+
+
+def test_japanese_facts_pass_the_gate():
+    out = _ja(_f("people_affected", 1260000, "顧客約126万人の氏名、住所、電話番号が外部に流出した。", "persons", "exact"),
+              _f("data_exfiltrated", True, "顧客約126万人の氏名、住所、電話番号が外部に流出した。"),
+              _f("data_types", "氏名、住所、電話番号", "顧客約126万人の氏名、住所、電話番号が外部に流出した。"),
+              _f("category", "ransomware", "株式会社サンプル物流は2026年10月15日、同社のサーバーがランサムウェアに感染し、ファイルが暗号化されたと発表した。"),
+              _f("vector", "phishing", "同社によると、社員を装ったフィッシングメールが侵入の起点だった。"),
+              _f("discovery_date", "2026-10-13", "同社は2026年10月13日に不審な通信を検知した。"),
+              _f("data_exfiltrated", False, "クレジットカード情報の流出は確認されていません。"))
+    [inc] = extract.validate(out, JA_DOC)
+    got = [(c.field, c.reject_reason) for c in inc.candidates]
+    assert all(r is None for _, r in got), got
+    assert inc.candidates[0].qualifier == "approx"           # 約: the sentence's qualifier, not the model's
+    assert inc.organization_en == "Sample Butsuryu"
+
+
+def test_japanese_negatives_are_rejected():
+    out = _ja(
+        # the inquiry count is not people and not records
+        _f("people_affected", 1200, "コールセンターには問い合わせが1200件寄せられた。", "persons"),
+        _f("records_affected", 1200, "コールセンターには問い合わせが1200件寄せられた。", "records"),
+        # "not confirmed" negates a leak
+        _f("data_exfiltrated", True, "クレジットカード情報の流出は確認されていません。"),
+        # "believed to" is not a stated cause
+        _f("vector", "vulnerability_exploitation", "攻撃者は委託先のVPN機器の脆弱性を悪用して侵入したとみられる。"),
+        # what the gang claims on its leak site is the gang's claim: never a count
+        _f("people_affected", 30000, "ランサムウェアグループ「Qilin」はリークサイトで、従業員3万人分のデータを盗んだと主張している。", "persons"))
+    reasons = [c.reject_reason for c in extract.validate(out, JA_DOC)[0].candidates]
+    assert reasons == ["count_not_of_people", "count_not_of_records", "negated", "hedged",
+                       "actor_claim_cannot_supply_count"], reasons
+
+
+def test_japanese_possibility_and_ceiling_and_part():
+    doc = ("サンプル電機は、最大54万2513件の個人情報が漏えいした可能性があると発表した。"
+           "サンプル電機によると、情報漏えいの可能性がある。"
+           "サンプル百貨店は、会員情報約126万件の一部が漏えいしたと発表した。"
+           "このうち、カード情報は3万件だった。")
+    out = {"is_incident_report": True, "incidents": [
+        {"organization": "サンプル電機", "source_of_account": "news", "facts": [
+            _f("records_affected", 542513, "サンプル電機は、最大54万2513件の個人情報が漏えいした可能性があると発表した。", "records"),
+            _f("data_exfiltrated", True, "サンプル電機によると、情報漏えいの可能性がある。")]},
+        {"organization": "サンプル百貨店", "source_of_account": "news", "facts": [
+            _f("records_affected", 1260000, "サンプル百貨店は、会員情報約126万件の一部が漏えいしたと発表した。", "records"),
+            _f("records_affected", 30000, "このうち、カード情報は3万件だった。", "records")]}]}
+    a, b = extract.validate(out, doc)
+    assert [c.reject_reason for c in a.candidates] == ["hypothetical", "hedged"]
+    # 126万 is what the store holds, not what leaked; 3万 is a sub-group (and names nobody)
+    assert [c.reject_reason for c in b.candidates] == ["partial_count", "partial_count"]
+
+
+def test_japanese_subject_naming_uses_the_written_name_never_organization_en():
+    doc = ("株式会社サンプル物流と株式会社テスト商事は、共同で利用するシステムに不正アクセスがあったと発表した。"
+           "サンプル物流では顧客約126万人の個人情報が流出した。"
+           "Sample Butsuryu の顧客約2万人の個人情報も流出した。")
+    other = {"organization": "株式会社テスト商事", "organization_en": "Test Shoji", "source_of_account": "news", "facts": []}
+    out = _ja(_f("people_affected", 1260000, "サンプル物流では顧客約126万人の個人情報が流出した。", "persons"),
+              # the sentence names the company only by the model's English name: not evidence
+              _f("people_affected", 20000, "Sample Butsuryu の顧客約2万人の個人情報も流出した。", "persons"),
+              more=[other])
+    a = extract.validate(out, doc)[0]
+    assert a.candidates[0].accepted and a.candidates[0].subject_match
+    assert a.candidates[1].reject_reason == "subject_not_named"
+    assert not extract._names_org("株式会社テスト商事は発表した。", "サンプル物流")
+
+
+def test_japanese_number_values_and_actor():
+    doc = "サンプル製薬は、患者1億2000万人分の診療記録が窃取されたと発表した。ランサムウェアグループ「Qilin」が犯行声明を出した。"
+    out = {"is_incident_report": True, "incidents": [{"organization": "サンプル製薬", "source_of_account": "news", "facts": [
+        _f("people_affected", 120000000, "サンプル製薬は、患者1億2000万人分の診療記録が窃取されたと発表した。", "persons"),
+        _f("actor", "Qilin", "ランサムウェアグループ「Qilin」が犯行声明を出した。"),
+        _f("actor", "攻撃者", "ランサムウェアグループ「Qilin」が犯行声明を出した。")]}]}
+    c = extract.validate(out, doc)[0].candidates
+    assert c[0].accepted and c[0].qualifier == "exact"
+    assert c[1].accepted and c[1].basis == "threat_actor_claim"     # 犯行声明 is the gang's own claim
+    assert c[2].reject_reason == "value_not_in_quote"
+
+
+def test_organization_en_is_latin_or_nothing():
+    assert extract._english_name("ASKUL Corporation") == "ASKUL Corporation"
+    assert extract._english_name("アスクル") is None and extract._english_name("") is None
+    assert extract._english_name(None) is None and extract._english_name(42) is None
+
+
+def test_language_detection():
+    assert extract.language(JA_DOC) == "ja"
+    assert extract.language(DOC) == "en"
+    # any Han or kana sends a document to the Japanese version, which has no active fields (review)
+    assert extract.language("某公司遭受勒索软件攻击，导致数据泄露。") == "ja"
+    assert extract.language("Acme (アクメ) was breached; the attackers took 2 TB of data from its servers.") == "ja"
+
+
+def test_prompt_v4_carries_organization_en_and_the_no_translation_rule():
+    assert extract.SCHEMA_VERSION == "breach-extract-v4"
+    assert '"organization_en"' in extract.SYSTEM and "Never translate" in extract.SYSTEM
+    assert "126万" in extract.SYSTEM and "最大" in extract.SYSTEM
+
+
+def test_japanese_extractor_version_is_separate():
+    from zdc_breach import agent_load, run
+    assert run.extractor_id("m/x") != run.extractor_id("m/x", "ja") == run.extractor_id("m/x") + ":ja"
+    assert agent_load.extractor_id("m", "ja").endswith(":ja")
+    # an English gold set cannot switch on the Japanese version (checked before any database call)
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        json.dump({"languages": ["en"], "prompt_hash": extract.prompt_hash("m"),
+                   "fields": {"people_affected": {"accepted": 9, "correct": 9}}}, fh)
+    with pytest.raises(SystemExit, match="documents, not"):
+        agent_load.activate(None, "m", ["people_affected"], [fh.name], lang="ja")
+    with open(fh.name, "w") as f2:
+        json.dump({"prompt_hash": extract.prompt_hash("m"),
+                   "fields": {"people_affected": {"accepted": 9, "correct": 9}}}, f2)    # no language: English
+    with pytest.raises(SystemExit, match="documents, not"):
+        agent_load.activate(None, "m", ["people_affected"], [fh.name], lang="ja")
+
+
+def test_gold_records_the_language_it_scored():
+    from zdc_breach import gold
+    out = _ja(_f("people_affected", 1260000, "顧客約126万人の氏名、住所、電話番号が外部に流出した。", "persons"))
+    res = gold.score({"d": {"incidents": []}}, {"d": JA_DOC}, {"d": out})
+    assert res["languages"] == ["ja"]
+
+
+RDF = """<?xml version="1.0" encoding="UTF-8" ?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:dc="http://purl.org/dc/elements/1.1/"
+         xmlns="http://purl.org/rss/1.0/">
+  <channel rdf:about="https://jp.example/"><title>Example</title><link>https://jp.example/</link></channel>
+  <item rdf:about="https://jp.example/article/1.html">
+    <title>サンプル物流に不正アクセス、約126万件の会員情報が漏えい</title>
+    <link>https://jp.example/article/1.html</link>
+    <dc:date>2026-10-19T08:05:25+09:00</dc:date>
+  </item>
+  <item rdf:about="https://jp.example/article/2.html">
+    <title>新製品セミナーのお知らせ</title>
+    <link>https://jp.example/article/2.html</link>
+    <description>来月開催</description>
+    <dc:date>2026-10-19T09:00:00+09:00</dc:date>
+  </item>
+</rdf:RDF>""".encode()
+
+
+def test_rss1_rdf_feed_parses():
+    items = sources_news.parse_feed("news_jp_x", RDF)
+    assert [i.url for i in items] == ["https://jp.example/article/1.html", "https://jp.example/article/2.html"]
+    assert items[0].guid == "https://jp.example/article/1.html"
+    assert items[0].published_at == datetime(2026, 10, 18, 23, 5, 25, tzinfo=timezone.utc)
+    assert [i.relevant for i in items] == [True, False]      # the Japanese prefilter
+
+
+def test_japanese_feeds_registered_feed_text_only():
+    jp = [f for f in sources_news.FEEDS if f.source_id.startswith("news_jp_")]
+    assert {f.source_id for f in jp} == {"news_jp_securitynext", "news_jp_scannetsecurity",
+                                          "news_jp_cybersecurityjp", "news_jp_itmedia"}
+    assert not any(f.fetch_page for f in jp)
+    banned = ("news.google.", "bing.com", "news.yahoo.co.jp", "westeria.jp", "legalagent.co.jp", "satimo.org",
+              "piyolog", "elkentaro", "jpx.co.jp", "tdnet")
+    assert not any(b in f.url for f in sources_news.FEEDS for b in banned)
+
+
+def test_japanese_title_links_need_a_long_name_and_an_event():
+    from zdc_breach import sources_media as sm
+    idx = sm.index_names([("v1", "株式会社ニフティ"), ("v2", "トヨタ"), ("v3", "ソースネクスト株式会社"),
+                          ("v4", "Change Healthcare"), ("v5", "アスクル")])
+    assert sm.JA_KEY + "トヨタ" not in idx                          # three characters: too short to trust
+    assert sm.find_in_title("ソースネクストに不正アクセス、会員情報2,251万件が流出した可能性", idx) == ["v3"]
+    assert sm.find_in_title("ニフティ、54万件超漏えいの可能性", idx) == ["v1"]
+    assert sm.find_in_title("Change Healthcare ransomware attack", idx) == ["v4"]
+    assert sm.TITLE_EVENT.search("ニフティ、54万件超漏えいの可能性")
+    assert sm.TITLE_EVENT.search("サンプル社でデータ流出")
+    assert not sm.TITLE_EVENT.search("人材流出が止まらないアスクル")        # staff leaving is not a breach
+    assert not sm.TITLE_EVENT.search("「Fortinet」の脆弱性悪用に注意喚起")    # an advisory, no victim event
+    assert sm.matches("ソースネクスト株式会社", "ソースネクストに不正アクセス", "https://x.example/a")
+    assert not sm.matches("ソースネクスト株式会社", "ソースネクストが新製品", "https://x.example/a")
+
+
+# ---- review fixes, 2026-10-19 (each written to fail first) --------------------------------------
+def test_english_id_is_not_a_credential_or_account_cue():
+    doc = "Hackers used stolen employee ID numbers to get in. The attackers stole ID scans of 5,000 customers."
+    out = _out(_f("vector", "stolen_credentials", "Hackers used stolen employee ID numbers to get in."),
+               _f("accounts_affected", 5000, "The attackers stole ID scans of 5,000 customers.", "accounts"))
+    c = extract.validate(out, doc)[0].candidates
+    assert c[0].reject_reason == "vector_cue_missing"
+    # accounts_affected never reaches its cue (the gate rejects the field as unknown, as at HEAD),
+    # so its cue is checked directly: "ID" must not be an English accounts cue
+    assert c[1].reject_reason == "unknown_field"
+    assert extract._cued(extract.CUES, extract.CUES_JA, "accounts_affected", "The attackers stole ID scans of 5,000 customers.") is False
+    assert extract._cued(extract.CUES, extract.CUES_JA, "accounts_affected", "ID 3万件が流出した") is True
+
+
+def test_japanese_negations_reviewer_set():
+    for q in ("被害は確認されておりません", "不審なファイルは見つかっておりません", "情報の流出は確認されず",
+              "同社は流出は無いとした", "流出は確認できていません"):
+        assert grounding.negated(q), q
+
+
+@pytest.mark.parametrize("quote", [
+    "顧客約126万人の個人情報が漏えいした恐れがある。",
+    "顧客約126万人の個人情報が流出したおそれがある。",
+    "顧客約126万人の個人情報が流出したとみられる。",
+    "顧客約126万人の個人情報が流出したと思われる。",
+    "顧客約126万人の個人情報が流出したとされる。",
+    "流出した個人情報は推定126万人分にのぼる。",
+    "同社は顧客約126万人の個人情報が流出したとみている。",
+    "顧客約126万人について情報流出の有無について調査している。",
+])
+def test_japanese_hedged_counts_are_rejected(quote):
+    [inc] = extract.validate(_ja(_f("people_affected", 1260000, quote, "persons")), quote)
+    assert inc.candidates[0].reject_reason == "hedged", inc.candidates[0].reject_reason
+
+
+@pytest.mark.parametrize("field,value,unit,quote", [
+    ("people_affected", 30, "persons", "同社は30人体制で調査を進め、流出の範囲を確認している。"),
+    ("people_affected", 5, "persons", "外部専門家5名を交えて流出の経緯を調べている。"),
+    ("people_affected", 100, "persons", "従業員100人が在宅勤務中で、流出の影響を調べている。"),
+    ("people_affected", 1260000, "persons", "会員数は126万人にのぼり、一部の情報が流出した。"),
+    ("people_affected", 1260000, "persons", "同社は会員126万人にメールで通知し、注意を呼びかけた。"),
+    ("records_affected", 3, "records", "サーバ3件が不正アクセスを受けた。"),
+    ("records_affected", 300, "records", "300件の不審なメールが送信された。"),
+    ("records_affected", 1260000, "records", "126万件中20万件の個人情報が流出した。"),
+])
+def test_japanese_counts_that_are_not_the_victims(field, value, unit, quote):
+    [inc] = extract.validate(_ja(_f(field, value, quote, unit)), quote)
+    assert not inc.candidates[0].accepted, (quote, inc.candidates[0].reject_reason)
+
+
+def test_japanese_attacker_statements_are_claims_but_a_company_statement_is_not():
+    a = "犯行グループは、従業員3万人分のデータを盗んだとしている。"
+    b = "ハッカー集団は3万人分の情報を入手したと声明を出した。"
+    c = "同社は、顧客約126万人の個人情報が流出したとしている。"
+    for q in (a, b):
+        [inc] = extract.validate(_ja(_f("people_affected", 30000, q, "persons")), q)
+        assert inc.candidates[0].basis == "threat_actor_claim", q
+        assert inc.candidates[0].reject_reason == "actor_claim_cannot_supply_count"
+    assert not extract.actor_claim(c)
+
+
+def test_japanese_category_negation():
+    q = "同社によると、今回の障害はランサムウェアの被害ではない。"
+    [inc] = extract.validate(_ja(_f("category", "ransomware", q)), q)
+    assert inc.candidates[0].reject_reason == "negated"
+
+
+def test_japanese_names_must_end_at_a_word_boundary():
+    from zdc_breach import sources_media as sm
+    idx = sm.index_names([("v1", "日本航空"), ("v2", "アスクル")])
+    assert sm.find_in_title("日本航空電子工業に不正アクセス", idx) == []
+    assert sm.find_in_title("全日本航空に不正アクセス", idx) == []
+    assert sm.find_in_title("日本航空に不正アクセス、情報流出", idx) == ["v1"]       # a particle may follow
+    assert sm.find_in_title("アスクルロジストでランサムウェア被害", idx) == []
+    assert not extract._names_org("日本航空電子工業は不正アクセスを受けた。", "日本航空")
+    assert extract._names_org("日本航空は不正アクセスを受けた。", "日本航空")
+
+
+def test_language_is_japanese_for_any_han_or_kana_or_a_japanese_feed():
+    assert extract.language("Acme (アクメ) was breached; the attackers took 2 TB of data.") == "ja"
+    assert extract.language("某公司遭受勒索软件攻击。") == "ja"
+    assert extract.language("Plain English text about a breach.", "news_jp_itmedia") == "ja"
+    assert extract.language("Plain English text about a breach.", "news_therecord") == "en"
+
+
+def test_bare_thousand_counts():
+    assert Decimal(1000) in grounding.numbers_in("顧客千人分の情報が流出した")
+    assert Decimal(1000) in grounding.numbers_in("千件の個人情報")
+    assert Decimal(1000) not in grounding.numbers_in("数千件の個人情報")
+    assert Decimal(1000) not in grounding.numbers_in("五千人の情報")
+
+
+def test_organization_en_is_a_match_key_only_when_the_document_writes_it():
+    doc = "トヨタ紡織株式会社は、サーバーがランサムウェアに感染したと発表した。顧客約2万人の個人情報が流出した。"
+    out = {"is_incident_report": True, "incidents": [{"organization": "トヨタ紡織株式会社", "organization_en": "Toyota",
+                                                      "source_of_account": "news", "facts": []}]}
+    [inc] = extract.validate(out, doc)
+    assert inc.organization_en == "Toyota" and not inc.organization_en_in_text
+    doc2 = doc + "Toyota Boshoku (トヨタ紡織) said the attack began on Monday."
+    out["incidents"][0]["organization_en"] = "TOYOTA BOSHOKU"
+    [inc] = extract.validate(out, doc2)
+    assert inc.organization_en_in_text                       # case-insensitive for Latin
+
+
+def test_titles_only_feed_is_never_extracted():
+    scan = next(f for f in sources_news.FEEDS if f.source_id == "news_jp_scannetsecurity")
+    assert scan.extract is False and all(f.extract for f in sources_news.FEEDS if f is not scan)
+
+
+def test_gold_activation_refuses_another_prompt():
+    from zdc_breach import agent_load, gold
+    import tempfile
+    res = gold.score({}, {}, {}, prompt_hash=extract.prompt_hash("m"))
+    assert res["prompt_hash"] == extract.prompt_hash("m")
+    for sc in ({"languages": ["en"], "prompt_hash": "deadbeef", "fields": {"x": {"accepted": 9, "correct": 9}}},
+               {"languages": ["en"], "fields": {"x": {"accepted": 9, "correct": 9}}}):          # legacy: no hash
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+            json.dump(sc, fh)
+        with pytest.raises(SystemExit, match="scored prompt"):
+            agent_load.activate(None, "m", ["x"], [fh.name])

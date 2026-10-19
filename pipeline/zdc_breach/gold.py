@@ -56,7 +56,7 @@ def _same_value(field: str, got, want) -> bool:
     return bool(g and w) and len(g & w) / min(len(g), len(w)) >= 0.5
 
 
-def score(labels: dict, docs: dict, outputs: dict) -> dict:
+def score(labels: dict, docs: dict, outputs: dict, prompt_hash: str | None = None) -> dict:
     tp, fp, gold_n = defaultdict(int), defaultdict(int), defaultdict(int)
     mistakes = []
     for doc, lab in labels.items():
@@ -88,7 +88,10 @@ def score(labels: dict, docs: dict, outputs: dict) -> dict:
                "gold": gold_n[f], "recall": round(tp[f] / gold_n[f], 3) if gold_n[f] else None}
            for f in fields}
     total_tp, total_fp = sum(tp.values()), sum(fp.values())
-    return {"fields": per, "unlabelled_fields": unlabelled, "overall_precision": round(total_tp / (total_tp + total_fp), 3) if total_tp + total_fp else None,
+    # Which language the scored documents are in (0130): activation refuses a score file whose
+    # language is not the extractor version's.
+    langs = sorted({extract.language(docs[d]) for d in labels if docs.get(d) is not None and outputs.get(d) is not None})
+    return {"languages": langs, "prompt_hash": prompt_hash, "fields": per, "unlabelled_fields": unlabelled, "overall_precision": round(total_tp / (total_tp + total_fp), 3) if total_tp + total_fp else None,
             "documents": len(labels), "mistakes": mistakes}
 
 
@@ -118,11 +121,13 @@ def main(argv=None) -> int:
     ap.add_argument("--docs", required=True)
     ap.add_argument("--outputs", required=True, help="jsonl of {doc, output}")
     ap.add_argument("--min-precision", type=float, default=0.95)
+    ap.add_argument("--model", required=True,
+                    help="the model whose outputs these are; its prompt hash is recorded so activation can check it")
     args = ap.parse_args(argv)
     labels = _jsonl(args.labels, "doc")
     docs = {k: v["text"] for k, v in _jsonl(args.docs, "doc").items()}
     outputs = {k: v["output"] for k, v in _jsonl(args.outputs, "doc").items()}
-    res = score(labels, docs, outputs)
+    res = score(labels, docs, outputs, prompt_hash=extract.prompt_hash(args.model))
     ok, held = passing_fields(res, args.min_precision)
     res["passing_fields"], res["held_fields"] = ok, held
     print(json.dumps(res, indent=2, default=str))

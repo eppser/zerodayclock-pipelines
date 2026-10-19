@@ -49,8 +49,18 @@ RANSOMLOOK_URL = "https://www.ransomlook.io/api/last/2"
 RANSOMFEED_URL = "https://api.ransomfeed.it/offset/300"
 ACTOR_LINK_WINDOW = timedelta(days=60)
 
-def extractor_id(model: str) -> str:
-    return f"llm:{model}@{extract.prompt_hash(model)}"
+def extractor_id(model: str, lang: str = "en") -> str:
+    """One extractor version per model, prompt AND language (0130): a Japanese document is
+    extracted under "...:ja", which the English gold set never activated. Fields are activated
+    per extractor version, so no Japanese fact can publish until a Japanese gold set passes it."""
+    base = f"llm:{model}@{extract.prompt_hash(model)}"
+    return base if lang == "en" else f"{base}:{lang}"
+
+
+# A feed summary shorter than this is not worth a model call. Japanese packs about three times
+# the content per character: ITmedia's one-sentence summaries (50-180 characters) state the
+# organisation, the count and the cause.
+MIN_DOC_CHARS = {"en": 200, "ja": 60}
 
 
 class Ctx:
@@ -571,8 +581,8 @@ def run_feed(ctx, cur, feed: sources_news.Feed) -> dict:
                 body = sources_news.article_text(page.text())
                 if len(body) > len(text):
                     text = body
-        if len(text) < 200:
-            continue
+        if not feed.extract or len(text) < MIN_DOC_CHARS[extract.language(text, feed.source_id)]:
+            continue      # a titles-only feed (ScanNetSecurity) is read for headline links only
         store_doc(cur, feed.source_id, it.url, it.title, it.published_at, text, it.guid)
         extracted += 1
     return {"items": len(items), "relevant": len(rel), **counts, "documents": extracted}
@@ -587,20 +597,22 @@ def run_extraction(ctx, conn) -> dict:
     made: if the job dies at document 30, the 29 calls before it still count toward the cap."""
     if ctx.llm is None:
         return {"skipped": "no LLM key"}
-    ext_id = extractor_id(MODEL)
+    ext_id, ext_ja = extractor_id(MODEL), extractor_id(MODEL, "ja")
     ph = extract.prompt_hash(MODEL)
     with conn.transaction(), conn.cursor() as cur:
-        cur.execute("""insert into breach_core.extractor_versions (extractor_id, kind, model_id, prompt_hash, schema_hash, active, note)
-                       values (%s, 'llm', %s, %s, %s, false, 'Awaiting gold-set result before activation')
-                       on conflict (extractor_id) do nothing""", (ext_id, MODEL, ph, extract.SCHEMA_VERSION))
+        for eid, note in ((ext_id, "Awaiting gold-set result before activation"),
+                          (ext_ja, "Japanese documents; awaiting a Japanese gold-set result before activation")):
+            cur.execute("""insert into breach_core.extractor_versions (extractor_id, kind, model_id, prompt_hash, schema_hash, active, note)
+                           values (%s, 'llm', %s, %s, %s, false, %s)
+                           on conflict (extractor_id) do nothing""", (eid, MODEL, ph, extract.SCHEMA_VERSION, note))
         cur.execute("""select d.doc_sha256, d.source_id, d.url, d.title, d.published_at, d.text, d.source_record_id
                          from breach_raw.documents d
                         where d.captured_at > now() - interval '21 days'
                           and not exists (select 1 from breach_core.extractions e
-                                           where e.doc_sha256 = d.doc_sha256 and e.extractor_id = %s)
+                                           where e.doc_sha256 = d.doc_sha256 and e.extractor_id in (%s, %s))
                           and (select count(*) from breach_core.llm_calls c
                                 where c.doc_sha256 = d.doc_sha256 and c.prompt_hash = %s and not c.ok) < 2
-                        order by d.captured_at desc limit %s""", (ext_id, ph, ctx.args.max_docs))
+                        order by d.captured_at desc limit %s""", (ext_id, ext_ja, ph, ctx.args.max_docs))
         todo = cur.fetchall()
     done = 0
     for sha, source_id, url, title, published, text, rid in todo:
@@ -627,8 +639,9 @@ def run_extraction(ctx, conn) -> dict:
             break
     with conn.cursor() as cur:
         cur.execute("""select count(*) from breach_raw.documents d where d.captured_at > now() - interval '21 days'
-                         and not exists (select 1 from breach_core.extractions e where e.doc_sha256 = d.doc_sha256 and e.extractor_id = %s)""",
-                    (ext_id,))
+                         and not exists (select 1 from breach_core.extractions e where e.doc_sha256 = d.doc_sha256
+                                                                                 and e.extractor_id in (%s, %s))""",
+                    (ext_id, ext_ja))
         left = cur.fetchone()[0]
     return {"extracted": done, "backlog_left": left}
 
@@ -638,7 +651,7 @@ def extract_doc(ctx, cur, sha, text, url, title, *, forced_incident=None, forced
     """Run the model on one document (cached per extractor version) and file its claims."""
     if ctx.llm is None or ctx.docs_left <= 0 or ctx.report["llm"]["budget_stopped"]:
         return 0
-    ext_id = extractor_id(MODEL)
+    ext_id = extractor_id(MODEL, extract.language(text, source_id))
     cur.execute("select 1 from breach_core.extractions where doc_sha256 = %s and extractor_id = %s", (sha, ext_id))
     if cur.fetchone():
         return 0
@@ -673,7 +686,9 @@ def file_output(ctx, cur, sha, text, output, ext_id, *, call_id=None, published=
             inc = forced_incident
         else:
             org, how = resolve.find_or_create_org(cur, name=ei.organization, domain=norm_domain(ei.domain),
-                                                  country=norm_country(ei.country), sector=ei.sector)
+                                                  country=norm_country(ei.country), sector=ei.sector,
+                                                  name_en=ei.organization_en,
+                                                  name_en_in_text=ei.organization_en_in_text)
             ev = next((date.fromisoformat(c.value) for c in ei.candidates
                        if c.accepted and c.field == "event_date" and len(str(c.value)) == 10), None)
             inc, _ = resolve.resolve_incident(cur, org_id=org, org_how=how, source_id=source_id or "news",

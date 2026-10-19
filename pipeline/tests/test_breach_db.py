@@ -316,3 +316,138 @@ def test_human_review_publishes_one_fact(conn):
                          join breach_core.incidents i using (incident_id) join breach_core.organizations o using (org_id)
                         where o.sec_cik = '999999'""")
     assert facts == [(["CVE-2026-40404"], None)]     # the reviewed CVE only; the unreviewed count stays private
+
+
+# ---- Japanese coverage (0130) ------------------------------------------------------------------
+JA_FEED = f"""<rss version="2.0"><channel>
+<item><title>サンプル物流にランサムウェア攻撃、顧客約126万人の情報が流出</title>
+<link>https://jp.example/news/1</link><guid>jp-1</guid><pubDate>{NOW.strftime('%a, %d %b %Y %H:%M:%S +0000')}</pubDate>
+<description>株式会社サンプル物流は、同社のサーバーがランサムウェアに感染したと発表した。顧客約126万人の氏名、住所、電話番号が外部に流出した。</description></item>
+</channel></rss>"""
+JA_QUOTE = "顧客約126万人の氏名、住所、電話番号が外部に流出した。"
+
+
+def fake_get_ja(url, **kw):
+    if "itmedia" in url:
+        return Fetched(url, 200, JA_FEED.encode(), None, NOW, NOW, {})
+    return fake_get(url, **kw)
+
+
+class FakeLLMJa(FakeLLM):
+    def json(self, system, user, **kw):
+        if "サンプル物流" not in user:
+            return super().json(system, user, **kw)
+        self.calls += 1
+        data = {"is_incident_report": True, "incidents": [{
+            "organization": "株式会社サンプル物流", "organization_en": "Sample Butsuryu Holdings", "country": "Japan",
+            "source_of_account": "news", "facts": [
+                {"field": "people_affected", "value": 1260000, "unit": "persons", "qualifier": "exact", "quote": JA_QUOTE}]}]}
+        return llm_mod.LlmResult(True, data, "fake/model", "fake", 100, 50, 0.0001, 5, None)
+
+
+def test_norm_name_sql_twin_matches_python(conn):
+    """breach_core.norm_name_cjk() re-normalised the stored rows in 0130; it must agree with the
+    Python normaliser on every name with Han or kana, and leave every other name alone (NULL)."""
+    from zdc_breach.normalize import has_cjk, norm_name
+    names = ["アスクル株式会社", "株式会社アスクル", "㈱アスクル", "（株）アスクル", "ｱｽｸﾙ", "ＮＴＴデータ", "NTT データ",
+             "ソフトバンク・テクノロジー株式会社", "アサヒグループホールディングス株式会社", "一般社団法人 日本音楽著作権協会",
+             "医療法人社団 健康会 さくら病院", "ABC Co株式会社", "トヨタ Toyota Motor Corp", "Søren株式会社", "Café株式会社",
+             "Ｈ２Ｏ　リテイリング", "エイチ・ツー・オー リテイリング株式会社", "みずほ銀行", "佐々木病院", "ガンホー",
+             "AT&T ジャパン合同会社", "S.p.A. イタリア支社", "the サンプル L.L.C.", "サンプル(有)", "東京大学", "𠮷野家",
+             "Acme, Inc.", "Société Générale", "삼성전자", ""]
+    with conn.cursor() as cur:
+        for n in names:
+            cur.execute("select breach_core.norm_name_cjk(%s)", (n,))
+            got = cur.fetchone()[0]
+            assert got == (norm_name(n) if has_cjk(n) else None), (n, got, norm_name(n))
+
+
+def test_japanese_document_extracts_under_its_own_version_and_stays_private(conn):
+    rep = brun.run(conn, args(sources="news_jp_itmedia,extract"), getter=fake_get_ja, llm=FakeLLMJa(), fx=NoFx())
+    assert rep["sources"]["news_jp_itmedia"].get("documents") == 1, rep["sources"]
+    [(ext,)] = q(conn, "select extractor_id from breach_core.extractions")
+    assert ext.endswith(":ja")
+    # the organisation keeps its Japanese name; the English name the model gave is stored, but the
+    # article never writes it, so it is not a match key
+    [(nn, aliases, alias_norms, ctry)] = q(conn, "select norm_name, aliases, alias_norms, country from breach_core.organizations")
+    assert nn == "サンプル物流" and aliases == ["Sample Butsuryu Holdings"] and alias_norms == []
+    assert q(conn, "select accepted, qualifier::text from breach_core.claims where field = 'people_affected'") == [(True, "approx")]
+    # every English version activated: the Japanese fact stays private
+    with conn.cursor() as cur:
+        cur.execute("""update breach_core.extractor_versions set gold = '{"test": true}', active = true,
+                               active_fields = '{people_affected}' where kind = 'llm' and extractor_id not like '%%:ja'""")
+        from zdc_breach import reconcile
+        reconcile.build(cur)
+    conn.commit()
+    assert q(conn, "select people_affected from breach_core.incident_facts") == [(None,)]
+    # ... until the Japanese version itself is activated
+    with conn.cursor() as cur:
+        cur.execute("""update breach_core.extractor_versions set gold = '{"test": true}', active = true,
+                               active_fields = '{people_affected}' where extractor_id like '%%:ja'""")
+        reconcile.build(cur)
+    conn.commit()
+    assert q(conn, "select people_affected from breach_core.incident_facts") == [(1260000,)]
+
+
+def test_alias_finds_the_same_organisation_across_languages(conn):
+    from zdc_breach import resolve
+    with conn.cursor() as cur:
+        ja, how = resolve.find_or_create_org(cur, name="株式会社サンプル物流", country="JP", name_en="Sample Butsuryu",
+                                             name_en_in_text=True)
+        assert how == "new"
+        # a later English report finds it through the alias, as a NAME match (same country rule)
+        assert resolve.find_or_create_org(cur, name="Sample Butsuryu Co., Ltd.", country="JP") == (ja, "name")
+        assert resolve.find_or_create_org(cur, name="Sample Butsuryu", country="US")[1] == "new"
+        # a Japanese report naming it differently in Japanese still finds it by the English name
+        assert resolve.find_or_create_org(cur, name="サンプル・ブツリュウ", country="JP", name_en="Sample Butsuryu",
+                                          name_en_in_text=True) == (ja, "name_en")
+        # the same alias, not written in that article, finds nothing
+        assert resolve.find_or_create_org(cur, name="サンプル・ブツリュウ二", country="JP",
+                                          name_en="Sample Butsuryu")[1] == "new"
+        # an English-named organisation never takes an alias: "Change Healthcare" is not "UnitedHealth"
+        en, _ = resolve.find_or_create_org(cur, name="Change Healthcare", country="US", name_en="UnitedHealth Group")
+        cur.execute("select aliases from breach_core.organizations where org_id = %s", (en,))
+        assert cur.fetchone()[0] == []
+        assert resolve.find_or_create_org(cur, name="UnitedHealth Group", country="US")[1] == "new"
+        # the batched resolver makes the same decision
+        r = resolve.Resolver(cur)
+        assert r.org(name="Sample Butsuryu", country="JP") == (ja, "name")
+    conn.rollback()
+
+
+# ---- review fixes, 2026-10-19 ------------------------------------------------------------------
+def test_leak_claims_with_an_empty_normalised_name_never_merge(conn):
+    """Korean, Cyrillic, Greek and Arabic names still normalise to "": two different victims of
+    one group must stay two claims (an empty name matched every other empty name)."""
+    from zdc_breach import db as bdb
+    from zdc_breach.sources_leak import LeakPost
+    posts = [LeakPost("ransomfeed", "k-1", "qilin", "가나다 병원", None, "KR", None, D(2), {}),
+             LeakPost("ransomfeed", "k-2", "qilin", "라마바 은행", None, "KR", None, D(2), {}),
+             LeakPost("ransomfeed", "k-3", "qilin", "가나다 병원", None, "KR", None, D(1), {})]
+    with conn.cursor() as cur:
+        bdb.upsert_leak_posts(cur, posts)
+    conn.commit()
+    got = q(conn, "select victim_name, jsonb_array_length(tracker_refs) from breach_core.leak_claims order by 1")
+    assert got == [("가나다 병원", 2), ("라마바 은행", 1)], got
+
+
+def test_organization_en_not_written_in_the_document_is_never_a_key(conn):
+    from zdc_breach import resolve
+    with conn.cursor() as cur:
+        # the model's "Toyota" for トヨタ紡織, a name the article never writes: stored, not a key
+        sub, _ = resolve.find_or_create_org(cur, name="トヨタ紡織株式会社", country="JP", name_en="Toyota")
+        cur.execute("select aliases, alias_norms from breach_core.organizations where org_id = %s", (sub,))
+        assert cur.fetchone() == (["Toyota"], [])
+        assert resolve.find_or_create_org(cur, name="Toyota", country="JP")[1] == "new"
+        assert resolve.Resolver(cur).org(name="Toyota Motor", country="JP")[1] == "new"
+        # an alias written in the article is a key
+        ja, _ = resolve.find_or_create_org(cur, name="アスクル株式会社", country="JP", name_en="ASKUL Corporation",
+                                           name_en_in_text=True)
+        assert resolve.find_or_create_org(cur, name="ASKUL", country="JP") == (ja, "name")
+        # a Latin-named organisation found by domain takes no alias at all
+        en, _ = resolve.find_or_create_org(cur, name="Example Logistics", domain="example-logi.example", country="JP")
+        resolve.find_or_create_org(cur, name="サンプル物流", domain="example-logi.example", country="JP",
+                                   name_en="Example Logistics Holdings", name_en_in_text=True)
+        cur.execute("select aliases, alias_norms from breach_core.organizations where org_id = %s", (en,))
+        assert cur.fetchone() == ([], [])
+    conn.rollback()

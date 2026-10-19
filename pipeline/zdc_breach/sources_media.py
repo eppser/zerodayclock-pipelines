@@ -14,6 +14,8 @@ import re
 import urllib.parse
 from datetime import date, datetime, timedelta, timezone
 
+from .normalize import cjk_contains, has_cjk, norm_name
+
 API = "https://api.gdeltproject.org/api/v2/doc/doc"
 INDEX_START = date(2017, 1, 1)
 PACE_S = 8.0          # GDELT asks for one request per 5 s; shared runner IPs need more
@@ -21,7 +23,8 @@ RETRIES_429 = 3       # GDELT is often congested: a 429 that is retried 15 s lat
 RETRY_SLEEP_S = 15.0
 GIVE_UP_AFTER = 3     # consecutive searches that never got an answer
 _BREACH = re.compile(r"(ransom|breach|hack|cyber|attack|leak|stolen|extort|data theft|compromis|incident|"
-                     r"datenleck|cyberangriff|piratage|fuite|ciberataque|violaci|attacco|lek|aanval)", re.I)
+                     r"datenleck|cyberangriff|piratage|fuite|ciberataque|violaci|attacco|lek|aanval|"
+                     r"不正アクセス|漏え?い|漏洩|流出|ランサムウェア|サイバー攻撃|身代金)", re.I)
 
 
 def norm(s: str | None) -> str:
@@ -49,6 +52,13 @@ def query_url(name: str, seen: date, today: date) -> str | None:
 
 
 def matches(name: str, title: str, url: str) -> bool:
+    if has_cjk(name):
+        # Japanese is written without spaces: the whole normalised name, legal form removed, as a
+        # substring of the normalised title (0130).
+        n = norm_name(name)
+        if len(n.replace(" ", "")) < 4 or not cjk_contains(norm_name(title), n):
+            return False
+        return bool(_BREACH.search(title) or _BREACH.search(url))
     n, t = norm(name), norm(title)
     if not n or not t or not re.search(r"(^|\s)" + re.escape(n) + r"(\s|$)", t):
         return False
@@ -80,6 +90,11 @@ def distinctive(name: str | None) -> bool:
     be an ordinary word ("Target" is a verb in "Hackers target hospitals"): CamelCase, a digit,
     or at least nine letters."""
     n = (name or "").strip()
+    if has_cjk(n):
+        # A Japanese name (0130): at least four characters once the legal form is gone. "トヨタ"
+        # and "日産" are left out, as one plain English word is: a three-character katakana word
+        # is as likely to be part of another word in a headline as to be the company.
+        return "?" not in n and len(norm_name(n).replace(" ", "")) >= 4
     if not searchable(n) or "?" in n:
         return False
     words = norm(n).split()
@@ -97,8 +112,13 @@ def index_names(victims) -> dict[str, list]:
     for v in victims:
         vid, name = v[0], v[1]
         if distinctive(name):
-            idx.setdefault(norm(name), []).append(vid if len(v) == 2 else (vid, v[2]))
+            key = JA_KEY + norm_name(name) if has_cjk(name) else norm(name)
+            idx.setdefault(key, []).append(vid if len(v) == 2 else (vid, v[2]))
     return idx
+
+
+# Index keys of Japanese names carry this prefix; norm() can never produce a colon.
+JA_KEY = "ja:"
 
 
 def in_window(published: date | None, seen: date | None) -> bool:
@@ -113,7 +133,11 @@ def in_window(published: date | None, seen: date | None) -> bool:
 # ("Microsoft catches hackers exploiting Zimbra bug").
 TITLE_EVENT = re.compile(r"ransomware|data breach|\bbreach(?:ed|es)?\b|\bhacked\b|cyber[- ]?attack|cyber incident|"
                          r"security incident|data (?:leak|theft)|(?:data|records|files) (?:were )?stolen|stolen data|"
-                         r"\bleak(?:ed|s)?\b|extort|datenleck|cyberangriff|piratage|ciberataque", re.I)
+                         r"\bleak(?:ed|s)?\b|extort|datenleck|cyberangriff|piratage|ciberataque|"
+                         # Japanese (0130): an event, not a topic. 流出 only after 情報/データ - 人材流出
+                         # is staff leaving. "注意喚起" (an advisory) and "脆弱性" (a flaw) are not events.
+                         r"ランサムウェア|不正アクセス|サイバー攻撃|情報漏え?い|情報漏洩|漏えい|漏洩|(?:情報|データ).{0,20}?流出|"
+                         r"身代金|誤送信|誤送付|紛失|盗難", re.I)
 
 
 def find_in_title(title: str, idx: dict[str, list[str]], max_words: int = 8) -> list[str]:
@@ -123,4 +147,9 @@ def find_in_title(title: str, idx: dict[str, list[str]], max_words: int = 8) -> 
     for i in range(len(words)):
         for j in range(i + 1, min(len(words), i + max_words) + 1):
             hits += idx.get(" ".join(words[i:j]), [])
+    if has_cjk(title):
+        t = norm_name(title)
+        for key, vids in idx.items():
+            if key.startswith(JA_KEY) and cjk_contains(t, key[len(JA_KEY):]):
+                hits += vids
     return hits

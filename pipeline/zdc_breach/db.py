@@ -94,6 +94,10 @@ def watermark(cur, source_id: str) -> dict:
     return (r[0] or {}) if r else {}
 
 
+def _raw(name: str | None) -> str:
+    return " ".join((name or "").split()).lower()
+
+
 def upsert_leak_posts(cur, posts) -> dict:
     """Fold tracker posts into posting episodes. A post joins an existing claim when the
     group matches and the victim matches by domain or normalised name within 14 days;
@@ -107,13 +111,14 @@ def upsert_leak_posts(cur, posts) -> dict:
         return counts
     groups = sorted({p.actor_group for p in posts})
     cur.execute("""select claim_key, actor_group, victim_domain, victim_norm, first_seen_at, last_seen_at,
-                          trackers, tracker_refs, country, sector, employees_stated, demand_text
+                          trackers, tracker_refs, country, sector, employees_stated, demand_text, victim_name
                      from breach_core.leak_claims
                     where actor_group = any(%s) and first_seen_at between %s and %s""",
                 (groups, posts[0].seen_at - LEAK_WINDOW, posts[-1].seen_at + LEAK_WINDOW))
     by_group: dict = {}
-    for key, grp, dom, norm, first, last, trackers, refs, country, sector, emp, dem in cur.fetchall():
+    for key, grp, dom, norm, first, last, trackers, refs, country, sector, emp, dem, vname in cur.fetchall():
         by_group.setdefault(grp, []).append({"key": key, "domain": dom, "norm": norm, "first": first, "last": last,
+                                             "name": vname,
                                              "trackers": list(trackers), "refs": list(refs or []),
                                              "country": country, "sector": sector, "employees": emp,
                                              "demand": (dem, None, None) if dem else None, "demand_new": False,
@@ -121,7 +126,11 @@ def upsert_leak_posts(cur, posts) -> dict:
     for p in posts:
         ref = {"source_id": p.source_id, "id": p.source_record_id}
         cands = [c for c in by_group.get(p.actor_group, [])
-                 if ((c["domain"] is not None and c["domain"] == p.victim_domain) or c["norm"] == p.victim_norm)
+                 # an empty normalised name (a Korean, Cyrillic, Greek or Arabic name) matches nothing
+                 # (the raw name, spacing and case aside, stands in for it there)
+                 if ((c["domain"] is not None and c["domain"] == p.victim_domain)
+                     or (p.victim_norm and c["norm"] == p.victim_norm)
+                     or (not p.victim_norm and not c["norm"] and _raw(c.get("name")) == _raw(p.victim_name)))
                  and abs(c["first"] - p.seen_at) <= LEAK_WINDOW]
         if cands:
             c = min(cands, key=lambda c: abs((c["first"] - p.seen_at).total_seconds()))
@@ -144,7 +153,10 @@ def upsert_leak_posts(cur, posts) -> dict:
             c["dirty"] = True
             counts["joined"] += 1
         else:
-            key = f"{p.actor_group}|{p.victim_domain or p.victim_norm}|{p.seen_at.date().isoformat()}"
+            # with no domain and an empty normalised name the raw name keys the claim, so two such
+            # victims of one group on one day stay two claims
+            who = p.victim_domain or p.victim_norm or "name:" + _raw(p.victim_name)
+            key = f"{p.actor_group}|{who}|{p.seen_at.date().isoformat()}"
             existing = next((c for c in by_group.get(p.actor_group, []) if c["key"] == key), None)
             if existing:            # the same key opened earlier in this batch or a previous run
                 counts["already"] += 1

@@ -24,8 +24,10 @@ import psycopg
 from . import extract, run
 
 
-def extractor_id(model: str) -> str:
-    return f"agent:{model}@{extract.prompt_hash(model)}"
+def extractor_id(model: str, lang: str = "en") -> str:
+    """Per model, prompt and language, as run.extractor_id (0130)."""
+    base = f"agent:{model}@{extract.prompt_hash(model)}"
+    return base if lang == "en" else f"{base}:{lang}"
 
 
 def load(conn, model: str, lines: list[dict], dry_run: bool = False) -> dict:
@@ -36,11 +38,7 @@ def load(conn, model: str, lines: list[dict], dry_run: bool = False) -> dict:
     ctx = run.Ctx(conn, None, _Args())
     out = {"extractor_id": ext_id, "filed": 0, "already": 0, "no_document": 0}
     with conn.transaction(), conn.cursor() as cur:
-        cur.execute("""insert into breach_core.extractor_versions (extractor_id, kind, model_id, prompt_hash, schema_hash, active, note)
-                       values (%s, 'llm', %s, %s, %s, false,
-                               'Claude subagent on the owner''s subscription; awaiting gold-set result before activation')
-                       on conflict (extractor_id) do nothing""",
-                    (ext_id, model, extract.prompt_hash(model), extract.SCHEMA_VERSION))
+        registered = set()
         for row in lines:
             sha, output = row.get("doc"), extract.parse_model_json(row.get("output"))
             cur.execute("""select d.text, d.url, d.title, d.published_at, d.source_id, d.source_record_id
@@ -49,11 +47,21 @@ def load(conn, model: str, lines: list[dict], dry_run: bool = False) -> dict:
             if doc is None:
                 out["no_document"] += 1
                 continue
+            text, url, title, published, source_id, rid = doc
+            # A Japanese document files under the ":ja" version, which only a Japanese gold set
+            # can activate (0130).
+            ext_id = extractor_id(model, extract.language(text, source_id))
+            if ext_id not in registered:
+                cur.execute("""insert into breach_core.extractor_versions (extractor_id, kind, model_id, prompt_hash, schema_hash, active, note)
+                               values (%s, 'llm', %s, %s, %s, false,
+                                       'Claude subagent on the owner''s subscription; awaiting gold-set result before activation')
+                               on conflict (extractor_id) do nothing""",
+                            (ext_id, model, extract.prompt_hash(model), extract.SCHEMA_VERSION))
+                registered.add(ext_id)
             cur.execute("select 1 from breach_core.extractions where doc_sha256 = %s and extractor_id = %s", (sha, ext_id))
             if cur.fetchone():
                 out["already"] += 1
                 continue
-            text, url, title, published, source_id, rid = doc
             forced = None
             if source_id == "sec_8k":
                 cur.execute("""select incident_id from breach_core.incident_sources
@@ -64,16 +72,28 @@ def load(conn, model: str, lines: list[dict], dry_run: bool = False) -> dict:
                             forced_incident=forced, forced_basis="regulator_filing" if forced else None)
             out["filed"] += 1
         out["claims"] = ctx.report["claims"]
+        out["extractor_ids"] = sorted(registered)
         if dry_run:
             raise _Rollback(out)
     return out
 
 
-def activate(conn, model: str, fields: list[str], gold_files: list[str]) -> dict:
+def activate(conn, model: str, fields: list[str], gold_files: list[str], lang: str = "en") -> dict:
     """Record the gold-set scores that justify it and switch on exactly these fields. Every field
-    must reach 0.95 combined over the given score files, with at least 5 accepted facts."""
-    ext_id = extractor_id(model)
+    must reach 0.95 combined over the given score files, with at least 5 accepted facts. The
+    score files must have been scored on documents of the version's language (0130): an English
+    gold set cannot activate the Japanese version, nor the reverse."""
+    ext_id = extractor_id(model, lang)
     scores = {f: json.load(open(f)) for f in gold_files}
+    want_hash = extract.prompt_hash(model)
+    for f, sc in scores.items():
+        # score files written before 0130 carry no language and were all English
+        if sc.get("languages", ["en"]) != [lang]:
+            raise SystemExit(f"{f} was scored on {sc.get('languages', ['en'])} documents, not [{lang!r}]; not activated")
+        # A score is evidence about the prompt that produced the outputs it scored. A file that does
+        # not name its prompt (every file before this check) cannot activate a version.
+        if sc.get("prompt_hash") != want_hash:
+            raise SystemExit(f"{f} scored prompt {sc.get('prompt_hash')!r}, not {want_hash!r}; not activated")
     for fld in fields:
         acc = sum((s["fields"].get(fld) or {}).get("accepted", 0) for s in scores.values())
         ok = sum((s["fields"].get(fld) or {}).get("correct", 0) for s in scores.values())
@@ -101,10 +121,11 @@ def main(argv=None) -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--activate", help="comma-separated fields that passed the gold set")
     ap.add_argument("--gold", nargs="+", default=[], help="score files from zdc_breach.gold")
+    ap.add_argument("--language", default="en", choices=("en", "ja"), help="which extractor version to activate")
     a = ap.parse_args(argv)
     if a.activate:
         conn = psycopg.connect(os.environ["DATABASE_URL"], autocommit=False)
-        print(json.dumps(activate(conn, a.model, a.activate.split(","), a.gold), indent=2))
+        print(json.dumps(activate(conn, a.model, a.activate.split(","), a.gold, a.language), indent=2))
         return 0
     lines = [json.loads(l) for f in a.outputs for l in open(f) if l.strip()]
     conn = psycopg.connect(os.environ["DATABASE_URL"], autocommit=False)
