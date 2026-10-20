@@ -16,7 +16,7 @@ import pytest
 from zdc_aicap import checks, discover, registry, source_vals
 from zdc_crowdsec.evals import EvalResult as EvalResultT
 
-TODAY = dt.date(2026, 10, 19)
+TODAY = dt.date(2026, 10, 20)
 
 
 # ---------------------------------------------------------------- the real registry
@@ -36,10 +36,10 @@ def reg_fixture():
                        {"id": "lab", "name": "Lab", "kind": "vendor_research", "url": "https://lab.example", "develops_models": ["LabCo"]}],
         "benchmarks": [{"id": "b1", "name": "B1", "side": "offence", "skill": "exploit things", "unit": "percent", "scale_max": 100,
                         "tasks": 10, "evaluator": "gov", "source": "curated", "url": "https://b1.example", "licence": "x",
-                        "republish": "allowed", "status": "active"},
+                        "republish": "allowed", "status": "active", "cadence": "series"},
                        {"id": "b2", "name": "B2", "side": "defence", "skill": "detect things", "unit": "reward", "scale_max": 1,
                         "tasks": None, "evaluator": "lab", "source": "curated", "url": "https://b2.example", "licence": "x",
-                        "republish": "cite", "status": "active"}],
+                        "republish": "cite", "status": "active", "cadence": "leaderboard"}],
         "results": [{"benchmark": "b1", "version": "1", "model": "M", "developer": "OtherCo", "score": 44.4, "n": 502,
                      "published_on": "2026-09-17", "source_url": "https://b1.example/r", "evidence": "44.4% (223/502)", "verified_on": "2026-10-19"},
                     {"benchmark": "b2", "version": "1", "model": "N", "developer": "OtherCo", "score": 0.637,
@@ -69,11 +69,20 @@ def test_a_valid_registry_has_no_problems():
     (lambda r: r["events"][0].update(lane="lab"), "government or benchmark"),
     (lambda r: r["events"][0].update(evidence=""), "without an evidence quote"),
     (lambda r: r["benchmarks"][0].update(skill="x" * 111), "one-line skill"),
+    (lambda r: r["benchmarks"][0].update(cadence="one-off"), "only continuous benchmarks"),
+    (lambda r: r["benchmarks"][0].pop("cadence"), "cadence"),
 ])
 def test_each_registry_rule_catches_its_mistake(mutate, needle):
     r = reg_fixture()
     mutate(r)
     assert any(needle in p for p in registry.validate(r, TODAY)), registry.validate(r, TODAY)
+
+
+def test_only_continuous_benchmarks_are_active_in_the_shipped_registry():
+    # owner, 2026-10-20: a one-off research paper is never shown, only boards and recurring series
+    for b in registry.load()["benchmarks"]:
+        assert b["status"] != "active" or b["cadence"] in ("leaderboard", "series"), b["id"]
+    assert {b["id"] for b in registry.load()["benchmarks"] if b["status"] == "retired"} >= {"cti-realm", "excytin"}
 
 
 def test_evidence_may_state_the_count_instead_of_the_share():
@@ -435,7 +444,8 @@ def test_vals_unreachable_keeps_last_week_and_still_writes_the_registry(db, monk
     assert run_with(monkeypatch, board_doc(), fail_board=True) == 1      # never read: the run fails, so it is seen
     doc = db.execute("select public.aicap_document()").fetchone()[0]
     assert doc["board"]["rows"] is None                                    # nothing stored yet, nothing invented
-    assert any(r["b"] == "cti-realm" for r in doc["results"])              # the curated results still went through
+    assert any(r["b"] == "caisi-sec-bench-pro" for r in doc["results"])    # the curated results still went through
+    assert not any(r["b"] == "cti-realm" for r in doc["results"])          # a retired one-off paper is never served
     assert run_with(monkeypatch, board_doc()) == 0
     assert run_with(monkeypatch, board_doc(), fail_board=True) == 0
     doc = db.execute("select public.aicap_document()").fetchone()[0]

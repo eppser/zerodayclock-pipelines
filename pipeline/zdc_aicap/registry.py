@@ -31,6 +31,9 @@ UNITS = {"percent": 100.0, "points": 100.0, "reward": 1.0}
 SOURCES = {"vals", "curated"}
 REPUBLISH = {"allowed", "cite", "pending", "denied"}
 STATUSES = {"active", "retired"}
+# leaderboard: a maintained board that adds models; series: a recurring evaluation programme (CAISI);
+# one-off: a single paper. Only the first two are shown (owner, 2026-10-20): a one-off cannot move.
+CADENCES = {"leaderboard", "series", "one-off"}
 LANES = {"government", "benchmark"}
 PRECISION = {"day", "month"}
 ISO = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -127,6 +130,10 @@ def validate(reg: dict, today: dt.date | None = None) -> list[str]:
             p.append(f"{w}: republish {b.get('republish')!r} not in {sorted(REPUBLISH)}")
         if b.get("status") not in STATUSES:
             p.append(f"{w}: status {b.get('status')!r} not in {sorted(STATUSES)}")
+        if b.get("cadence") not in CADENCES:
+            p.append(f"{w}: cadence {b.get('cadence')!r} not in {sorted(CADENCES)}")
+        elif b["cadence"] == "one-off" and b.get("status") == "active":
+            p.append(f"{w}: a one-off paper cannot be active; only continuous benchmarks are shown")
         if b.get("tasks") is not None and (not isinstance(b["tasks"], int) or b["tasks"] <= 0):
             p.append(f"{w}: tasks must be a positive integer or null")
         if not b.get("name") or not b.get("skill") or len(b.get("skill", "")) > 110:
