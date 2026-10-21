@@ -42,6 +42,13 @@ WA = [
      "datestart": "2026-08-01T00:00:00.000", "washingtoniansaffected": "700",
      "databreachcause": "Cyberattack", "cyberattacktype": "Ransomware"},
 ]
+# atg.wa.gov's list (R4): the data types for "Twin Filing Corp", and a notice no dataset row carries.
+from test_wa_site import page as wa_page, row as wa_row  # noqa: E402
+
+WA_SITE = [wa_page([wa_row("Twin Filing Corp", D(20).strftime("%m/%d/%Y"), "08/01/2026", "900",
+                           "Name; Social Security Number; Unknown", pdf="A9001"),
+                    wa_row("Zz Unfiled Clinic", D(25).strftime("%m/%d/%Y"), "", "650", "Medical Information",
+                           pdf="A9000")])]
 CA = ("﻿Organization Name,Date(s) of Breach  (if known),Reported Date\n"
       f"Twin Filing Corp.,08/01/2026,{D(18).strftime('%m/%d/%Y')}\n"
       f"Near Date Inc,08/09/2026,{D(18).strftime('%m/%d/%Y')}\n")
@@ -73,6 +80,8 @@ def payload_for(url: str):
         return json.dumps(WA).encode()
     if "oag.ca.gov" in url:
         return CA.encode()
+    if "atg.wa.gov" in url:
+        return WA_SITE[0].encode()
     if "haveibeenpwned" in url:
         return json.dumps(HIBP).encode()
     if "efts.sec.gov" in url:
@@ -844,3 +853,89 @@ def test_incident_cve_never_files_against_a_rejected_twin(conn):
     conn.commit()
     assert q(conn, """select count(*) from breach_core.incident_cves ic join breach_core.claims c on c.claim_id = ic.claim_id
                        where not c.accepted""") == [(0,)]
+
+
+# ---- atg.wa.gov list (R4) ------------------------------------------------------------------------
+def _wa_dt(conn):
+    return q(conn, """select o.display_name, c.value_text, c.source_record_id, c.superseded_by is null
+                        from breach_core.claims c join breach_core.incidents i using (incident_id)
+                        join breach_core.organizations o using (org_id)
+                       where c.field = 'data_types' and c.source_id = 'wa_ag' order by c.created_at, c.value_text""")
+
+
+def test_wa_site_types_join_the_dataset_incident_and_nothing_else(conn):
+    rep = brun.run(conn, args(sources="wa_ag"), getter=fake_get, llm=None, fx=NoFx())
+    assert rep["ok"], [e for e in rep["evals"] if not e["passed"]]
+    site = rep["sources"]["wa_ag"]["site"]
+    assert site["ok"] and site["notices"] == 2 and site["claims_written"] == 1
+    assert site["join"] == {"name_date": 1, "no_match": 1}
+    assert _wa_dt(conn) == [("Twin Filing Corp", "Name, Social Security Number", "site:A9001", True)]
+    # raw first: both notices stored, the page fetch recorded with its URL, status and hash
+    assert q(conn, """select count(*) from breach_raw.source_records
+                       where source_id = 'wa_ag' and source_record_id like 'site:%%'""") == [(2,)]
+    assert q(conn, """select http_status, sha256 is not null from breach_raw.fetches
+                       where url like 'https://www.atg.wa.gov/%%'""") == [(200, True)]
+    # no second link, no new organisation or incident from the list
+    assert q(conn, "select count(*) from breach_core.incident_sources where source_record_id like 'site:%%'") == [(0,)]
+    assert q(conn, "select count(*) from breach_core.organizations where display_name like 'Zz%%'") == [(0,)]
+    brun.run(conn, args(sources="extract"), getter=fake_get, llm=None, fx=NoFx())
+    facts = q(conn, """select f.data_types from breach_core.incident_facts f join breach_core.incidents i using (incident_id)
+                         join breach_core.organizations o using (org_id) where o.display_name = 'Twin Filing Corp'""")
+    assert facts == [(["Name", "Social Security Number"],)]
+
+
+def test_wa_site_second_run_writes_nothing_and_a_revision_supersedes(conn):
+    brun.run(conn, args(sources="wa_ag"), getter=fake_get, llm=None, fx=NoFx())
+    rep = brun.run(conn, args(sources="wa_ag"), getter=fake_get, llm=None, fx=NoFx())
+    site = rep["sources"]["wa_ag"]["site"]
+    assert site["pages"] == 1 and site["unchanged"] == 2 and site["claims_written"] == 0
+    old = WA_SITE[0]
+    try:
+        WA_SITE[0] = old.replace("Name; Social Security Number; Unknown", "Name; Passport Number")
+        rep = brun.run(conn, args(sources="wa_ag"), getter=fake_get, llm=None, fx=NoFx())
+    finally:
+        WA_SITE[0] = old
+    assert rep["sources"]["wa_ag"]["site"]["changed"] == 1
+    assert _wa_dt(conn) == [("Twin Filing Corp", "Name, Social Security Number", "site:A9001", False),
+                            ("Twin Filing Corp", "Name, Passport Number", "site:A9001", True)]
+
+
+def test_wa_site_blocked_keeps_the_dataset_rows_and_warns(conn):
+    def blocked(url, **kw):
+        if "atg.wa.gov" in url:
+            return Fetched(url, 403, b"", "HTTP 403", NOW, NOW, {})
+        return fake_get(url, **kw)
+    rep = brun.run(conn, args(sources="wa_ag"), getter=blocked, llm=None, fx=NoFx())
+    assert rep["ok"] and rep["sources"]["wa_ag"]["ok"]
+    assert rep["sources"]["wa_ag"]["site"]["error"] == "blocked"
+    assert q(conn, "select count(*) from breach_core.incident_sources where source_id = 'wa_ag'") == [(2,)]
+    assert q(conn, "select http_status from breach_raw.fetches where url like 'https://www.atg.wa.gov/%%'") == [(403,)]
+    ev = {e["name"]: e for e in rep["evals"]}["wa_site_harvested"]
+    assert not ev["passed"] and ev["severity"] == "warn"
+
+
+def test_wa_site_eval_fails_when_the_list_changes_shape(conn):
+    old = WA_SITE[0]
+    try:
+        WA_SITE[0] = "<html><body>new design</body></html>"
+        rep = brun.run(conn, args(sources="wa_ag"), getter=fake_get, llm=None, fx=NoFx())
+    finally:
+        WA_SITE[0] = old
+    ev = {e["name"]: e for e in rep["evals"]}["wa_site_harvested"]
+    assert not ev["passed"] and ev["severity"] == "error"
+
+
+def test_wa_site_reads_every_page_once_then_stops_at_the_first_unchanged_page(conn):
+    p0 = wa_page([wa_row("Zz Page Zero", D(5).strftime("%m/%d/%Y"), "", "600", "Name", pdf="A9100")], last=1)
+    p1 = wa_page([wa_row("Zz Page One", D(40).strftime("%m/%d/%Y"), "", "700", "Name", pdf="A9101")], last=1)
+    asked = []
+
+    def two_pages(url, **kw):
+        if "atg.wa.gov" in url:
+            asked.append(url)
+            return Fetched(url, 200, (p1 if url.endswith("page=1") else p0).encode(), None, NOW, NOW, {})
+        return fake_get(url, **kw)
+    rep = brun.run(conn, args(sources="wa_ag"), getter=two_pages, llm=None, fx=NoFx())
+    assert rep["sources"]["wa_ag"]["site"]["pages"] == 2 and len(asked) == 2
+    rep = brun.run(conn, args(sources="wa_ag"), getter=two_pages, llm=None, fx=NoFx())
+    assert rep["sources"]["wa_ag"]["site"]["pages"] == 1 and len(asked) == 3

@@ -997,3 +997,100 @@ def test_gold_activation_refuses_another_prompt():
             json.dump(sc, fh)
         with pytest.raises(SystemExit, match="scored prompt"):
             agent_load.activate(None, "m", ["x"], [fh.name])
+
+
+# ---- data_types: the reconcile split (R2) and the HHS archive clause (R5), ruling 2026-10-21 ------------------
+DE_FIN = ("Account number, credit card account number, or debit card number, in combination with any required "
+          "security code, access code, or password that would permit access to a financial account")
+DE_HEALTH_ID = ("Health insurance policy number, subscriber ID number, or any other unique identifier used by health "
+                "insurer to identify person")
+DE_ONLINE = "Username or email address, in combination with password or security question and answer to access online account"
+
+
+def test_split_keeps_delaware_statutory_elements_whole():
+    """Mutant: split on every comma (the old rule made 'access code' and 'in combination with any required security
+    code' items of their own, which tagged a card number as Credentials)."""
+    text = f"Social Security number, {DE_FIN}, {DE_HEALTH_ID}, Medical history, and {DE_ONLINE}"
+    assert reconcile.split_data_types(text) == ["Social Security number", DE_FIN, DE_HEALTH_ID, "Medical history",
+                                                DE_ONLINE]
+
+
+def test_split_reads_the_spellings_and_truncations_delaware_carries():
+    """Mutant: only the canonical spelling is protected."""
+    slashed = ("Account number / Credit card account number / or debit card number in combination with any required "
+               "security code")
+    assert reconcile.split_data_types(f"Social Security number, {slashed}, Biometric data") == [
+        "Social Security number", slashed, "Biometric data"]
+    cut = DE_FIN[:120]                                # the 500-character cap lands inside an element
+    assert reconcile.split_data_types(f"Driver's license number, {cut}") == ["Driver's license number", cut]
+    short = "Health insurance policy number, subscriber ID, any other unique ID number used by health ins to ID person"
+    assert reconcile.split_data_types(f"Social Security number, {short}") == ["Social Security number", short]
+    wth = "Username or email address in combination wth password or security question"
+    assert reconcile.split_data_types(f"Account number, {wth}, Passport Number") == ["Account number", wth,
+                                                                                   "Passport Number"]
+
+
+def test_split_top_level_separators_only():
+    """Mutant: a comma inside parentheses splits; a leading 'and'/'or' is kept; 'in combination' stands alone."""
+    assert reconcile.split_data_types("contact details (residential address, phone), names") == [
+        "contact details (residential address, phone)", "names"]
+    assert reconcile.split_data_types("Social Security number; Account number\nPassport, and Medical history, or SSN") == [
+        "Social Security number", "Account number", "Passport", "Medical history", "SSN"]
+    assert reconcile.split_data_types("Passwords, in combination with a PIN, Names") == [
+        "Passwords, in combination with a PIN", "Names"]
+    assert reconcile.split_data_types("'SSN, FinInfo.") == ["SSN", "FinInfo"]
+    assert reconcile.split_data_types(f"Social Security number and {DE_HEALTH_ID}") == ["Social Security number",
+                                                                                         DE_HEALTH_ID]
+    assert reconcile.split_data_types("Social Security number & Drivers License") == ["Social Security number",
+                                                                                       "Drivers License"]
+    assert reconcile.split_data_types("names and addresses, Security questions and answers") == [
+        "names and addresses", "Security questions and answers"]                       # lower-case 'and' stays
+    assert reconcile.split_data_types("a, , Names, Names") == ["Names"]                 # junk and repeats once
+    assert reconcile.split_data_types(None) == [] and reconcile.split_data_types("") == []
+
+
+def test_split_leaves_a_plain_list_as_the_old_rule_did():
+    """Mutant: the new rule changes an HIBP list (its items never carry a comma)."""
+    hibp = "Email addresses, IP addresses, Names, Passwords, Usernames"
+    assert reconcile.split_data_types(hibp) == [t.strip() for t in hibp.split(",")]
+
+
+def test_hhs_archive_description_gives_the_phi_clause_only():
+    """Mutant: the whole description is read (cause, safeguards), or a negated clause counts."""
+    s = sources_reg.hhs_phi_items
+    assert s("The covered entity (CE), X, reported a breach affecting the protected health information (PHI) of 1,693 "
+             "individuals.  The PHI involved clinical, demographic, and financial information.  The CE notified HHS, "
+             "the media, and the affected individuals.") == ["clinical", "demographic", "financial information"]
+    assert s("The protected health information (PHI) involved included names, Social Security numbers, drivers’ "
+             "license and Social Security numbers, and medications prescribed.") == [
+        "names", "Social Security numbers", "drivers’ license", "medications prescribed"]
+    assert s("The PHI consisted of demographic and clinical information.") == ["demographic", "clinical information"]
+    assert s("The PHI did not include financial information. OCR provided technical assistance.") == []
+    # measured on the full Archive export: counts, run-on sentences and paired items
+    assert s("The PHI involved included clinical information of approximately 1,000 individuals.") == ["clinical information"]
+    assert s("The PHI involved 2,345 individuals.") == []
+    assert s("The information included patient names, and in some cases Social Security numbers.") == [
+        "patient names", "Social Security numbers"]
+    assert s("The PHI involved in the breaches included clinical and demographic information.") == [
+        "clinical", "demographic information"]
+    assert s("The PHI involved included demographic and financial information The CE notified HHS and affected "
+             "individuals") == ["demographic", "financial information"]
+    assert s("The PHI involved included, first and last names, member and group identification numbers, and in some "
+             "cases, diagnoses.") == ["first and last names", "member and group identification numbers", "diagnoses"]
+    assert s("The CE implemented additional safeguards to better protect its PHI.") == []
+    assert s("") == [] and s(None) == []
+
+
+def test_hhs_archive_row_carries_a_data_types_claim_open_rows_none():
+    """Mutant: parse_hhs drops the Web Description column (no claim), or an empty description adds a record key
+    (every stored open-case record would get a new version on the next run)."""
+    body = ('"Name","State","Type","Individuals Affected","Breach Submission Date","Type of Breach","Location","BA","Web Description"\n'
+            '"A Clinic","NC","Healthcare Provider","1200","09/01/2024","Hacking/IT Incident","Network Server","No",'
+            '"The PHI involved clinical and demographic information. The CE notified HHS."\n'
+            '"B Plan","IA","Health Plan","1693","09/21/2026","Theft","Laptop","Yes",""\n')
+    ds, bad = sources_reg.parse_hhs(body)
+    assert bad == 0
+    dt = [f for f in ds[0].facts if f.field == "data_types"]
+    assert [f.value_text for f in dt] == ["clinical, demographic information"]
+    assert ds[0].basis == "regulator_filing" and ds[0].record["web_description"].startswith("The PHI involved")
+    assert not any(f.field == "data_types" for f in ds[1].facts) and "web_description" not in ds[1].record

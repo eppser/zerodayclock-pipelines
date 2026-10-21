@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -28,7 +29,7 @@ import psycopg
 from zdc_kev import db as runs_db
 
 from . import (confidence, cve_agent_load, cve_extract, db, evals, extract, http, linkage_db, reconcile, resolve, sources_actors, sources_leak, sources_media,
-               sources_news, sources_reg, sources_size, thumbs)
+               sources_news, sources_reg, sources_size, sources_wa_site, thumbs)
 from .fx import Fx
 from .llm import MODEL, BudgetExceeded, OpenRouter
 from .normalize import norm_country, norm_domain
@@ -190,7 +191,101 @@ def run_structured(ctx, cur, source_id: str) -> dict:
             apply_disclosure_batched(r, d)
             applied += 1
     r.flush()
-    return {"parsed": len(items), "malformed": bad, **counts, "applied": applied}
+    res = {"parsed": len(items), "malformed": bad, **counts, "applied": applied}
+    if source_id == "wa_ag" and not getattr(ctx.args, "no_wa_site", False):
+        # The AG's web list (R4): its own savepoint, so a failure there never costs the dataset rows.
+        try:
+            with cur.connection.transaction():
+                res["site"] = run_wa_site(ctx, cur)
+        except Exception as e:  # noqa: BLE001 - reported; the wa_site eval fails on it
+            log.warning("wa_ag site list failed: %s", type(e).__name__)
+            res["site"] = {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
+    return res
+
+
+_WA_DT_SQL = """with new as (
+        insert into breach_core.claims (incident_id, field, value_text, unit, qualifier, as_of, basis,
+                                        source_id, source_record_id, accepted)
+        values (%(inc)s, 'data_types', %(v)s, 'none', 'not_applicable', %(as_of)s, 'regulator_filing',
+                'wa_ag', %(sid)s, true)
+        on conflict do nothing returning claim_id)
+    update breach_core.claims c set superseded_by = (select claim_id from new)
+     where exists (select 1 from new) and c.incident_id = %(inc)s and c.field = 'data_types'
+       and c.source_id = 'wa_ag' and c.source_record_id = %(sid)s and c.superseded_by is null"""
+
+
+def run_wa_site(ctx, cur) -> dict:
+    """Washington AG's web list -> raw records -> a data_types claim on the incident its dataset row
+    created (sources_wa_site has the join rule and why). Newest first; stops at the first page that
+    brings nothing new or changed, so the first run reads every page and later runs one or two.
+    One request a second at most. A 403 or 429 stops the harvest and is reported, never retried."""
+    sleep = getattr(ctx, "sleep", time.sleep)
+    max_pages = getattr(ctx.args, "wa_site_pages", None) or sources_wa_site.MAX_PAGES
+    out = {"ok": True, "pages": 0, "notices": 0, "malformed": 0, "new": 0, "changed": 0, "unchanged": 0}
+    seen: set = set()
+    changed: set = set()
+    page = 0
+    while page < max_pages:
+        if page:
+            sleep(sources_wa_site.PAGE_DELAY_S)
+        f = ctx.get(sources_wa_site.page_url(page), accept="text/html")
+        if not f.ok:
+            db.record_fetch(cur, ctx.run_id, "wa_ag", f, None)
+            out.update(ok=False, http=f.status, stopped_at_page=page,
+                       error="blocked" if f.status in (403, 429) else (f.error or f"HTTP {f.status}"))
+            break
+        notices, bad, last = sources_wa_site.parse_page(f.text())
+        notices = [n for n in sources_wa_site.dedupe_ids(notices) if n.site_id not in seen]
+        seen.update(n.site_id for n in notices)
+        fid = db.record_fetch(cur, ctx.run_id, "wa_ag", f, len(notices) + bad)
+        counts, ch = db.store_records(cur, "wa_ag", [(n.site_id, n.record) for n in notices], fid)
+        changed |= ch
+        out["pages"] += 1
+        out["notices"] += len(notices)
+        out["malformed"] += bad
+        for k in ("new", "changed", "unchanged"):
+            out[k] += counts.get(k, 0)
+        if not ch or last is None or page >= last:
+            break
+        page += 1
+    out.update(apply_wa_site(cur, changed))
+    return out
+
+
+def apply_wa_site(cur, changed: set) -> dict:
+    """Join every stored site notice to the dataset rows (the join needs all of them to see an
+    ambiguity) and write a claim for each joined notice that changed or has no claim yet."""
+    cur.execute("""select distinct on (source_record_id) source_record_id, record
+                     from breach_raw.source_records
+                    where source_id = 'wa_ag' and source_record_id like 'site:%'
+                    order by source_record_id, version desc""")
+    notices = [n for n in (sources_wa_site.from_record(s, r) for s, r in cur.fetchall()) if n]
+    cur.execute("""select distinct on (source_record_id) source_record_id, record->>'name', record->>'datesubmitted'
+                     from breach_raw.source_records
+                    where source_id = 'wa_ag' and source_record_id not like 'site:%'
+                    order by source_record_id, version desc""")
+    dataset = [(rid, name, sources_reg._d(sub)) for rid, name, sub in cur.fetchall()]
+    joins = sources_wa_site.join(notices, dataset)
+    cur.execute("""select source_record_id from breach_core.claims
+                    where source_id = 'wa_ag' and field = 'data_types' and source_record_id like 'site:%'""")
+    has_claim = {r[0] for r in cur.fetchall()}
+    want = {did for did, how in joins.values() if did}
+    cur.execute("""select source_record_id, incident_id from breach_core.incident_sources
+                    where source_id = 'wa_ag' and source_record_id = any(%s)""", (sorted(want),))
+    inc_of = dict(cur.fetchall())
+    outcome: dict = {}
+    rows = []
+    for n in notices:
+        did, how = joins[n.site_id]
+        outcome[how] = outcome.get(how, 0) + 1
+        inc = inc_of.get(did) if did else None
+        if not inc or not n.data_types or (n.site_id in has_claim and n.site_id not in changed):
+            continue
+        rows.append({"inc": inc, "v": n.data_types[:500], "as_of": n.date_reported, "sid": n.site_id})
+    if rows:
+        with cur.connection.pipeline():
+            cur.executemany(_WA_DT_SQL, rows)
+    return {"join": outcome, "claims_written": len(rows)}
 
 
 def apply_disclosure_batched(r: "resolve.Resolver", d: sources_reg.Disclosure):
@@ -1057,6 +1152,9 @@ def main(argv=None) -> int:
     ap.add_argument("--max-apply", type=int, default=2000,
                     help="new or changed rows applied per regulator source per run; the rest wait")
     ap.add_argument("--no-llm", action="store_true")
+    ap.add_argument("--wa-site-pages", type=int, default=0,
+                    help="cap on atg.wa.gov list pages per run (default sources_wa_site.MAX_PAGES)")
+    ap.add_argument("--no-wa-site", action="store_true", help="skip the atg.wa.gov list (dataset only)")
     ap.add_argument("--trigger", default=os.environ.get("GITHUB_EVENT_NAME", "manual"))
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--report")

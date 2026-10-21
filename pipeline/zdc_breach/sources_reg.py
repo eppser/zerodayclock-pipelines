@@ -165,6 +165,54 @@ HHS_REPORT = "https://ocrportal.hhs.gov/ocr/breach/breach_report_hip.jsf"
 HHS_TYPE_VECTOR = {"theft": "physical_loss", "loss": "physical_loss", "improper disposal": "physical_loss"}
 
 
+# The Archive tab's "Web Description" is OCR's own case summary. Only its PHI clause is read ("The PHI involved
+# clinical, demographic, and financial information"): the subject must be the PHI (or the information) and the verb
+# must follow it directly, so "did not include" or "may have included" never match. The rest of the summary
+# (cause, safeguards, OCR's findings) is not a data-type statement and is not read. Deterministic; basis = the
+# regulator's text. Open cases carry no description, so the claim comes from the Archive export only.
+_HHS_PHI = re.compile(
+    r"\b(?:e?PHI|(?:electronic\s+)?protected health information(?:\s*\(e?PHI\))?|information)"
+    r"(?:\s+(?:involved|compromised|affected|at issue)(?:\s+in\s+(?:the|this|these)\s+(?:breach(?:es)?|incidents?))?)?"
+    r"\s+(?:included|includes|involved|consisted of)(?=[\s,:])[\s,:]+(?P<list>[^.;]+)", re.I)
+# The list ends where OCR's next sentence begins even when the period is missing ("... information The CE notified").
+_HHS_LIST_END = re.compile(r"\s+(?:The|This|OCR|Following|In response|After|As a result)\b")
+# A clause about how many were affected ("involved 2,345 individuals") is a count, not a list of types.
+_HHS_COUNT = re.compile(r"^\s*(?:approximately\s+|about\s+|over\s+)?\d")
+# Pairs OCR writes as one item; split at their "and" they would leave a dangling adjective ("first", "member").
+_HHS_PAIRS = re.compile(r"\b(?:first and last names?|member and group (?:identification |ID )?numbers?|"
+                        r"admission and discharge dates?)\b", re.I)
+_HHS_ITEM_SPLIT = re.compile(r"\s*,\s*(?:and/or\s+|and\s+|or\s+)?|\s+and/or\s+|\s+and\s+|\s+or\s+", re.I)
+
+
+def hhs_phi_items(description: str | None) -> list[str]:
+    """The data types OCR's description says the PHI involved, in its own words, one item each; [] when the
+    description has no PHI clause. Several PHI clauses (rare) are read in order, each item once."""
+    out: list[str] = []
+    for m in _HHS_PHI.finditer(re.sub(r"\s+", " ", description or "")):
+        text = _HHS_LIST_END.split(m.group("list"), maxsplit=1)[0]
+        if _HHS_COUNT.match(text):
+            continue
+        text = re.sub(r"(\d),(\d{3})\b", r"\1\2", text)          # "1,000 individuals" is one number, not two items
+        text = _HHS_PAIRS.sub(lambda p: p.group(0).replace(" and ", "\x00"), text)
+        for item in _HHS_ITEM_SPLIT.split(text):
+            item = re.sub(r"^(?:the|a|an)\s+", "", item.replace("\x00", " and ").strip(" ,:'\"\u2019()"),
+                          flags=re.I).strip()
+            item = _HHS_TAIL.sub("", item).strip(" ,")
+            item = re.sub(r"^in (?:some|certain|limited|a few) (?:cases|instances),?\s+", "", item, flags=re.I)
+            if sum(c.isalpha() for c in item) >= 2 and not _HHS_FILLER.match(item) and item not in out:
+                out.append(item)
+    return out
+
+
+# "... of approximately 940 individuals", "... affecting 9,000": the count trailing an item is not part of it.
+_HHS_TAIL = re.compile(r"\s*\b(?:(?:potentially\s+)?(?:affecting|affected)|of|for|pertaining to)\s+(?:approximately\s+|less than\s+)?"
+                       r"\d+\b.*$", re.I)
+# Connective words and counts left between the items of a list; no data type is named by them.
+_HHS_FILLER = re.compile(r"^(?:\d.*|(?:potentially\s+)?affect\w*\b.*|in (?:some|certain|limited|the)\b.*|as well as\b.*|etc|and|or|"
+                         r"including|included(?: variously)?|specifically|information|related information|other information|"
+                         r"times|named|full|start|date|dates|results|codes|members)$", re.I)
+
+
 def parse_hhs(body: str) -> tuple[list[Disclosure], int]:
     out, bad = [], 0
     rows = list(csv.reader(io.StringIO(body.lstrip("﻿"))))
@@ -182,6 +230,10 @@ def parse_hhs(body: str) -> tuple[list[Disclosure], int]:
         rec = {"name": name, "state": state, "entity_type": etype, "individuals_affected": n,
                "submitted": submitted, "type_of_breach": btype, "location": loc,
                "business_associate_present": r[7].strip() if len(r) > 7 else None}
+        desc = r[8].strip() if len(r) > 8 else ""
+        if desc:
+            # only when present: an empty key would change the stored hash of every open-case record
+            rec["web_description"] = desc
         d = Disclosure("hhs_ocr", f"{name}|{state}|{submitted}", name, when, "regulator_filing",
                        state=state, sector=f"Health: {etype}" if etype else "Health",
                        url="https://ocrportal.hhs.gov/ocr/breach/breach_report.jsf", record=rec)
@@ -190,6 +242,9 @@ def parse_hhs(body: str) -> tuple[list[Disclosure], int]:
             # 500/501 is filed when the true count is not yet known (HHS's own threshold).
             d.facts.append(Fact("people_affected", cnt, None, "persons",
                                 "placeholder" if cnt in (500, 501) else "exact"))
+        phi = hhs_phi_items(desc)
+        if phi:
+            d.facts.append(Fact("data_types", None, ", ".join(phi)[:500]))
         # "Hacking/IT Incident" is not a vector (advisor); only physical types map.
         for k, v in HHS_TYPE_VECTOR.items():
             if btype.lower().startswith(k):

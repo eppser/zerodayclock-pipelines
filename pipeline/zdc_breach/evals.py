@@ -41,6 +41,23 @@ def regulators_not_silently_empty(report) -> EvalResult:
                       else f"parsed to zero rows: {', '.join(bad)}", {"empty": bad})
 
 
+def wa_site_harvested(report) -> EvalResult:
+    """The atg.wa.gov list (R4) is the only source of WA data types. A read that parses to no
+    notice has changed shape (ERROR); a blocked or unreachable list is visible (WARN), and the
+    dataset rows still landed because the list runs in its own savepoint."""
+    site = (report["sources"].get("wa_ag") or {}).get("site")
+    if site is None:
+        return EvalResult("wa_site_harvested", INFO, True, "atg.wa.gov list not read this run", {})
+    if site.get("ok") and site.get("pages", 0) and not site.get("notices"):
+        return EvalResult("wa_site_harvested", ERROR, False, "atg.wa.gov list parsed to zero notices", site)
+    if not site.get("ok"):
+        return EvalResult("wa_site_harvested", WARN, False,
+                          f"atg.wa.gov list not read: {site.get('error')}", site)
+    return EvalResult("wa_site_harvested", INFO, True,
+                      f"{site['pages']} pages, {site['notices']} notices, {site.get('claims_written', 0)} claims written",
+                      site)
+
+
 def records_parse(report) -> EvalResult:
     worst, where = 0.0, None
     for k, v in report["sources"].items():
@@ -326,7 +343,7 @@ def censoring(cur) -> EvalResult:
 def run_all(cur, ctx) -> list[EvalResult]:
     r = ctx.report
     return [sources_answered(r), leak_not_silently_empty(r), regulators_not_silently_empty(r),
-            records_parse(r), quote_offsets_valid(ctx.new_quotes), budget(r),
+            wa_site_harvested(r), records_parse(r), quote_offsets_valid(ctx.new_quotes), budget(r),
             public_rows_have_status(cur), victims_list_current(cur), linked_list_current(cur), linkage_clusters_valid(cur),
             cve_links_current(cur), cve_links_one_view(cur), cve_links_have_evidence(cur),
             no_machine_link_public_ungated(cur), cve_links_no_pii(cur), cve_links_held(cur),

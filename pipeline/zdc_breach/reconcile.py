@@ -23,6 +23,7 @@ private source (sources.publication = 'private') feeds no fact and counts as no 
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from decimal import Decimal
 
@@ -34,6 +35,63 @@ OTHER_ORDER = ["regulator_filing", "victim_statement", "news_citing_victim", "ne
                "threat_actor_claim"]
 QUAL_RANK = {"exact": 0, "approx": 1, "at_least": 2, "at_most": 2, "range": 2,
              "not_applicable": 0, "placeholder": 9}
+
+
+# ---- data_types: one claim's text -> the items it lists (R2, ruling 2026-10-21) --------------------------
+# Delaware's form offers the statute's elements (6 Del. C. 12B-101) as checkboxes, and three of them contain
+# commas of their own. Splitting the text on every comma turned one element into four items, two of them junk
+# ("access code", "in combination with any required security code") that tagged a card number as Credentials.
+# Each element is matched whole, in the spellings and truncations the filings carry; its inner separators are
+# masked, and only the separators left over split the list.
+_DE_ELEMENTS = [
+    re.compile(r"account number\W+credit card account number\W+(?:or\s+)?debit card number"
+               r"(?:\W+in combination with any required security code(?:\W+access(?: code)?)?"
+               r"(?:\W+or(?: password(?: that would permit access to a financial account)?)?)?)?", re.I),
+    re.compile(r"health insurance policy number\W+subscriber ID(?: number)?\W+(?:or\s+)?any other unique "
+               r"(?:identifier|ID number) used by health ins(?:urer)?\.? to (?:identify|ID) person", re.I),
+    re.compile(r"username or email address,?\s*in combination w(?:i)?th password or security question"
+               r"(?:\s+and answer(?: to access online account)?)?", re.I),
+]
+_MASK = {",": "\x00", ";": "\x01", "\n": "\x02"}    # separators inside an element, restored after the split
+_LEAD = re.compile(r"^(?:and/or|and|or)\s+", re.I)
+_CONTINUES = re.compile(r"^in combination\b", re.I)
+_AND_LABEL = re.compile(r"\s+(?:and|&)\s+(?=[A-Z])")
+
+
+def split_data_types(text: str | None) -> list[str]:
+    """The items a data_types claim lists, split only at top-level separators (comma, semicolon, line break, and
+    'and'/'&' before a capitalised label; outside parentheses and outside a statutory element). A leading 'and'/'or' is dropped; a fragment that
+    begins 'in combination ...' qualifies the item before it and stays with it. Order kept, duplicates once."""
+    s = (text or "").replace("�", " ")
+    for rx in _DE_ELEMENTS:
+        s = rx.sub(lambda m: m.group(0).translate(str.maketrans(_MASK)), s)
+    parts, buf, depth = [], [], 0
+    for ch in s:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]" and depth:
+            depth -= 1
+        if ch in ",;\n" and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    parts.append("".join(buf))
+    # Delaware's checkbox labels are capitalised, so "Social Security number and Medical history" is two of them;
+    # a lower-case "and" ("names and addresses", "question and answer") is left alone.
+    parts = [q for p in parts for q in _AND_LABEL.split(p)]
+    out: list[str] = []
+    for p in parts:
+        item = re.sub(r"\s+", " ", p.translate(str.maketrans({v: k for k, v in _MASK.items()}))).strip(" .'\"\t")
+        item = _LEAD.sub("", item).strip()
+        if sum(c.isalpha() for c in item) < 2:
+            continue
+        if out and _CONTINUES.match(item):
+            out[-1] = f"{out[-1]}, {item}"
+            continue
+        out.append(item)
+    seen: set[str] = set()
+    return [x for x in out if not (x in seen or seen.add(x))]
 
 
 def _rank(order):
@@ -121,7 +179,7 @@ def build(cur) -> int:
             row["has_disagreement"] |= dis
         dt = choose(f.get("data_types", []), OTHER_ORDER)
         if dt:
-            row["data_types"] = sorted({t.strip() for t in dt["value_text"].split(",") if t.strip()})
+            row["data_types"] = sorted(set(split_data_types(dt["value_text"])))
         for field, col in (("vector", "vector"), ("actor", "actor")):
             best = choose(f.get(field, []), OTHER_ORDER)
             if best:
