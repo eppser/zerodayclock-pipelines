@@ -1,0 +1,136 @@
+name: Breach victim reality checks
+
+# Is a ransomware leak-site victim name a real organisation? Method breach-reality-v1:
+# pipeline/zdc_breach/reality.py (decision) and reality_harvest.py (evidence); migration
+# supabase/migrations/0143_breach_victim_checks.sql. Daily.
+#
+# PUBLIC, LIKE THE OTHER SCHEDULED PIPELINES. Every input is public: the victim's own candidate
+# websites (one GET of the home page per resolving host, four extra pages of the best one, the TLS
+# certificate subject), Wikidata, GLEIF and SEC EDGAR (each <= 2 requests/s). No Common Crawl, no
+# certificate logs, no LLM. Actor infrastructure and RFC-reserved domains are never fetched.
+# Because the logs and the report artifact are public, the run prints and reports COUNTS ONLY:
+# never a victim name, a host or a page title. The decisions stay in private tables.
+#
+# Each run checks claims never checked (newest first), then claims still ambiguous on their
+# evidence after 90 days. Claims with the same name, domain, country and group share one harvest.
+
+on:
+  schedule:
+    - cron: '41 2 * * *'
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Claims to check this run'
+        type: string
+        default: '600'
+      deadline_min:
+        description: 'Stop starting new harvests after this many minutes (results so far are written)'
+        type: string
+        default: '40'
+      environment:
+        description: 'Target environment'
+        type: choice
+        options: [staging, production]
+        default: staging
+
+concurrency:
+  group: breach-reality-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Tests run with no environment, so nothing they install can reach a secret.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-ci.txt
+      - name: Unit tests
+        run: python -m pytest -q tests/test_breach_reality.py
+
+  check:
+    needs: test
+    runs-on: ubuntu-latest
+    # The run stops starting new harvests at --deadline-min and writes what it has; this is the
+    # backstop if a fetch hangs past its own timeouts.
+    timeout-minutes: 60
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Mask database connection details
+        working-directory: .
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.parse
+          u = urllib.parse.urlsplit(os.environ.get("DATABASE_URL", ""))
+          for v in {u.hostname, u.username, u.password}:
+              if v:
+                  print(f"::add-mask::{v}")
+                  print(f"::add-mask::{urllib.parse.unquote(v)}")
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-run.txt
+
+      - name: Check victims
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          LIMIT: ${{ github.event.inputs.limit || '600' }}
+          DEADLINE: ${{ github.event.inputs.deadline_min || '40' }}
+        run: |
+          case "$LIMIT$DEADLINE" in ''|*[!0-9]*) echo "limit and deadline_min must be whole numbers"; exit 1;; esac
+          # stdout is the same counts-only report; it is not echoed so the log stays minimal
+          python -m zdc_breach.reality --report breach-reality-report.json \
+            run --limit "$LIMIT" --deadline-min "$DEADLINE" > /dev/null
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f breach-reality-report.json ]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r = json.load(open("breach-reality-report.json"))
+          print(f"### Breach victim reality checks ({r.get('method_version')})\n")
+          print(f"- selected {r.get('selected', 0)} claims in {r.get('groups', 0)} name groups; "
+                f"{r.get('checks_written', 0)} decisions written, {r.get('raw_new', 0)} new evidence packs; "
+                f"{r.get('groups_left', 0)} groups left for the next run; {r.get('seconds')} s\n")
+          print("| label | claims |\n|---|---|")
+          for k, v in r.get("labels", {}).items():
+              print(f"| {k} | {v} |")
+          print("\n| harvest | groups |\n|---|---|")
+          for k, v in r.get("harvest", {}).items():
+              print(f"| {k} | {v} |")
+          PY
+          else
+            echo "No report produced: the run failed before writing one." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Counts only (see the header): safe to keep as a public artifact.
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: breach-reality-report-${{ github.run_id }}
+          path: pipeline/breach-reality-report.json
+          if-no-files-found: warn
+          retention-days: 14
