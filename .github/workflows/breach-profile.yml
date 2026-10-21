@@ -1,0 +1,149 @@
+name: Breach victim profiles
+
+# Victim profile from the ransomware leak post. Method breach-profile-v1: pipeline/zdc_breach/profile.py;
+# migration supabase/migrations/0145_breach_victim_profiles.sql. Daily.
+#
+# PUBLIC, LIKE THE OTHER SCHEDULED PIPELINES. Each run asks TypeSafe Jev (model jev-1.13.0, frozen question set
+# p1-q2) about leak-post descriptions not yet profiled (newest first) or whose description changed, and stores the
+# raw answers and the decisions in private tables. The leak text is read inside the process and sent only to the
+# classifier: because the logs and the report artifact are public, the run prints and reports COUNTS ONLY - never a
+# victim name, a sentence, a span or the key. A spend guard (--max-usd, input tokens at 0.042 USD per million) stops
+# the run cleanly; what was answered is written.
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Claims to profile this run'
+        type: string
+        default: '300'
+      deadline_min:
+        description: 'Stop starting new chunks after this many minutes (results so far are written)'
+        type: string
+        default: '30'
+      max_usd:
+        description: 'Stop before Jev spend passes this many USD'
+        type: string
+        default: '5'
+      environment:
+        description: 'Target environment'
+        type: choice
+        options: [staging, production]
+        default: staging
+
+concurrency:
+  group: breach-profile-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Tests run with no environment, so nothing they install can reach a secret.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-ci.txt
+      - name: Unit tests
+        run: python -m pytest -q tests/test_breach_profile.py
+
+  profile:
+    needs: test
+    runs-on: ubuntu-latest
+    # The run stops starting new chunks at --deadline-min and writes what it has; this is the backstop.
+    timeout-minutes: 60
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Require the Jev key
+        working-directory: .
+        env:
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+        run: |
+          if [ -z "$TYPESAFE_API_KEY" ]; then
+            echo "::error::TYPESAFE_API_KEY is not set in the '${{ github.event.inputs.environment || 'staging' }}' environment; nothing was profiled."
+            exit 1
+          fi
+      - name: Mask database connection details
+        working-directory: .
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.parse
+          u = urllib.parse.urlsplit(os.environ.get("DATABASE_URL", ""))
+          for v in {u.hostname, u.username, u.password}:
+              if v:
+                  print(f"::add-mask::{v}")
+                  print(f"::add-mask::{urllib.parse.unquote(v)}")
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-run.txt
+
+      - name: Profile victims
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+          LIMIT: ${{ github.event.inputs.limit || '300' }}
+          DEADLINE: ${{ github.event.inputs.deadline_min || '30' }}
+          MAX_USD: ${{ github.event.inputs.max_usd || '5' }}
+        run: |
+          case "$LIMIT$DEADLINE" in ''|*[!0-9]*) echo "limit and deadline_min must be whole numbers"; exit 1;; esac
+          case "$MAX_USD" in ''|*[!0-9.]*|*.*.*) echo "max_usd must be a number"; exit 1;; esac
+          # stdout is the same counts-only report; it is not echoed so the log stays minimal.
+          # Exit 3 means TypeSafe reported the account out of funds (the report is still written).
+          python -m zdc_breach.profile --report breach-profile-report.json \
+            run --limit "$LIMIT" --deadline-min "$DEADLINE" --max-usd "$MAX_USD" > /dev/null
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f breach-profile-report.json ]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r = json.load(open("breach-profile-report.json"))
+          print(f"### Breach victim profiles ({r.get('method_version')}, {r.get('model')}, q_hash {r.get('q_hash')})\n")
+          print(f"- selected {r.get('selected', 0)} claims; {r.get('written', 0)} profiles written; {r.get('left', 0)} left; "
+                f"stopped: {r.get('stopped') or 'no'}; {r.get('calls', 0)} Jev calls, {r.get('input_tokens', 0)} input tokens, "
+                f"{r.get('usd', 0)} USD (cap {r.get('max_usd')}); {r.get('seconds')} s\n")
+          print(f"- sentences {r.get('sentences', 0)}, shown by the gate {r.get('sentences_shown', 0)} "
+                f"in {r.get('descriptions_shown', 0)} descriptions; template sentences {r.get('boilerplate_sentences', 0)}\n")
+          for name in ("groups", "tags", "volumes", "size", "errors", "http_status"):
+              if r.get(name):
+                  print(f"\n| {name} | count |\n|---|---|")
+                  for k, v in r[name].items():
+                      print(f"| {k} | {v} |")
+          PY
+          else
+            echo "No report produced: the run failed before writing one." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # Counts only (see the header): safe to keep as a public artifact.
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: breach-profile-report-${{ github.run_id }}
+          path: pipeline/breach-profile-report.json
+          if-no-files-found: warn
+          retention-days: 14
