@@ -130,10 +130,11 @@ def test_display_shows_clean_profile_sentences():   # control for every gate tes
 
 
 @pytest.mark.parametrize('text', [
-    '1TB country: South Korea status: private',
-    'Interiorsgroup.ie placeIreland',
-    'Lone Rock is a timber company.We are ready to upload 25GB files of corporate documents',
-    'Doscast Hacked This website is the largest podcast site',
+    # synthetic stand-ins for the four round-1 failures, one per filter (never real leak text: ADR 0010)
+    '2TB region: Exampleland status: private',                                           # "key: value" + byte size
+    'Zzexample-holdings.zz placeExampleland',                                             # a bare hostname
+    'Zzexample Timber is a sawmill.We are ready to upload 30GB files of corporate records',  # attacker voice
+    'Zzexample Radio Hacked This website is the largest radio site in the region',        # "Hacked" headline
 ])
 def test_round1_bad_sentences_are_never_shown(text):  # mutant: KV, HOST, ATTACK or the byte-size scrub removed (RULING P1.2 C3)
     s = S(text)
@@ -401,8 +402,10 @@ def test_q_hash_names_the_questions(monkeypatch):   # mutant: q_hash independent
 # =====================================================================================================
 # Equivalence with the frozen research files (P1.2). Skips where they are absent (CI, the public mirror).
 # =====================================================================================================
-FROZEN = Path(os.environ.get('ZDC_PROFILE_FROZEN', '/tmp/zdcq/profile'))
-FROZEN_CLIENT = Path(os.environ.get('ZDC_PROFILE_FROZEN_CLIENT', '/tmp/zdcq/verify/C/bin'))
+# Only where the research files are named explicitly: a default path under /tmp would be world-writable and
+# would be put on sys.path.
+FROZEN = Path(os.environ.get('ZDC_PROFILE_FROZEN', '/nonexistent'))
+FROZEN_CLIENT = Path(os.environ.get('ZDC_PROFILE_FROZEN_CLIENT', '/nonexistent'))
 need_frozen = pytest.mark.skipif(not ((FROZEN / 'bin/pjev2.py').exists() and (FROZEN / 'bin/decide2.py').exists()
                                       and (FROZEN_CLIENT / 'jev.py').exists()), reason='frozen research files not present')
 
