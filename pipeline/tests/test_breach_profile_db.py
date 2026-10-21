@@ -212,12 +212,18 @@ from argparse import Namespace
 
 
 def models_and(calls, offered=('jev-1.13.0',), status=200, out_of_funds=False):
+    """The real API answers a pinned version under its own name and refuses an unknown one; /v1/models lists only
+    aliases, so the pin is checked with a probe question."""
     inner = fake_transport(calls)
     def t(method, url, headers, body, timeout):
-        if method == 'GET':
-            return 200, {}, {'data': [{'id': m} for m in offered]}
         if out_of_funds:
             return 402, {}, {'error': 'insufficient credit balance'}
+        req = json.loads(body)
+        if req['model'] not in offered:
+            return 404, {}, {'error': f"model {req['model']} not found"}
+        if 'probe' in req['state']:
+            return 200, {}, {'answers': {'probe': {'type': 'noul', 'noul': 0.9}}, 'model': req['model'],
+                             'usage': {'input_tokens': 300, 'output_tokens': 5}}
         return inner(method, url, headers, body, timeout)
     return t
 

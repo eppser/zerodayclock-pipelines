@@ -525,17 +525,21 @@ class Jev:
         self.budget, self.transport, self.sleep, self.retries, self.timeout = budget, transport or _urllib_transport, sleep, retries, timeout
         self.status = collections.Counter()
 
-    def offered_models(self):
-        """The model ids TypeSafe offers now (GET /v1/models; free). None when the list cannot be read."""
-        headers = {'Authorization': 'Bearer ' + self._key, 'User-Agent': 'zdc-breach-profile/1'}
+    def pin_answers(self):
+        """Does the pinned model still answer as itself? TypeSafe's /v1/models lists only aliases (jev-latest,
+        jev-preview), so the check is one minimal real question (~300 input tokens, ~0.00002 USD): True when the
+        response names MODEL, False when the API refuses the model or answers with another one, None when it cannot
+        be reached (a network failure is not evidence the model is gone)."""
         try:
-            st, _, js = self.transport('GET', API + '/v1/models', headers, None, self.timeout)
-        except (urllib.error.URLError, TimeoutError, OSError):
+            js = self.ask({'probe': {'text': 'Example Org makes tools.'}},
+                          {'probe': {'type': 'noul', 'instructions': 'Does `probe.text` mention tools?'}})
+        except OutOfFunds:
+            raise
+        except JevError as e:
+            return False if any(w in str(e).lower() for w in ('model', '404', '400', '422')) else None
+        except (BudgetExhausted, urllib.error.URLError, TimeoutError, OSError):
             return None
-        if st != 200 or not isinstance(js, dict):
-            return None
-        rows = js.get('data') or js.get('models') or []
-        return {str(r.get('id') if isinstance(r, dict) else r) for r in rows}
+        return (js or {}).get('model') == MODEL
 
     def ask(self, state, questions, model=MODEL):
         self.budget.reserve()
@@ -911,9 +915,14 @@ def run_recorded(conn, args, transport=None, key=None, sleep=time.sleep):
     left = max(0.0, args.monthly_usd - spent)
     budget = Budget(min(args.max_usd, left))
     jev = Jev(budget, key=key, transport=transport, sleep=sleep)
-    offered = jev.offered_models()
     rep, code, error = None, 0, None
-    if offered is not None and MODEL not in offered:
+    try:
+        offered = jev.pin_answers() if left > 0 else None
+    except OutOfFunds:
+        offered, rep, code, error = None, _new_report('run', budget.max_usd), EXIT_OUT_OF_FUNDS, 'TypeSafe account out of funds'
+    if code:
+        pass
+    elif offered is False:
         rep, code, error = _new_report('run', budget.max_usd), EXIT_MODEL_GONE, f'pinned model {MODEL} is no longer offered'
     elif left <= 0:
         rep, code, error = _new_report('run', 0), EXIT_CEILING, f'monthly ceiling {args.monthly_usd} USD reached'
@@ -924,7 +933,7 @@ def run_recorded(conn, args, transport=None, key=None, sleep=time.sleep):
     rep['month_spend_usd'] = round(spent + float(rep.get('usd') or 0), 4)
     rep['monthly_ceiling_usd'] = args.monthly_usd
     rep['month_spend_share'] = round(rep['month_spend_usd'] / args.monthly_usd, 3) if args.monthly_usd else None
-    rep['model_offered'] = None if offered is None else MODEL in offered
+    rep['model_offered'] = offered
     errors = sum((rep.get('errors') or {}).values()) if isinstance(rep.get('errors'), dict) else 0
     runs_db.finish_run(conn, run_id, ok=code == 0, error=error, entries_seen=rep.get('selected', 0),
                        entries_inserted=rep.get('written', 0),
