@@ -13,7 +13,10 @@ Incident identity for one organisation:
 - MERGE when the names match and both rows state the SAME event date (two regulators
   describing one breach - the common multi-state filing);
 - LINK (possible_duplicate_of) when the names match and the dates are within 30/90 days but
-  not equal: both incidents stay, and the page counts the pair once;
+  not equal: both incidents stay, and the page counts the pair once. Never for a card issuer
+  (CARD_ISSUERS): American Express and Discover file one notice per merchant breach, usually
+  without naming the merchant, so two of their notices a month apart are different breaches
+  (owner decision 2026-10-20; 0 of 4 such links were right on the labelled pairs);
 - otherwise a new incident.
 A manual override (breach_core.match_overrides) beats every rule.
 
@@ -25,6 +28,17 @@ article's own name does not match - "アスクル" with alias
 "ASKUL" is found by a later English "Askul", and the reverse. It is a NAME match, with the same
 country rule and the same consequence (incidents merge only on the same stated event date,
 otherwise possible_duplicate_of); it never makes a hard key and is never evidence.
+
+PRIVATE SOURCES (0136-0137, ADR 0009). A source with publication = 'private' (the curated export) is
+resolved PASSIVELY: it may create organisations and incidents of its own and attach to existing ones by
+the rules above, but it never writes to an organisation or incident another source created (no domain,
+sector or date of its own lands on a public row). In the other direction, an incident known only from
+private sources is invisible to the public list, so a public source never marks a row as a possible
+duplicate of one (that would hide the public row behind an invisible one); when a public source merges
+into such an incident by a hard key, the incident takes the public source's dates, and an ORGANISATION
+the private source created (organizations.created_by_source) takes the public source's name, domain,
+country and sector the first time a public source matches it - the public source wins, so no export
+value reaches a public row through the organisation either (review 2026-10-20, must-fix 2).
 """
 
 from __future__ import annotations
@@ -34,6 +48,7 @@ from datetime import date, timedelta
 from .normalize import has_cjk, norm_domain, norm_name
 
 EVENT_WINDOW = timedelta(days=30)
+CARD_ISSUERS = ("american express", "discover financial")   # = linkage.CARD_ISSUERS
 PUBLIC_WINDOW = timedelta(days=90)
 
 
@@ -69,6 +84,19 @@ def _add_alias(cur, org_id, alias):
                 (alias[0], alias[0], alias[2], alias[1], alias[1], org_id))
 
 
+_TAKE_OVER_SQL = """update breach_core.organizations
+                        set display_name = %s, norm_name = %s, domain = %s, country = %s, sector = %s,
+                            sec_cik = coalesce(%s, sec_cik), created_by_source = null
+                      where org_id = %s
+                        and created_by_source in (select source_id from breach_core.private_sources)"""
+
+
+def _take_over(cur, org_id, name, domain, country, sector, cik):
+    """A public source matched an organisation a private source created: its own values replace the
+    private ones (a no-op for any other organisation)."""
+    cur.execute(_TAKE_OVER_SQL, (name.strip()[:300], norm_name(name), domain, country, sector, cik, org_id))
+
+
 def find_or_create_org(cur, *, name: str, domain: str | None = None, cik: str | None = None,
                        country: str | None = None, sector: str | None = None,
                        name_en: str | None = None, name_en_in_text: bool = False) -> tuple[str, str]:
@@ -80,6 +108,7 @@ def find_or_create_org(cur, *, name: str, domain: str | None = None, cik: str | 
         cur.execute("select org_id from breach_core.organizations where sec_cik = %s", (cik,))
         r = cur.fetchone()
         if r:
+            _take_over(cur, r[0], name, domain, country, sector, cik)
             _add_alias(cur, r[0], alias)
             return r[0], "sec_cik"
     if domain:
@@ -88,6 +117,7 @@ def find_or_create_org(cur, *, name: str, domain: str | None = None, cik: str | 
         if r:
             if cik:
                 cur.execute("update breach_core.organizations set sec_cik = coalesce(sec_cik, %s) where org_id = %s", (cik, r[0]))
+            _take_over(cur, r[0], name, domain, country, sector, cik)
             _add_alias(cur, r[0], alias)
             return r[0], "domain"
     # By name: the organisation's own normalised name first, then a match key another language
@@ -109,6 +139,7 @@ def find_or_create_org(cur, *, name: str, domain: str | None = None, cik: str | 
                                domain = coalesce(domain, %s), sec_cik = coalesce(sec_cik, %s),
                                sector = coalesce(sector, %s)
                             where org_id = %s""", (domain, cik, sector, r[0]))
+            _take_over(cur, r[0], name, domain, country, sector, cik)
             _add_alias(cur, r[0], alias)
             return r[0], how
     cur.execute("""insert into breach_core.organizations (display_name, norm_name, domain, country, sector, sec_cik,
@@ -147,9 +178,11 @@ def resolve_incident(cur, *, org_id: str, org_how: str, source_id: str, record_i
     if has and forced:
         incident, method = forced, "manual"
     elif not has:
-        cur.execute("""select incident_id, event_date, first_public_date from breach_core.incidents
+        cur.execute("""select incident_id, event_date, first_public_date,
+                              incident_id in (select incident_id from breach_core.private_only_incidents)
+                         from breach_core.incidents
                         where org_id = %s order by first_public_date""", (org_id,))
-        for inc_id, ev, pub in cur.fetchall():
+        for inc_id, ev, pub, private_only in cur.fetchall():
             if event_date and ev:
                 close, same = abs(ev - event_date) <= EVENT_WINDOW, ev == event_date
             else:
@@ -162,17 +195,27 @@ def resolve_incident(cur, *, org_id: str, org_how: str, source_id: str, record_i
             if same:
                 incident, method = inc_id, "event_window"
                 break
-            dup_of = dup_of or inc_id
+            if not private_only:      # never hide a public row behind an invisible one (0137)
+                dup_of = dup_of or inc_id
+        if dup_of:
+            cur.execute("select norm_name from breach_core.organizations where org_id = %s", (org_id,))
+            row = cur.fetchone()
+            if row and (row[0] or "").startswith(CARD_ISSUERS):
+                dup_of = None
     if incident is None:
         cur.execute("""insert into breach_core.incidents (org_id, event_date, first_public_date, possible_duplicate_of)
                        values (%s,%s,%s,%s) returning incident_id""",
                     (org_id, event_date, public_date, dup_of))
         incident, method = cur.fetchone()[0], method or "new"
     else:
+        # an incident only private sources knew takes this (public) source's dates: no private date surfaces
         cur.execute("""update breach_core.incidents set
-                           event_date = coalesce(event_date, %s),
-                           first_public_date = least(first_public_date, %s), updated_at = now()
-                        where incident_id = %s""", (event_date, public_date, incident))
+                           event_date = case when incident_id in (select incident_id from breach_core.private_only_incidents)
+                                             then %s else coalesce(event_date, %s) end,
+                           first_public_date = case when incident_id in (select incident_id from breach_core.private_only_incidents)
+                                                    then %s else least(first_public_date, %s) end,
+                           updated_at = now()
+                        where incident_id = %s""", (event_date, event_date, public_date, public_date, incident))
     cur.execute("""insert into breach_core.incident_sources (incident_id, source_id, source_record_id, doc_sha256, match_method)
                    values (%s,%s,%s,%s,%s) on conflict do nothing""",
                 (incident, source_id, record_id or "", doc or "", method))
@@ -228,16 +271,27 @@ class Resolver:
     and a GitHub runner sits ~100 ms from the database, so Washington's 1,000 rows took 15+
     minutes and California's 5,300 would outlive the job. This reads the organisations, incidents,
     links and overrides once, decides in memory, generates ids client-side and sends every write
-    in one pipelined batch. Same inputs, same decisions (tests run both paths)."""
+    in one pipelined batch. Same inputs, same decisions (tests run both paths).
 
-    def __init__(self, cur):
+    passive=True is for a private source (see PRIVATE SOURCES above): it creates its own rows and links to
+    existing ones, but never updates a row it did not create. id_namespace makes the ids it creates a
+    function of the source record (uuid5), so re-normalising the same raw layer into an empty core gives
+    the same ids, and the same links (curated_export renormalise)."""
+
+    def __init__(self, cur, *, passive: bool = False, id_namespace: uuid.UUID | None = None):
         self.cur = cur
+        self.passive, self.ns = passive, id_namespace
         self.writes: list[tuple[str, tuple]] = []
-        cur.execute("""select org_id, norm_name, domain, country, sec_cik, alias_norms from breach_core.organizations
+        cur.execute("""select org_id, norm_name, domain, country, sec_cik, alias_norms,
+                              created_by_source in (select source_id from breach_core.private_sources)
+                         from breach_core.organizations
                         order by created_at, org_id""")
         self.by_cik, self.by_domain, self.by_name, self.by_alias = {}, {}, {}, {}
-        self.org_cik = {}
-        for oid, nn, dom, ctry, cik, aliases in cur.fetchall():
+        self.org_cik, self.org_nn = {}, {}
+        self.private_orgs: set = set()     # organisations a private source created; a public match takes them over
+        for oid, nn, dom, ctry, cik, aliases, private in cur.fetchall():
+            if private:
+                self.private_orgs.add(oid)
             self._index_org(oid, nn, dom, ctry, cik)
             for an in aliases or ():
                 self.by_alias.setdefault((an, ctry or ""), oid)
@@ -250,6 +304,8 @@ class Resolver:
         self.linked = {(s, r, d): i for s, r, d, i in cur.fetchall()}
         cur.execute("select source_id, source_record_id, doc_sha256, incident_id from breach_core.match_overrides")
         self.overrides = {(s, r, d): i for s, r, d, i in cur.fetchall()}
+        cur.execute("select incident_id from breach_core.private_only_incidents")
+        self.private_only = {r[0] for r in cur.fetchall()}
         self.flags: set = set()
 
     def _index_org(self, oid, nn, dom, ctry, cik):
@@ -259,14 +315,28 @@ class Resolver:
             self.by_domain.setdefault(dom, oid)
         self.by_name.setdefault((nn, ctry or ""), oid)
         self.org_cik[oid] = cik
+        self.org_nn[oid] = nn or ""
 
-    def org(self, *, name, domain=None, cik=None, country=None, sector=None):
+    def _new_id(self, kind: str, seed: str | None):
+        return uuid.uuid5(self.ns, f"{kind}:{seed}") if self.ns and seed else uuid.uuid4()
+
+    def org(self, *, name, domain=None, cik=None, country=None, sector=None, seed=None, source_id=None):
+        """source_id is passed by a private source only: it is recorded as the creator of a new row."""
+        oid, how = self._org(name=name, domain=domain, cik=cik, country=country, sector=sector, seed=seed,
+                             source_id=source_id)
+        if not self.passive and oid in self.private_orgs:
+            self.writes.append((_TAKE_OVER_SQL, (name.strip()[:300], norm_name(name), norm_domain(domain), country,
+                                                 sector, cik, oid)))
+            self.private_orgs.discard(oid)
+        return oid, how
+
+    def _org(self, *, name, domain, cik, country, sector, seed, source_id):
         nn, domain = norm_name(name), norm_domain(domain)
         if cik and cik in self.by_cik:
             return self.by_cik[cik], "sec_cik"
         if domain and domain in self.by_domain:
             oid = self.by_domain[domain]
-            if cik:
+            if cik and not self.passive:
                 self.writes.append(("update breach_core.organizations set sec_cik = coalesce(sec_cik, %s) where org_id = %s", (cik, oid)))
                 self.by_cik.setdefault(cik, oid)
                 self.org_cik[oid] = self.org_cik.get(oid) or cik
@@ -276,6 +346,8 @@ class Resolver:
             if oid is None and len(nn.replace(" ", "")) >= MIN_ALIAS_LEN:
                 oid = self.by_alias.get((nn, country or ""))     # an alias another language gave (0130)
             if oid and (cik is None or self.org_cik.get(oid) in (None, cik)):
+                if self.passive:
+                    return oid, "name"
                 self.writes.append(("""update breach_core.organizations set domain = coalesce(domain, %s),
                                           sec_cik = coalesce(sec_cik, %s), sector = coalesce(sector, %s)
                                        where org_id = %s""", (domain, cik, sector, oid)))
@@ -285,9 +357,13 @@ class Resolver:
                     self.by_cik.setdefault(cik, oid)
                     self.org_cik[oid] = self.org_cik.get(oid) or cik
                 return oid, "name"
-        oid = uuid.uuid4()
-        self.writes.append(("""insert into breach_core.organizations (org_id, display_name, norm_name, domain, country, sector, sec_cik)
-                               values (%s,%s,%s,%s,%s,%s,%s)""", (oid, name.strip()[:300], nn, domain, country, sector, cik)))
+        oid = self._new_id("org", seed)
+        self.writes.append(("""insert into breach_core.organizations (org_id, display_name, norm_name, domain, country, sector, sec_cik,
+                                                                     created_by_source)
+                               values (%s,%s,%s,%s,%s,%s,%s,%s)""", (oid, name.strip()[:300], nn, domain, country, sector, cik,
+                                                                    source_id if self.passive else None)))
+        if self.passive:
+            self.private_orgs.add(oid)
         self._index_org(oid, nn, domain, country, cik)
         return oid, "new"
 
@@ -313,12 +389,27 @@ class Resolver:
                 if same:
                     incident, method = inc_id, "event_window"
                     break
-                dup_of = dup_of or inc_id
+                if self.passive or inc_id not in self.private_only:   # never hide a public row behind an invisible one
+                    dup_of = dup_of or inc_id
+        if dup_of and self.org_nn.get(org_id, "").startswith(CARD_ISSUERS):
+            dup_of = None
         if incident is None:
-            incident, method = uuid.uuid4(), method or "new"
+            incident, method = self._new_id("incident", f"{source_id}:{record_id or ''}:{doc or ''}"), method or "new"
             self.writes.append(("""insert into breach_core.incidents (incident_id, org_id, event_date, first_public_date, possible_duplicate_of)
                                    values (%s,%s,%s,%s,%s)""", (incident, org_id, event_date, public_date, dup_of)))
             self.incidents.setdefault(org_id, []).append([incident, event_date, public_date])
+            if self.passive:
+                self.private_only.add(incident)
+        elif self.passive:
+            pass                       # a private source never moves another source's row
+        elif incident in self.private_only:
+            # an incident only private sources knew takes this public source's dates
+            self.writes.append(("""update breach_core.incidents set event_date = %s, first_public_date = %s, updated_at = now()
+                                   where incident_id = %s""", (event_date, public_date, incident)))
+            self.private_only.discard(incident)
+            for inc in self.incidents.get(org_id, []):
+                if inc[0] == incident:
+                    inc[1], inc[2] = event_date, public_date
         else:
             self.writes.append(("""update breach_core.incidents set event_date = coalesce(event_date, %s),
                                       first_public_date = least(first_public_date, %s), updated_at = now()

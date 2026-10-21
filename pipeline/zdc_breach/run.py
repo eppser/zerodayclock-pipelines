@@ -27,7 +27,7 @@ import psycopg
 
 from zdc_kev import db as runs_db
 
-from . import (confidence, db, evals, extract, http, reconcile, resolve, sources_actors, sources_leak, sources_media,
+from . import (confidence, cve_agent_load, cve_extract, db, evals, extract, http, linkage_db, reconcile, resolve, sources_actors, sources_leak, sources_media,
                sources_news, sources_reg, sources_size, thumbs)
 from .fx import Fx
 from .llm import MODEL, BudgetExceeded, OpenRouter
@@ -119,6 +119,8 @@ def link_leak_claims(cur) -> int:
              join breach_core.organizations o on o.domain = l.victim_domain
              join breach_core.incidents i on i.org_id = o.org_id
             where l.incident_id is null and l.victim_domain is not null
+              -- an incident only private sources know is invisible; a claim attached to it would vanish (0137)
+              and i.incident_id not in (select incident_id from breach_core.private_only_incidents)
               and abs(coalesce(i.event_date, i.first_public_date) - l.first_seen_at::date) <= %s""",
         (ACTOR_LINK_WINDOW.days,))
     n = 0
@@ -646,6 +648,78 @@ def run_extraction(ctx, conn) -> dict:
     return {"extracted": done, "backlog_left": left}
 
 
+# The ONLY filer of CVE-pass output (RULING verify-B1): attach-only, never an organisation or an incident.
+# It lives in cve_agent_load so the local Claude-subagent loader and this hourly pass share one implementation.
+file_cve_output = cve_agent_load.file_cve_output
+
+
+def run_cve_extraction(ctx, conn) -> dict:
+    """The CVE pass (ADVISOR 2026-10-20 s7; RULING verify-B2). Runs right after run_extraction, before linkage
+    and reconcile, one transaction per document, under the same budget guard. A document is selected only if it
+    was captured in the last 21 days, carries a CVE ID, already has a main-extraction incident (an accepted claim
+    from a non-CVE extractor version, or an incident_sources row for it), has no extraction by this CVE version,
+    and fewer than 2 failed calls. A document whose main extraction has not happened yet is picked up next hour.
+    The CVE version starts with no active field: DeepSeek gets cve_id only after the sealed H-pipeline check and
+    the owner's approval; until OpenRouter is funded and on, this reports 'skipped' and local agent loads
+    (cve_agent_load) are the path."""
+    if ctx.llm is None:
+        return {"skipped": "no LLM key"}
+    ext_id = f"llm:{MODEL}@{cve_extract.prompt_hash(MODEL)}"
+    ph = cve_extract.prompt_hash(MODEL)
+    with conn.transaction(), conn.cursor() as cur:
+        cur.execute("""insert into breach_core.extractor_versions (extractor_id, kind, model_id, prompt_hash, schema_hash, active, note)
+                       values (%s, 'llm', %s, %s, %s, false, 'CVE pass; prompt file sha256 ' || %s || '; awaiting H-pipeline')
+                       on conflict (extractor_id) do nothing""",
+                    (ext_id, MODEL, ph, cve_extract.SCHEMA_VERSION, cve_extract.file_hash()))
+        cur.execute("""select d.doc_sha256, d.source_id, d.url, d.title, d.published_at, d.text
+                         from breach_raw.documents d
+                        where d.captured_at > now() - interval '21 days'
+                          and d.text ~ 'CVE-[0-9]{4}-[0-9]{4,}'
+                          and (exists (select 1 from breach_core.claims c
+                                         join breach_core.extractions e on e.extraction_id = c.extraction_id
+                                         join breach_core.extractor_versions x on x.extractor_id = e.extractor_id
+                                        where c.doc_sha256 = d.doc_sha256 and c.accepted and c.incident_id is not null
+                                          and coalesce(x.schema_hash, '') <> %s)
+                               or exists (select 1 from breach_core.incident_sources s where s.doc_sha256 = d.doc_sha256))
+                          and not exists (select 1 from breach_core.extractions e
+                                           where e.doc_sha256 = d.doc_sha256 and e.extractor_id = %s)
+                          and (select count(*) from breach_core.llm_calls c
+                                where c.doc_sha256 = d.doc_sha256 and c.prompt_hash = %s and not c.ok) < 2
+                        order by d.captured_at desc limit %s""",
+                    (cve_extract.SCHEMA_VERSION, ext_id, ph, ctx.args.max_docs))
+        todo = cur.fetchall()
+    calls = attached = 0
+    unattached: dict[str, int] = {}
+    for sha, source_id, url, title, published, text in todo:
+        if not cve_extract.has_cve(text) or ctx.report["llm"]["budget_stopped"]:
+            continue
+        try:
+            with conn.transaction(), conn.cursor() as cur:
+                try:
+                    res = ctx.llm.json(cve_extract.prompt_text(), cve_extract.user_message(title, url, text))
+                except BudgetExceeded as e:
+                    ctx.report["llm"]["budget_stopped"] = str(e)
+                    break
+                calls += 1
+                call_id = db.record_llm_call(cur, ctx.run_id, res, ph, sha)
+                ctx.report["llm"]["cost_usd"] = round(ctx.report["llm"]["cost_usd"] + res.cost_usd, 6)
+                if res.ok:
+                    r = file_cve_output(ctx, cur, sha, text, res.data, ext_id, call_id=call_id,
+                                        published=published, source_id=source_id)
+                    attached += r["attached"]
+                    for k, v in r["unattached"].items():
+                        unattached[k] = unattached.get(k, 0) + v
+                if ctx.args.dry_run:
+                    raise _DryRun()
+        except _DryRun:
+            pass
+        if datetime.now(timezone.utc) > getattr(ctx, "deadline", datetime.max.replace(tzinfo=timezone.utc)):
+            break
+    # "did not run" is reported as such, never as "found nothing" (amendment s6, eval cve_extractor_budget_ok)
+    return {"in_scope": len(todo), "calls": calls, "attached": attached, "unattached": unattached,
+            "did_not_run": bool(todo) and calls == 0}
+
+
 def extract_doc(ctx, cur, sha, text, url, title, *, forced_incident=None, forced_basis=None,
                 published=None, source_id=None) -> int:
     """Run the model on one document (cached per extractor version) and file its claims."""
@@ -754,9 +828,14 @@ def file_candidate(ctx, cur, inc, c: extract.Candidate, basis, source_id, sha, e
                       quote_start=c.quote_start, quote_end=c.quote_end, subject_match=c.subject_match,
                       extraction_id=extraction_id, accepted=c.accepted, reject_reason=c.reject_reason, **money)
     if c.accepted and c.field == "cve_id":
-        cur.execute("""insert into breach_core.incident_cves (incident_id, cve_id, role, basis)
-                       values (%s,%s,%s,%s) on conflict do nothing""",
-                    (inc, str(c.value).upper(), c.cve_role or "mentioned", basis))
+        # The CVE names the claim behind it (0138): the link layer reads its quote, document and review
+        # verdict through claim_id, and a link without a claim is never built (0137, T4).
+        cur.execute("""insert into breach_core.incident_cves (incident_id, cve_id, role, claim_id, basis)
+                       select %s, %s, %s, c.claim_id, %s from breach_core.claims c
+                        where c.incident_id = %s and c.field = 'cve_id' and c.source_id = %s
+                          and c.doc_sha256 = %s and c.value_text = %s and c.accepted
+                       on conflict do nothing""",
+                    (inc, str(c.value).upper(), c.cve_role or "mentioned", basis, inc, source_id, sha, value_text))
     if c.accepted and c.quote:
         ctx.new_quotes.append((c.quote, text))
 
@@ -819,6 +898,17 @@ def run(conn, args, getter=http.get, llm=None, fx=None) -> dict:
                     db.mark_source(cur, source_id, False, f"{type(e).__name__}: {str(e)[:300]}")
     if not args.sources or "extract" in wanted:
         ctx.report["extraction"] = run_extraction(ctx, conn)
+        ctx.report["cve_extraction"] = run_cve_extraction(ctx, conn)
+    # Record linkage (0134, ADR 0008): only when a method is active; its own transaction, so a
+    # failure here leaves the previous clusters in place and never stops the list rebuild. The
+    # writes are batched under statement_timeout / lock_timeout (linkage_db).
+    if not args.dry_run:
+        try:
+            with conn.transaction(), conn.cursor() as cur:
+                ctx.report["linkage"] = linkage_db.refresh(cur)
+        except Exception as e:  # noqa: BLE001 - reported, and the eval below sees stale clusters
+            log.warning("linkage failed: %s", type(e).__name__)
+            ctx.report["linkage"] = {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
     try:
         with conn.transaction(), conn.cursor() as cur:
             # Leak claims attach by domain to incidents created by any source this run,
@@ -835,6 +925,12 @@ def run(conn, args, getter=http.get, llm=None, fx=None) -> dict:
             cur.execute("set local statement_timeout = '10min'")
             cur.execute("select breach_core.rebuild_victims_list()")
             ctx.report["victims_listed"] = cur.fetchone()[0]
+            # The linked list (0135, option (a)): a private copy with the active linkage applied, read only by
+            # the staging app's server routes. Built only while a method is active; the public list never changes.
+            cur.execute("select exists (select 1 from breach_core.link_methods where active and cardinality(active_classes) > 0)")
+            if cur.fetchone()[0]:
+                cur.execute("select breach_core.rebuild_victims_list_linked()")
+                ctx.report["victims_listed_linked"] = cur.fetchone()[0]
             results = evals.run_all(cur, ctx)
             if args.dry_run:
                 raise _DryRun()

@@ -1510,6 +1510,35 @@ def check_explorer_list_complete(conn) -> EvalResult:
         {"in_list": got, "expected": expect})
 
 
+def check_explorer_breach_count_from_links(conn) -> EvalResult:
+    """The Explorer's breach count is the number of public victims in public.breach_cve_links, the
+    same view the sheet lists and /breaches derives its CVE column from (0137, ADR 0009).
+
+    Two ways it could drift, both asserted: the list rebuild reading breach data again (it counted raw
+    export rows, 230 for MOVEit where the victims are ~179), and explorer_rows no longer counting the
+    view. Compared on up to 20 CVEs that have a count on either side, so the check can fail both ways.
+    """
+    with conn.cursor() as cur:
+        cur.execute("select pg_get_functiondef('derived.rebuild_explorer_list(text,date,uuid)'::regprocedure)")
+        body = cur.fetchone()[0]
+        reads = [t for t in ("breach_cves", "core.breaches", "cve_links") if t in body]
+        cur.execute("""with sample as (
+                           (select cve_id from public.breach_cve_links
+                             union select cve_id from public.explorer_rows where breach_count > 0)
+                           order by 1 limit 20)
+                       select s.cve_id, r.breach_count,
+                              (select count(distinct victim_id) from public.breach_cve_links b where b.cve_id = s.cve_id)
+                         from sample s left join public.explorer_rows r on r.cve_id = s.cve_id""")
+        rows = cur.fetchall()
+    wrong = [(c, a, b) for c, a, b in rows if a != b and a is not None]
+    ok = not reads and not wrong
+    return EvalResult(
+        "explorer_breach_count_from_links", ERROR, ok,
+        f"breach_count equals the link view on {len(rows)} sampled CVEs; the list rebuild reads no breach data"
+        if ok else f"rebuild reads {reads or 'nothing'}; {len(wrong)} sampled CVEs disagree with the view",
+        {"rebuild_reads": reads, "sampled": len(rows), "disagree": [list(w) for w in wrong[:20]]})
+
+
 def check_explorer_strata_agree(conn) -> EvalResult:
     """The header numbers must describe the same corpus the list is drawn from.
 
@@ -1925,6 +1954,7 @@ def run_db_evals(conn) -> list[EvalResult]:
         check_explorer_list_fresh(conn),
         check_explorer_list_complete(conn),
         check_explorer_strata_agree(conn),
+        check_explorer_breach_count_from_links(conn),
         check_activity_window_fresh(conn),
         check_patch_dates_not_backdated(conn),
         check_method_versions_registered(conn),

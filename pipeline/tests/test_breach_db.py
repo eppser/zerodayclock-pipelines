@@ -142,12 +142,14 @@ def args(**kw):
 def conn():
     c = psycopg.connect(DSN, autocommit=False)
     with c.cursor() as cur:
-        cur.execute("""truncate breach_core.claims, breach_core.incident_cves, breach_core.incident_facts,
+        cur.execute("""truncate breach_core.claims, breach_core.incident_cves, breach_core.incident_facts, breach_core.cve_links,
+                       breach_core.source_pii_hashes,
                        breach_core.incident_sources, breach_core.match_overrides, breach_core.takedown_requests,
                        breach_core.leak_claims, breach_core.extractions, breach_core.llm_calls,
                        breach_core.incidents, breach_core.organizations, breach_core.source_state,
                        breach_raw.documents, breach_raw.source_records, breach_raw.fetches cascade""")
         cur.execute("delete from breach_core.extractor_versions where kind = 'llm'")
+        cur.execute("update breach_core.sources set publication = 'private' where source_id = 'cra_export'")
     c.commit()
     yield c
     c.close()
@@ -306,16 +308,22 @@ def test_human_review_publishes_one_fact(conn):
     cve = q(conn, """select c.claim_id from breach_core.claims c join breach_core.incidents i using (incident_id)
                       join breach_core.organizations o using (org_id)
                      where o.sec_cik = '999999' and c.field = 'cve_id' and c.accepted""")[0][0]
+    in_registry(conn, "CVE-2026-40404")
     with conn.cursor() as cur:
         cur.execute("""update breach_core.claims set review_verdict = 'confirmed', reviewer = 'test', reviewed_at = now()
                         where claim_id = %s""", (cve,))
         from zdc_breach import reconcile
         reconcile.build(cur)
+        cur.execute("select breach_core.rebuild_victims_list()")
     conn.commit()
-    facts = q(conn, """select f.cve_ids, f.people_affected from breach_core.incident_facts f
+    facts = q(conn, """select f.people_affected from breach_core.incident_facts f
                          join breach_core.incidents i using (incident_id) join breach_core.organizations o using (org_id)
                         where o.sec_cik = '999999'""")
-    assert facts == [(["CVE-2026-40404"], None)]     # the reviewed CVE only; the unreviewed count stays private
+    assert facts == [(None,)]                        # the unreviewed count stays private
+    # the reviewed CVE is public through the one gate (0137), on the row and in the Explorer's view alike
+    assert q(conn, "select cve_ids from public.breach_victims where name like 'Widget Holdings%%'") == [(["CVE-2026-40404"],)]
+    assert q(conn, """select l.cve_id, l.role::text, l.name from public.breach_cve_links l""") == [
+        ("CVE-2026-40404", "initial_access", "Widget Holdings Inc")]
 
 
 # ---- Japanese coverage (0130) ------------------------------------------------------------------
@@ -343,6 +351,52 @@ class FakeLLMJa(FakeLLM):
             "source_of_account": "news", "facts": [
                 {"field": "people_affected", "value": 1260000, "unit": "persons", "qualifier": "exact", "quote": JA_QUOTE}]}]}
         return llm_mod.LlmResult(True, data, "fake/model", "fake", 100, 50, 0.0001, 5, None)
+
+
+def in_registry(conn, *cves):
+    """The link gate requires the CVE in the registry (0137 rule 4); fixture CVEs are added once."""
+    with conn.cursor() as cur:
+        for c in cves:
+            cur.execute("insert into core.cves (cve_id, cve_year) values (%s, %s) on conflict do nothing", (c, int(c[4:8])))
+    conn.commit()
+
+
+def test_incident_cves_name_their_claim(conn):
+    """0138: run.py writes claim_id. Without it the link has no quote, document or verdict behind it and is
+    never built at all (0137 T4)."""
+    brun.run(conn, args(), getter=fake_get, llm=FakeLLM(), fx=NoFx())
+    rows = q(conn, """select ic.cve_id, c.field, upper(c.value_text), c.quote is not null from breach_core.incident_cves ic
+                        join breach_core.claims c on c.claim_id = ic.claim_id""")
+    assert rows == [("CVE-2026-40404", "cve_id", "CVE-2026-40404", True)]
+    assert q(conn, "select count(*) from breach_core.cve_links") == [(1,)]
+
+
+def test_mentioned_cve_never_reaches_the_list(conn):
+    """A CVE the extractor files as merely mentioned stays held (mentioned_only) even when its claim is
+    confirmed by a person and the extractor is active for cve_id."""
+    in_registry(conn, "CVE-2026-40404")
+    brun.run(conn, args(), getter=fake_get, llm=FakeLLM(), fx=NoFx())
+    activate(conn)
+    with conn.cursor() as cur:
+        cur.execute("update breach_core.incident_cves set role = 'mentioned'")
+        cur.execute("""update breach_core.claims set review_verdict = 'confirmed', reviewer = 'test', reviewed_at = now()
+                        where field = 'cve_id'""")
+        cur.execute("select breach_core.rebuild_victims_list()")
+    conn.commit()
+    assert q(conn, "select public, hold_reason from breach_core.cve_links") == [(False, "mentioned_only")]
+    assert q(conn, "select count(*) from breach_core.victims_list where cve_ids is not null") == [(0,)]
+    assert q(conn, "select count(*) from public.breach_cve_links") == [(0,)]
+
+
+def test_hourly_run_evals_cover_the_links(conn):
+    """The hourly run carries the link evals and they pass on a consistent build."""
+    in_registry(conn, "CVE-2026-40404")
+    rep = brun.run(conn, args(), getter=fake_get, llm=FakeLLM(), fx=NoFx())
+    names = {e["name"]: e for e in rep["evals"]}
+    for n in ("cve_links_current", "cve_links_one_view", "cve_links_have_evidence", "no_machine_link_public_ungated",
+              "cve_links_no_pii", "cve_links_held", "cve_extraction_recall_vs_export"):
+        assert names[n]["passed"], names[n]
+    assert names["cve_links_held"]["detail"]["by_reason"] == {"extractor_inactive": {"links": 1, "cves": 1}}
 
 
 def test_norm_name_sql_twin_matches_python(conn):
@@ -511,3 +565,282 @@ def test_news_backfill_stores_short_japanese_summaries_and_repairs_earlier_runs(
     again = run.backfill_news(conn, args, getter=getter)
     assert q(conn, "select count(*) from breach_raw.documents where source_id = 'news_jp_securitynext'") == [(1,)], again
     assert again["news_jp_securitynext"]["documents"] == 1
+
+
+# ---- owner decision 2026-10-20: card issuers file one notice per merchant breach -----------------
+def test_card_issuer_notices_are_never_linked_as_duplicates(conn):
+    """Two American Express notices a month apart are two merchant breaches; a non-issuer pair with
+    the same dates is still linked (so the test fails if the duplicate rule itself is removed)."""
+    from datetime import date
+    from zdc_breach import resolve
+    with conn.cursor() as cur:
+        for name in ("American Express Travel Related Services", "Near Date Holdings Corp"):
+            oid, _ = resolve.find_or_create_org(cur, name=name, country="US")
+            resolve.resolve_incident(cur, org_id=oid, org_how="name", source_id="ca_ag", record_id=name + "1",
+                                     event_date=date(2026, 3, 1), public_date=date(2026, 4, 1))
+            resolve.resolve_incident(cur, org_id=oid, org_how="name", source_id="ca_ag", record_id=name + "2",
+                                     event_date=date(2026, 3, 20), public_date=date(2026, 4, 20))
+        r = resolve.Resolver(cur)
+        for name, want in (("American Express Travel Related Services", 0), ("Near Date Holdings Corp", 1)):
+            oid, _ = r.org(name=name, country="US")
+            r.incident(org_id=oid, org_how="name", source_id="wa_ag", record_id=name + "3",
+                       event_date=date(2026, 3, 10), public_date=date(2026, 4, 10))
+            assert sum(1 for sql, p in r.writes if "possible_duplicate_of" in sql and p[0] and p[4]) == want
+            r.writes.clear()
+        cur.execute("""select o.norm_name, count(i.possible_duplicate_of) from breach_core.incidents i
+                         join breach_core.organizations o using (org_id) where o.country = 'US'
+                          and (o.norm_name like 'american express%%' or o.norm_name like 'near date%%') group by 1""")
+        got = dict(cur.fetchall())
+    conn.rollback()
+    assert got["american express travel related services"] == 0
+    assert sum(v for k, v in got.items() if k.startswith("near date")) == 1
+
+
+def test_card_issuer_list_matches_the_linkage_model():
+    from zdc_breach import linkage, resolve
+    assert resolve.CARD_ISSUERS == linkage.CARD_ISSUERS
+
+
+# ---- record linkage, active classes (0134, ADR 0008) ------------------------------------------------
+LK_A, LK_B = "00000000-0000-4000-8000-000000000a01", "00000000-0000-4000-8000-000000000a02"
+
+
+def _linkage_fixture(conn):
+    """A CA filing and a press report of one breach under two spellings (link_key match, same event
+    date, same exact count): the frozen model auto-links them as a reg_press pair."""
+    with conn.cursor() as cur:
+        cur.execute("""insert into breach_core.organizations (org_id, display_name, norm_name, country, sector) values
+                       ('00000000-0000-4000-8000-0000000000a1', 'Zzlink Orbital Health Services', 'zzlink orbital health services', 'US', 'Health'),
+                       ('00000000-0000-4000-8000-0000000000a2', 'Zzlink Orbital Health', 'zzlink orbital health', 'US', 'Health')""")
+        cur.execute("""insert into breach_core.incidents (incident_id, org_id, event_date, first_public_date, regulator_filed, media_reported)
+                       values (%s, '00000000-0000-4000-8000-0000000000a1', '2026-03-01', '2026-04-01', true, false),
+                              (%s, '00000000-0000-4000-8000-0000000000a2', '2026-03-01', '2026-04-05', false, true)""", (LK_A, LK_B))
+        cur.execute("""insert into breach_core.incident_sources (incident_id, source_id, source_record_id, match_method)
+                       values (%s, 'ca_ag', 'lk-a', 'new'), (%s, 'news_hipaajournal', 'lk-b', 'new')""", (LK_A, LK_B))
+        cur.execute("""insert into breach_core.claims (incident_id, field, value_num, unit, qualifier, basis, source_id, as_of, accepted)
+                       values (%s, 'people_affected', 48211, 'persons', 'exact', 'regulator_filing', 'ca_ag', '2026-04-01', true),
+                              (%s, 'people_affected', 48211, 'persons', 'exact', 'victim_statement', 'news_hipaajournal', '2026-04-05', true)""",
+                    (LK_A, LK_B))
+    conn.commit()
+
+
+def _set_linkage(conn, *, active: bool, classes=("press_press", "reg_press"), code_sha=None):
+    # The method row pins the scorer (0134: the frozen v1 sha); these tests exercise the wiring with the
+    # code under test, so they pin its sha unless a test passes a different one on purpose.
+    code_sha = code_sha or linkage_code_sha()
+    with conn.cursor() as cur:
+        cur.execute("""update breach_core.link_methods
+                          set active = %s, activated_at = case when %s then now() end, active_classes = %s,
+                              code_sha = coalesce(%s, code_sha)
+                        where method_version = 'breach-linkage-v1'""", (active, active, list(classes), code_sha))
+    conn.commit()
+
+
+def _rebuild_and_evals(conn):
+    from zdc_breach import evals
+    with conn.cursor() as cur:
+        cur.execute("select breach_core.rebuild_victims_list()")
+        res = {r.name: r for r in (evals.victims_list_current(cur), evals.linkage_clusters_valid(cur))}
+        cur.execute("select victim_id from breach_core.victims_list where victim_id like 'incident:%%' order by 1")
+        listed = [x[0] for x in cur.fetchall()]
+    conn.commit()
+    return listed, res
+
+
+def test_linkage_inactive_writes_nothing_and_the_list_is_legacy(conn):
+    from zdc_breach import linkage_db
+    _linkage_fixture(conn)
+    with conn.cursor() as cur:
+        assert linkage_db.refresh(cur) == {"active": False}
+    conn.commit()
+    listed, res = _rebuild_and_evals(conn)
+    assert f"incident:{LK_A}" in listed and f"incident:{LK_B}" in listed
+    assert res["victims_list_current"].passed and res["linkage_clusters_valid"].passed
+    assert q(conn, "select count(*) from breach_core.incident_clusters") == [(0,)]
+
+
+def test_linkage_active_hides_the_member_deterministically(conn):
+    from zdc_breach import linkage_db
+    _linkage_fixture(conn)
+    try:
+        _set_linkage(conn, active=True)
+        outs = []
+        for _ in range(2):
+            with conn.cursor() as cur:
+                rep = linkage_db.refresh(cur)
+            conn.commit()
+            outs.append((q(conn, """select incident_a::text, incident_b::text, decision, probability, band
+                                      from breach_core.incident_links order by 1, 2"""),
+                         q(conn, "select incident_id::text, cluster_id::text from breach_core.incident_clusters order by 1")))
+        assert outs[0] == outs[1], "a second run must write the same rows"
+        assert rep["active"] and rep["auto_links"] == 1 and rep["max_cluster"] == 2
+        assert (LK_A, LK_B, "auto_link") == outs[0][0][0][:3]
+        listed, res = _rebuild_and_evals(conn)
+        # 0135 (option (a)): the PUBLIC list is the legacy build; the private linked list carries the linkage
+        assert f"incident:{LK_A}" in listed and f"incident:{LK_B}" in listed
+        assert res["victims_list_current"].passed, res["victims_list_current"].summary
+        assert res["linkage_clusters_valid"].passed, res["linkage_clusters_valid"].summary
+        with conn.cursor() as cur:
+            cur.execute("select breach_core.rebuild_victims_list_linked()")
+            from zdc_breach import evals
+            linked_eval = evals.linked_list_current(cur)
+        conn.commit()
+        linked = [x[0] for x in q(conn, "select victim_id from breach_core.victims_list_linked where victim_id like 'incident:%%'")]
+        assert f"incident:{LK_A}" in linked and f"incident:{LK_B}" not in linked      # the press row joins the filing
+        assert linked_eval.passed, linked_eval.summary
+        assert q(conn, """select sources from breach_core.victims_list_linked where victim_id = %s""", f"incident:{LK_A}")[0][0] \
+            == ["ca_ag", "news_hipaajournal"]
+        # rollback by the flag: the press row is listed again, nothing deleted
+        _set_linkage(conn, active=True, classes=())
+        listed, res = _rebuild_and_evals(conn)
+        assert f"incident:{LK_B}" in listed and res["victims_list_current"].passed
+        with conn.cursor() as cur:
+            cur.execute("select breach_core.rebuild_victims_list_linked()")
+        conn.commit()
+        assert f"incident:{LK_B}" in [x[0] for x in q(conn, "select victim_id from breach_core.victims_list_linked")]
+        assert q(conn, "select count(*) from breach_core.incident_clusters") == [(2,)]
+    finally:
+        _set_linkage(conn, active=False)
+
+
+def test_linkage_auto_link_in_an_inactive_class_takes_no_part(conn):
+    from zdc_breach import linkage_db
+    _linkage_fixture(conn)
+    try:
+        _set_linkage(conn, active=True, classes=("press_press",))
+        with conn.cursor() as cur:
+            rep = linkage_db.refresh(cur)
+        conn.commit()
+        assert rep["inactive_class_auto"] == 1 and rep["clusters_multi"] == 0
+        assert q(conn, "select decision, reason from breach_core.incident_links") == [("review_pending", "class_not_active")]
+    finally:
+        _set_linkage(conn, active=False)
+
+
+def test_linkage_refuses_a_changed_scorer(conn):
+    from zdc_breach import linkage_db
+    _linkage_fixture(conn)
+    try:
+        _set_linkage(conn, active=True, code_sha="deadbeef0")
+        with conn.cursor() as cur, pytest.raises(RuntimeError):
+            linkage_db.refresh(cur)
+        conn.rollback()
+    finally:
+        _set_linkage(conn, active=False, code_sha=linkage_code_sha())
+
+
+def linkage_code_sha():
+    from zdc_breach import linkage_db
+    return linkage_db.code_sha256()[:40]
+
+
+# ---- the CVE link layer (0137, ADR 0009): every ERROR eval can fail -----------------------------------------
+def _confirmed_link(conn):
+    """One public link through a person's confirmation (Widget Holdings, CVE-2026-40404)."""
+    in_registry(conn, "CVE-2026-40404")
+    brun.run(conn, args(), getter=fake_get, llm=FakeLLM(), fx=NoFx())
+    with conn.cursor() as cur:
+        cur.execute("""update breach_core.claims set review_verdict = 'confirmed', reviewer = 'test', reviewed_at = now()
+                        where field = 'cve_id'""")
+        cur.execute("select breach_core.rebuild_victims_list()")
+    conn.commit()
+    assert q(conn, "select gate from breach_core.cve_links where public") == [("human_confirmed",)]
+
+
+def _eval(conn, fn, mutate=None):
+    from zdc_breach import evals
+    with conn.cursor() as cur:
+        if mutate:
+            cur.execute(mutate)
+        res = getattr(evals, fn)(cur)
+    conn.rollback()
+    return res
+
+
+@pytest.mark.parametrize("fn, mutate", [
+    ("cve_links_current", "update breach_core.cve_links set built_at = now() - interval '1 hour'"),
+    ("cve_links_one_view", "update breach_core.victims_list set cve_ids = null"),
+    ("cve_links_one_view", "update breach_core.victims_list set cve_ids = array['CVE-2026-40404'] where cve_ids is null"),
+    ("cve_links_have_evidence", "update breach_core.claims set accepted = false, reject_reason = 'test' where field = 'cve_id'"),
+    ("no_machine_link_public_ungated", "update breach_core.cve_links set gate = 'extractor_active' where public"),
+    ("cve_links_no_pii", """insert into breach_core.source_pii_hashes (source_id, sha256)
+                            select 'cra_export', encode(sha256(convert_to(lower(btrim(name)), 'UTF8')), 'hex')
+                              from public.breach_cve_links"""),
+])
+def test_each_link_eval_can_fail(conn, fn, mutate):
+    _confirmed_link(conn)
+    with conn.cursor() as cur:
+        cur.execute("select breach_core.rebuild_victims_list()")    # the evals read this transaction's build
+        from zdc_breach import evals
+        assert getattr(evals, fn)(cur).passed, fn
+    conn.rollback()
+    with conn.cursor() as cur:
+        cur.execute("select breach_core.rebuild_victims_list()")
+    res = _eval(conn, fn, mutate)
+    from zdc_crowdsec.evals import ERROR
+    assert not res.passed and res.severity == ERROR, (fn, res)
+
+
+def test_publication_has_no_open_tier(conn):
+    """Addendum s5.1: 'facts_only' or 'private', nothing that would surface the export's expressive fields."""
+    with pytest.raises(psycopg.errors.CheckViolation):
+        with conn.cursor() as cur:
+            cur.execute("update breach_core.sources set publication = 'open' where source_id = 'cra_export'")
+    conn.rollback()
+
+
+def test_enrich_breach_count_eval_can_fail(conn):
+    """zdc_enrich: breach_count equals the link view and the list rebuild reads no breach data. Mutant:
+    restore 0091's core.breach_cves join."""
+    from zdc_enrich import evals as eevals
+    _confirmed_link(conn)
+    with conn.cursor() as cur:
+        cur.execute("""insert into derived.explorer_list (cve_id, method_version, censored_at, computed_at)
+                       values ('CVE-2026-40404', 't', current_date, now()) on conflict do nothing""")
+    conn.commit()
+    try:
+        ok = eevals.check_explorer_breach_count_from_links(conn)
+        assert ok.passed and ok.detail["sampled"] == 1, ok
+        with conn.cursor() as cur:
+            body = q(conn, "select pg_get_functiondef('derived.rebuild_explorer_list(text,date,uuid)'::regprocedure)")[0][0]
+            cur.execute(body.replace("left join core.epss_summary es",
+                                     "left join (select cve_id, count(*)::int as n from core.breach_cves group by cve_id) b\n"
+                                     "        on b.cve_id = d.cve_id\n      left join core.epss_summary es"))
+        bad = eevals.check_explorer_breach_count_from_links(conn)
+        assert not bad.passed and bad.detail["rebuild_reads"] == ["breach_cves"], bad
+        conn.rollback()
+    finally:
+        with conn.cursor() as cur:
+            cur.execute("delete from derived.explorer_list where cve_id = 'CVE-2026-40404' and method_version = 't'")
+        conn.commit()
+
+
+def test_incident_cve_never_files_against_a_rejected_twin(conn):
+    """Review s7: when the dedupe index kept an older REJECTED claim with the same key, the accepted
+    candidate is not inserted and the CVE must not be filed against the rejected one. Mutant: drop
+    `c.accepted` from run.py's claim lookup."""
+    from types import SimpleNamespace
+
+    from zdc_breach import extract
+    from zdc_breach import run as brun_
+    with conn.cursor() as cur:
+        cur.execute("""insert into breach_core.organizations (org_id, display_name, norm_name)
+                       values ('00000000-0000-4000-8fff-000000000001', 'Twin Rejected Co', 'twin rejected') returning org_id""")
+        cur.execute("""insert into breach_core.incidents (incident_id, org_id, first_public_date)
+                       values ('00000000-0000-4000-9fff-000000000001', '00000000-0000-4000-8fff-000000000001', '2026-01-01')""")
+        cur.execute("""insert into breach_raw.documents (doc_sha256, source_id, url, text)
+                       values (repeat('a', 64), 'news_bleepingcomputer', 'https://news.example/t', 'Twin Rejected Co hit via CVE-2026-1111.')""")
+        cur.execute("""insert into breach_core.claims (incident_id, field, value_text, unit, qualifier, as_of, basis, source_id,
+                                                       doc_sha256, quote, accepted, reject_reason)
+                       values ('00000000-0000-4000-9fff-000000000001', 'cve_id', 'CVE-2026-1111', 'none', 'exact', '2026-01-01',
+                               'news', 'news_bleepingcomputer', repeat('a', 64), 'x', false, 'earlier_rejection')""")
+        c = extract.Candidate(field="cve_id", value="CVE-2026-1111", unit="none", qualifier="exact",
+                              quote="Twin Rejected Co hit via CVE-2026-1111.",
+                              accepted=True, cve_role="initial_access")
+        ctx = SimpleNamespace(report={"claims": {"accepted": 0, "rejected": 0, "reject_reasons": {}}}, new_quotes=[],
+                              fx=NoFx())
+        brun_.file_candidate(ctx, cur, '00000000-0000-4000-9fff-000000000001', c, "news", "news_bleepingcomputer",
+                             "a" * 64, None, NOW.date(), "Twin Rejected Co hit via CVE-2026-1111.")
+    conn.commit()
+    assert q(conn, """select count(*) from breach_core.incident_cves ic join breach_core.claims c on c.claim_id = ic.claim_id
+                       where not c.accepted""") == [(0,)]

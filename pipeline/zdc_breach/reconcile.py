@@ -15,6 +15,10 @@ the range and says sources differ.
 
 DETERMINISTIC. Same claims in, byte-identical facts out: every choice is ordered by stable keys,
 ties broken by claim_id.
+
+NOT HERE (0137, ADR 0009): which CVEs a breach is linked to. That is breach_core.cve_link_gate, the one
+gate, applied by rebuild_cve_links in the list rebuild; incident_facts.cve_ids is no longer written. A
+private source (sources.publication = 'private') feeds no fact and counts as no source.
 """
 
 from __future__ import annotations
@@ -74,6 +78,8 @@ def build(cur) -> int:
                      left join breach_core.extractions e using (extraction_id)
                      left join breach_core.extractor_versions v using (extractor_id)
                     where c.accepted and c.superseded_by is null and not i.suppressed
+                      -- a private source's claims are kept for evaluation, never published (0137)
+                      and c.source_id not in (select source_id from breach_core.private_sources)
                       -- machine-extracted facts count only from an extractor version that
                       -- passed its gold-set check and was activated
                       -- (0104) a person's confirmation also counts; a rejection never does
@@ -86,24 +92,10 @@ def build(cur) -> int:
     for row in cur.fetchall():
         c = dict(zip(cols, row))
         by[c["incident_id"]][c["field"]].append(c)
-    # A CVE counts only if an accepted claim from a rule or an ACTIVE extractor backs it - the
-    # same gate as every other fact (an integration test caught incident_cves bypassing it).
-    cur.execute("""select ic.incident_id, array_agg(distinct ic.cve_id order by ic.cve_id)
-                     from breach_core.incident_cves ic
-                    where ic.role <> 'mentioned'
-                      and exists (select 1 from breach_core.claims c
-                                    left join breach_core.extractions e using (extraction_id)
-                                    left join breach_core.extractor_versions v using (extractor_id)
-                                   where c.incident_id = ic.incident_id and c.field = 'cve_id'
-                                     and upper(c.value_text) = ic.cve_id and c.accepted
-                                     and c.superseded_by is null
-                                     and coalesce(c.review_verdict, '') <> 'rejected'
-                                     and (c.extraction_id is null or c.review_verdict = 'confirmed'
-                                          or (v.active and 'cve_id' = any(v.active_fields))))
-                    group by 1""")
-    cves = dict(cur.fetchall())
     cur.execute("""select s.incident_id, count(distinct s.source_id) from breach_core.incident_sources s
-                     join breach_core.incidents i using (incident_id) where not i.suppressed group by 1""")
+                     join breach_core.incidents i using (incident_id)
+                    where not i.suppressed and s.source_id not in (select source_id from breach_core.private_sources)
+                    group by 1""")
     nsrc = dict(cur.fetchall())
 
     cur.execute("delete from breach_core.incident_facts")
@@ -112,7 +104,7 @@ def build(cur) -> int:
     for inc in sorted(set(by) | set(nsrc), key=str):
         f = by.get(inc, {})
         row = {"incident_id": inc, "n_sources": nsrc.get(inc, 0), "method_version": METHOD_VERSION,
-               "has_disagreement": False, "cve_ids": cves.get(inc)}
+               "has_disagreement": False}
         for field, prefix in (("people_affected", "people"), ("records_affected", "records"),
                               ("accounts_affected", "accounts"), ("data_bytes", "data_bytes")):
             r = _count(f.get(field, []))

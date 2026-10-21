@@ -514,7 +514,8 @@ def _judge(c: Candidate, document: str, basis: str) -> str | None:
         parts = _ja_parts(c.value)
         if parts and not any(p in grounding.norm(c.quote or "") for p in parts):
             return "value_not_in_quote"
-    if c.field == "cve_id" and c.cve_role not in ("initial_access", "post_access", "mentioned"):
+    # 'exploited' (0136): the text says the CVE was exploited at this organisation, stage not stated.
+    if c.field == "cve_id" and c.cve_role not in ("initial_access", "exploited", "post_access", "mentioned"):
         c.cve_role = "mentioned"
     if c.field in ("event_date", "discovery_date", "disclosure_date"):
         m = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", str(c.value or ""))

@@ -78,7 +78,9 @@ def build(cur) -> int:
     for source, n, k in cur.fetchall():
         r, lo, hi = wilson(k, n)
         rows.append(("source", source, n, k, r, lo, hi, "victims a regulator filing or another outlet also reported"))
-    cur.execute("select source_id, kind from breach_core.sources where kind in ('regulator', 'breach_index', 'leak_tracker')")
+    # a private source (0136) is not described publicly at all
+    cur.execute("""select source_id, kind from breach_core.sources
+                    where kind in ('regulator', 'breach_index', 'leak_tracker') and publication <> 'private'""")
     for source, kind in cur.fetchall():
         note = {"regulator": "primary record: the organisation's own filing with a regulator",
                 "breach_index": "verified breach dataset (HIBP); counts are accounts",
