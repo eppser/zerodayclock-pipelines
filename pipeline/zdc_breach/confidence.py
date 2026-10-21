@@ -82,8 +82,11 @@ def build(cur) -> int:
     cur.execute("""select source_id, kind from breach_core.sources
                     where kind in ('regulator', 'breach_index', 'leak_tracker') and publication <> 'private'""")
     for source, kind in cur.fetchall():
+        # 'breach_index' covers HIBP and, since 0144, the curated export and Wikidata: only HIBP is named and only
+        # HIBP's counts are accounts, so the note is per source rather than per kind.
         note = {"regulator": "primary record: the organisation's own filing with a regulator",
-                "breach_index": "verified breach dataset (HIBP); counts are accounts",
+                "breach_index": ("verified breach dataset (HIBP); counts are accounts" if source == "hibp"
+                                 else "a curated index of reported breaches"),
                 "leak_tracker": "a copy of the attackers' own post: a claim, not a confirmation"}[kind]
         rows.append(("source", source, 0, 0, None, None, None, note))
     cur.execute("delete from breach_core.source_confidence")
