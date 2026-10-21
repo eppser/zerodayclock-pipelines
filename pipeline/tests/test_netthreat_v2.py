@@ -326,6 +326,12 @@ def test_union_measured_and_rho_range_gates():
     assert evals.check_v2_rho_range(s2).passed                                              # assumed values are not range-checked
     s3 = _summary(); s3["attack"].update(union_source="side", rho_union=1.0); s3["host"].update(union_source="side", rho_union=0.7)
     assert evals.check_v2_rho_range(s3).blocking
+    s4 = _summary(); s4["attack"].update(union_source="side", rho_union=0.852); s4["host"].update(union_source="side", rho_union=0.989)
+    assert evals.check_v2_rho_range(s4).passed                                              # week of 2026-10-12: host feeds barely overlap
+    s5 = _summary(); s5["attack"].update(union_source="side", rho_union=0.852); s5["host"].update(union_source="side", rho_union=1.0)
+    assert evals.check_v2_rho_range(s5).blocking                                            # a host clamp at 1 still fails
+    s6 = _summary(); s6["attack"].update(union_source="side", rho_union=0.97); s6["host"].update(union_source="side", rho_union=0.9)
+    assert evals.check_v2_rho_range(s6).blocking                                            # attack keeps the 0.95 ceiling
 
 
 def test_param_drift_and_first_week_are_info():

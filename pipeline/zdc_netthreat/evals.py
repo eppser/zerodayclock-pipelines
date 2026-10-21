@@ -284,16 +284,22 @@ def check_v2_union_measured(summary: dict, side_union_stored: dict[str, bool]) -
                       {"union_source": {s: summary[s].get("union_source") for s in ("attack", "host")}})
 
 
-def check_v2_rho_range(summary: dict, lo: float = 0.3, hi: float = 0.95) -> EvalResult:
-    """A measured de-duplication factor sits between 0.3 and 0.95; a clamp at 1.0 or 0.05 is
-    the wrong run's union or a unit error (the first live run clamped at 1)."""
+def check_v2_rho_range(summary: dict, lo: float = 0.3, hi: dict | None = None) -> EvalResult:
+    """A measured de-duplication factor sits between 0.3 and its side's ceiling; a clamp at 1.0 or
+    0.05 is the wrong run's union or a unit error (the first live run clamped at 1).
+
+    The ceiling differs by side. Attack feeds report the same scanners, so their /24s overlap
+    (0.85 measured, week of 2026-10-12). Host feeds list different things - C2 addresses,
+    malware URLs, phishing hosts - and barely overlap: 9,186 distinct /24s of 9,291 listed
+    (0.989) that week. A 0.95 ceiling failed that real measurement; 0.995 still catches the clamp."""
+    hi = {"attack": 0.95, "host": 0.995, **(hi or {})}
     bad = {}
     for s in ("attack", "host"):
         v = summary[s]
         if not v["feeds"] or str(v.get("union_source", "")).startswith("assumed"):
             continue
         r = v.get("rho_union")
-        if r is None or not (lo <= r <= hi):
+        if r is None or not (lo <= r <= hi[s]):
             bad[s] = r
     return EvalResult("v2_rho_range", ERROR, not bad,
                       "rho: " + ", ".join(f"{s} {summary[s].get('rho_union')} ({summary[s].get('union_source')})" for s in ("attack", "host") if summary[s]["feeds"])
