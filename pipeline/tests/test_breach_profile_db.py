@@ -78,6 +78,8 @@ def conn():
     try:
         with c.transaction(force_rollback=True):
             with c.cursor() as cur:
+                # start from the 0145 defaults whatever later migrations (0146) set; rolled back after the test
+                cur.execute("update breach_core.profile_settings set shipping_groups = '{}', descriptions_enabled = false, volumes_enabled = false")
                 for k, g, n, f, d, listed, check in CLAIMS:
                     cur.execute("""insert into breach_core.leak_claims (claim_key, actor_group, victim_name, victim_norm, victim_domain,
                                        country, first_seen_at, last_seen_at, trackers, tracker_refs)
@@ -203,3 +205,52 @@ def test_public_views_gate(conn):                   # mutant: switches ignored; 
     cols = q(conn, """select column_name from information_schema.columns where table_schema = 'public'
                        and table_name in ('breach_victim_profiles', 'breach_victim_descriptions')""")
     assert not [c for (c,) in cols if 'size' in c or c == 'profile_tags']
+
+
+# ---- recorded runs: the watchdog's view (READINESS B) ----------------------------------------------------------
+from argparse import Namespace
+
+
+def models_and(calls, offered=('jev-1.13.0',), status=200, out_of_funds=False):
+    inner = fake_transport(calls)
+    def t(method, url, headers, body, timeout):
+        if method == 'GET':
+            return 200, {}, {'data': [{'id': m} for m in offered]}
+        if out_of_funds:
+            return 402, {}, {'error': 'insufficient credit balance'}
+        return inner(method, url, headers, body, timeout)
+    return t
+
+
+def recorded(conn, transport, monthly=10.0):
+    args = Namespace(limit=50, deadline_min=5, max_usd=5.0, monthly_usd=monthly)
+    return P.run_recorded(conn, args, transport=transport, key=KEY, sleep=lambda s: None)
+
+
+def last_run(conn):
+    return q(conn, "select ok, error, notes->>'usd' from raw.pipeline_runs where pipeline = 'breach-profile' order by started_at desc limit 1")[0]
+
+
+def test_recorded_run_is_a_successful_run_row(conn):   # mutant: no run row, so the watchdog sees silence
+    rep, code = recorded(conn, models_and([]))
+    ok, err, usd = last_run(conn)
+    assert code == 0 and ok and err is None and float(usd) > 0 and rep['profiled'] > 0
+
+
+def test_monthly_ceiling_stops_and_fails(conn):         # mutant: per-run cap only (~150 USD/month worst case)
+    recorded(conn, models_and([]))
+    rep, code = recorded(conn, models_and([]), monthly=0.000001)
+    ok, err, _ = last_run(conn)
+    assert code == P.EXIT_CEILING and not ok and 'ceiling' in err and rep['profiled'] == 0
+
+
+def test_pinned_model_withdrawn_fails_loudly(conn):     # mutant: model list ignored
+    rep, code = recorded(conn, models_and([], offered=('jev-2.0.0',)))
+    ok, err, _ = last_run(conn)
+    assert code == P.EXIT_MODEL_GONE and not ok and 'jev-1.13.0' in err and rep['profiled'] == 0
+
+
+def test_out_of_funds_is_a_failed_run(conn):            # mutant: out of funds recorded as ok (green and silent)
+    rep, code = recorded(conn, models_and([], out_of_funds=True))
+    ok, err, _ = last_run(conn)
+    assert code == P.EXIT_OUT_OF_FUNDS and not ok and 'funds' in err

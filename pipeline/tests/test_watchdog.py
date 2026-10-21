@@ -117,3 +117,11 @@ class TestExitBehaviour:
         rows = self._rows({"a": "PENDING", "b": "DISABLED", "c": "OK"})
         assert not [r for r in rows
                     if r["state"] in ("OVERDUE", "NEVER RAN", "UNREGISTERED")]
+
+
+
+def test_database_size_states():                    # mutant: size never checked / thresholds swapped
+    from tools import watchdog as W
+    assert W.size_state(int(5.7e9), 6.5, 7.5) == "OK"
+    assert W.size_state(int(6.6e9), 6.5, 7.5) == "LARGE"
+    assert W.size_state(int(7.5e9), 6.5, 7.5) == "TOO LARGE"

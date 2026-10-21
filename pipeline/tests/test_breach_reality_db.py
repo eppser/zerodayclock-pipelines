@@ -140,3 +140,28 @@ def test_tables_are_private(conn):                      # mutant: grants left to
         for t in ('breach_raw.victim_evidence', 'breach_core.victim_checks'):
             cur.execute("select has_table_privilege('anon', %s, 'select') or has_table_privilege('authenticated', %s, 'select')", (t, t))
             assert cur.fetchone()[0] is False
+
+
+# ---- recorded runs: the watchdog's view (READINESS B) ----------------------------------------------------------
+def _last_run(conn):
+    with conn.cursor() as cur:
+        cur.execute("select ok, error from raw.pipeline_runs where pipeline = 'breach-reality' order by started_at desc limit 1")
+        return cur.fetchone()
+
+
+def test_recorded_run_writes_a_run_row(conn):              # mutant: no run row, so the watchdog sees silence
+    def fake(it):
+        pool = next(v for v in POOL.values() if v['name'] == it['name_raw'])
+        return dict(pool, claim_key=it['claim_key']), {}, __import__('datetime').datetime(2099, 2, 1, tzinfo=__import__('datetime').timezone.utc)
+    rep, code = R.run_recorded(conn, 4, 5, 2, harvester=fake)
+    assert code == 0 and _last_run(conn) == (True, None)
+
+
+def test_outage_is_a_failed_run_not_an_answer(conn, monkeypatch):   # mutant: an empty harvest recorded as a good run
+    monkeypatch.setattr(R, 'OUTAGE_MIN_CLAIMS', 1)
+    def down(it):                                          # every lookup failed: no candidates, no registry hits
+        return {'claim_key': it['claim_key'], 'name': it['name_raw'], 'candidates': [], 'wikidata': []}, {}, \
+            __import__('datetime').datetime(2099, 2, 1, tzinfo=__import__('datetime').timezone.utc)
+    rep, code = R.run_recorded(conn, 4, 5, 2, harvester=down)
+    ok, err = _last_run(conn)
+    assert code == 6 and ok is False and 'outage' in err

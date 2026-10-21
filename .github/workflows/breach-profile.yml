@@ -112,7 +112,9 @@ jobs:
           case "$LIMIT$DEADLINE" in ''|*[!0-9]*) echo "limit and deadline_min must be whole numbers"; exit 1;; esac
           case "$MAX_USD" in ''|*[!0-9.]*|*.*.*) echo "max_usd must be a number"; exit 1;; esac
           # stdout is the same counts-only report; it is not echoed so the log stays minimal.
-          # Exit 3 means TypeSafe reported the account out of funds (the report is still written).
+          # Non-zero exits turn the run red and are recorded as failed runs the watchdog reads (0148):
+          # 3 = TypeSafe account out of funds, 4 = the monthly ceiling (PROFILE_MONTHLY_USD, default 10 USD) is reached,
+          # 5 = TypeSafe no longer offers the pinned model. The report is written in every case.
           python -m zdc_breach.profile --report breach-profile-report.json \
             run --limit "$LIMIT" --deadline-min "$DEADLINE" --max-usd "$MAX_USD" > /dev/null
 
@@ -127,6 +129,8 @@ jobs:
           print(f"- selected {r.get('selected', 0)} claims; {r.get('written', 0)} profiles written; {r.get('left', 0)} left; "
                 f"stopped: {r.get('stopped') or 'no'}; {r.get('calls', 0)} Jev calls, {r.get('input_tokens', 0)} input tokens, "
                 f"{r.get('usd', 0)} USD (cap {r.get('max_usd')}); {r.get('seconds')} s\n")
+          print(f"- this month {r.get('month_spend_usd')} of {r.get('monthly_ceiling_usd')} USD ({r.get('month_spend_share')}); "
+                f"pinned model offered: {r.get('model_offered')}\n")
           print(f"- sentences {r.get('sentences', 0)}, shown by the gate {r.get('sentences_shown', 0)} "
                 f"in {r.get('descriptions_shown', 0)} descriptions; template sentences {r.get('boilerplate_sentences', 0)}\n")
           for name in ("groups", "tags", "volumes", "size", "errors", "http_status"):

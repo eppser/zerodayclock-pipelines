@@ -904,8 +904,9 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     import psycopg
     conn = psycopg.connect(os.environ['DATABASE_URL'], autocommit=True)
+    code = 0
     if args.cmd == 'run':
-        rep = cmd_run(conn, args.limit, args.deadline_min, args.workers)
+        rep, code = run_recorded(conn, args.limit, args.deadline_min, args.workers)
     elif args.cmd == 'load-packs':
         ha = datetime.fromisoformat(args.harvested_at) if args.harvested_at else None
         rep = cmd_load_packs(conn, args.pool, args.extras, args.groups, ha)
@@ -916,7 +917,31 @@ def main(argv=None) -> int:
         with open(args.report, 'w') as fh:
             fh.write(text)
     print(text)
-    return 0
+    return code
+
+
+PIPELINE = 'breach-reality'
+OUTAGE_MIN_CLAIMS = 50
+
+
+def run_recorded(conn, limit, deadline_min, workers, harvester=None):
+    """One recorded run (raw.pipeline_runs, watched by tools/watchdog.py). A run fails when it raises, or when it
+    checked >= 50 claims and decided not one real organisation: about a quarter are real on every sealed set, so zero
+    means the network or a source failed, and an outage must never read as 'no organisation found'."""
+    from zdc_kev import db as runs_db
+    run_id = runs_db.start_run(conn, PIPELINE, 'incremental', os.environ.get('GITHUB_EVENT_NAME') or 'manual',
+                               os.environ.get('GITHUB_SHA'))
+    try:
+        rep = cmd_run(conn, limit, deadline_min, workers, harvester=harvester)
+    except Exception as e:
+        runs_db.finish_run(conn, run_id, ok=False, error=type(e).__name__)
+        raise
+    real = (rep.get('labels') or {}).get('real_org', 0)
+    outage = rep.get('claims', 0) >= OUTAGE_MIN_CLAIMS and real == 0
+    runs_db.finish_run(conn, run_id, ok=not outage, error='no real organisation among %d checked: outage?' % rep['claims'] if outage else None,
+                       entries_seen=rep.get('claims', 0), entries_inserted=rep.get('checks_written', 0),
+                       notes={'raw_new': rep.get('raw_new', 0), 'real_org': real, 'groups': rep.get('groups', 0)})
+    return rep, (6 if outage else 0)
 
 
 if __name__ == '__main__':

@@ -110,6 +110,24 @@ def render(rows: list[dict]) -> str:
     return "\n".join(out)
 
 
+#: Database size (READINESS D, 2026-10-21). ONE database serves staging and production; at 5.7 GB in October 2026,
+#: mostly raw.payloads, a plan's disk limit is the slow failure no pipeline sees. Thresholds are environment knobs.
+DB_WARN_GB = float(os.environ.get("WATCHDOG_DB_WARN_GB", "6.5"))
+DB_FAIL_GB = float(os.environ.get("WATCHDOG_DB_FAIL_GB", "7.5"))
+
+
+def size_state(size_bytes: int, warn_gb: float = DB_WARN_GB, fail_gb: float = DB_FAIL_GB) -> str:
+    gb = size_bytes / 1e9
+    return "TOO LARGE" if gb >= fail_gb else "LARGE" if gb >= warn_gb else "OK"
+
+
+def db_size(conn) -> int:
+    with conn.cursor() as cur:
+        cur.execute("set statement_timeout = '60s'")
+        cur.execute("select pg_database_size(current_database())")
+        return int(cur.fetchone()[0])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", action="store_true")
@@ -122,10 +140,13 @@ def main() -> int:
 
     with psycopg.connect(dsn, connect_timeout=60) as conn:
         rows = collect(conn)
+        size = db_size(conn)
+    size_st = size_state(size)
 
     bad = [r for r in rows if r["state"] in ("OVERDUE", "NEVER RAN", "UNREGISTERED")]
     if args.json:
-        print(json.dumps({"ok": not bad, "pipelines": rows}, indent=2))
+        print(json.dumps({"ok": not bad and size_st != "TOO LARGE", "pipelines": rows,
+                          "database": {"bytes": size, "state": size_st}}, indent=2))
     else:
         print(render(rows))
         print()
@@ -135,7 +156,8 @@ def main() -> int:
             print(f"\nRESULT: {len(bad)} pipeline(s) not running as expected")
         else:
             print(f"RESULT: OK — {len(rows)} pipeline(s) within their expected cadence")
-    return 1 if bad else 0
+        print(f"DATABASE: {size / 1e9:.2f} GB — {size_st} (warn {DB_WARN_GB} GB, fail {DB_FAIL_GB} GB)")
+    return 1 if bad or size_st == "TOO LARGE" else 0
 
 
 if __name__ == "__main__":

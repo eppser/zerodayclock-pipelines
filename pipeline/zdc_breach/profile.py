@@ -525,6 +525,18 @@ class Jev:
         self.budget, self.transport, self.sleep, self.retries, self.timeout = budget, transport or _urllib_transport, sleep, retries, timeout
         self.status = collections.Counter()
 
+    def offered_models(self):
+        """The model ids TypeSafe offers now (GET /v1/models; free). None when the list cannot be read."""
+        headers = {'Authorization': 'Bearer ' + self._key, 'User-Agent': 'zdc-breach-profile/1'}
+        try:
+            st, _, js = self.transport('GET', API + '/v1/models', headers, None, self.timeout)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            return None
+        if st != 200 or not isinstance(js, dict):
+            return None
+        rows = js.get('data') or js.get('models') or []
+        return {str(r.get('id') if isinstance(r, dict) else r) for r in rows}
+
     def ask(self, state, questions, model=MODEL):
         self.budget.reserve()
         body = json.dumps({'model': model, 'state': state, 'questions': questions}).encode()
@@ -855,25 +867,70 @@ def main(argv=None) -> int:
     r = sub.add_parser('run', help='ask Jev about unprofiled (or changed) descriptions, newest first, and write')
     r.add_argument('--limit', type=int, default=300)
     r.add_argument('--deadline-min', type=float, default=30)
-    r.add_argument('--max-usd', type=float, default=5.0)
+    r.add_argument('--max-usd', type=float, default=5.0, help='ceiling for this run')
+    r.add_argument('--monthly-usd', type=float, default=float(os.environ.get('PROFILE_MONTHLY_USD', 10)),
+                   help='ceiling for the calendar month across all runs (READINESS B: 10 USD)')
     sub.add_parser('rescore', help='re-apply the decision rules to stored Jev answers (no network)')
     args = ap.parse_args(argv)
     import psycopg
-    jev = None
-    if args.cmd == 'run':
-        budget = Budget(args.max_usd)
-        jev = Jev(budget)                       # fails clearly before any database work when the key is missing
     conn = psycopg.connect(os.environ['DATABASE_URL'], autocommit=True)
-    if args.cmd == 'run':
-        rep = cmd_run(conn, args.limit, args.deadline_min, args.max_usd, jev=jev, budget=budget)
-    else:
+    if args.cmd == 'rescore':
         rep = cmd_rescore(conn)
+        code = 0
+    else:
+        rep, code = run_recorded(conn, args)
     text = json.dumps(rep, indent=2, sort_keys=True, default=str)
     if args.report:
         with open(args.report, 'w') as fh:
             fh.write(text)
     print(text)
-    return 3 if rep.get('stopped') == 'out_of_funds' else 0
+    return code
+
+
+PIPELINE = 'breach-profile'
+EXIT_OUT_OF_FUNDS, EXIT_CEILING, EXIT_MODEL_GONE = 3, 4, 5
+
+
+def month_spend_usd(conn) -> float:
+    """Jev spend recorded by this pipeline's runs since the first of the month (UTC), local backfills included."""
+    with conn.cursor() as cur:
+        cur.execute("""select coalesce(sum((notes->>'usd')::numeric), 0) from raw.pipeline_runs
+                        where pipeline = %s and started_at >= date_trunc('month', now() at time zone 'utc') at time zone 'utc'""",
+                    (PIPELINE,))
+        return float(cur.fetchone()[0])
+
+
+def run_recorded(conn, args, transport=None, key=None, sleep=time.sleep):
+    """One recorded run (raw.pipeline_runs, watched by tools/watchdog.py). Fails the run - so the watchdog and the
+    workflow both see it - when TypeSafe stops offering the pinned model, when the monthly ceiling is reached, or when
+    the account is out of funds. A run that profiled nothing because nothing was new is a success."""
+    from zdc_kev import db as runs_db
+    trigger = os.environ.get('GITHUB_EVENT_NAME') or 'manual'
+    run_id = runs_db.start_run(conn, PIPELINE, 'incremental', trigger, os.environ.get('GITHUB_SHA'))
+    spent = month_spend_usd(conn)
+    left = max(0.0, args.monthly_usd - spent)
+    budget = Budget(min(args.max_usd, left))
+    jev = Jev(budget, key=key, transport=transport, sleep=sleep)
+    offered = jev.offered_models()
+    rep, code, error = None, 0, None
+    if offered is not None and MODEL not in offered:
+        rep, code, error = _new_report('run', budget.max_usd), EXIT_MODEL_GONE, f'pinned model {MODEL} is no longer offered'
+    elif left <= 0:
+        rep, code, error = _new_report('run', 0), EXIT_CEILING, f'monthly ceiling {args.monthly_usd} USD reached'
+    else:
+        rep = cmd_run(conn, args.limit, args.deadline_min, budget.max_usd, jev=jev, budget=budget)
+        if rep.get('stopped') == 'out_of_funds':
+            code, error = EXIT_OUT_OF_FUNDS, 'TypeSafe account out of funds'
+    rep['month_spend_usd'] = round(spent + float(rep.get('usd') or 0), 4)
+    rep['monthly_ceiling_usd'] = args.monthly_usd
+    rep['month_spend_share'] = round(rep['month_spend_usd'] / args.monthly_usd, 3) if args.monthly_usd else None
+    rep['model_offered'] = None if offered is None else MODEL in offered
+    errors = sum((rep.get('errors') or {}).values()) if isinstance(rep.get('errors'), dict) else 0
+    runs_db.finish_run(conn, run_id, ok=code == 0, error=error, entries_seen=rep.get('selected', 0),
+                       entries_inserted=rep.get('written', 0),
+                       notes={'usd': float(rep.get('usd') or 0), 'profiled': rep.get('profiled', 0),
+                              'month_spend_usd': rep['month_spend_usd'], 'errors': errors})
+    return rep, code
 
 
 if __name__ == '__main__':
