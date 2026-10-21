@@ -424,6 +424,21 @@ def likely_english(text):
     return not (foreign >= 3 and foreign > 2 * english)
 
 
+# Health needs the post's own words (RULING_coverage L2 follow-up, 2026-10-21). On the fresh 30-claim gate health
+# reached 26/30, and its errors were inferences from the victim's trade (an orthodontist, an oncology clinic) or a
+# drug maker's research, not stated medical data. A health tag now stands only when the classifier text itself names
+# medical or patient records; otherwise the tag is dropped (never replaced by a guess). Fresh gate on 30 new guarded
+# claims: 29/30 (Wilson LB 0.833), so health ships (0151). The guard keeps 353 of 426 v1 health claims.
+HEALTH_EVIDENCE = re.compile(
+    r"\b(medical|health|patient|clinical|treatment|dental|hospital|lab|laboratory)\s+(records?|data|information|files?|"
+    r"histor(y|ies)|reports?|charts?|results?|documents?|details|cards?)\b|\b(phi|hipaa|ehr|emr|diagnos[ei]s|diagnostic|"
+    r"prescriptions?|x-rays?|mri)\b|\bpatients?\b", re.I)
+
+
+def health_evidence(text: str | None) -> bool:
+    return bool(text and HEALTH_EVIDENCE.search(text))
+
+
 def decide_claim(item, jev_answers, group_templates):
     """Every derived value of one claim from its stored Jev answers. item: {claim_key, victim_domain, sentences}."""
     A = jev_answers['tags']
@@ -446,6 +461,8 @@ def decide_claim(item, jev_answers, group_templates):
         for r in rows:
             r['text'], r['shown'] = None, False
     fine = profile_tags(A, sents, boiler, seen) if english else []
+    if 'health' in fine and not health_evidence(item.get('descr') or ' '.join(x['text'] for x in sents)):
+        fine = [t for t in fine if t != 'health']
     return {'profile_tags': fine, 'profile_groups': groups(fine),
             'volumes': volumes(A, jev_answers['meta']['cands'], boiler) if english else [],
             'size_band_est': band, 'size_p_top': p_top, 'sentences': rows}

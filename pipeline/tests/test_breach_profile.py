@@ -501,3 +501,25 @@ def test_language_guard_english_only():                 # mutant: likely_english
     assert P.likely_english('Insurance')
     assert not P.likely_english('Das Unternehmen bietet Logistikdienstleistungen für Händler in der ganzen Region an.')
     assert not P.likely_english('Компания предоставляет логистические услуги розничным продавцам.')
+
+
+def test_health_needs_medical_wording_in_the_post():
+    """A health tag inferred from the victim's trade is dropped; one the post states stays (gate C, 2026-10-21)."""
+    from zdc_breach.profile import health_evidence
+    assert health_evidence('We took staff medical records and payroll.')
+    assert health_evidence('Patient data of the clinic is published.')
+    assert health_evidence('HIPAA protected files')
+    assert not health_evidence('Zzexample Orthodontics: all insurance and personal data of customers.')
+    assert not health_evidence('Zzexample Labs does research on medicinal products.')
+    assert not health_evidence('Zzexample is a healthcare provider in Exampleland.')
+    assert not health_evidence(None)
+
+
+def test_decide_claim_drops_health_without_medical_wording():   # mutant: guard not applied in decide_claim
+    s = S('Zzexample Dental Care serves families in Exampleland.', 'We took all personal data of customers.')
+    ja = {'tags': answers(s, tags={'health': 0.95, 'personal_identity': 0.97}), 'meta': {'sids': ['s1', 's2'], 'cands': []}, 'size': None}
+    d = P.decide_claim({'claim_key': 'k', 'victim_domain': None, 'sentences': s}, ja, set())
+    assert 'health' not in d['profile_tags'] and 'health' not in d['profile_groups']
+    s2 = S('Zzexample Dental Care serves families in Exampleland.', 'We took staff medical records.')
+    ja2 = {'tags': answers(s2, tags={'health': 0.95}), 'meta': {'sids': ['s1', 's2'], 'cands': []}, 'size': None}
+    assert 'health' in P.decide_claim({'claim_key': 'k', 'victim_domain': None, 'sentences': s2}, ja2, set())['profile_groups']
