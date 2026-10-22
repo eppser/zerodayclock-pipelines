@@ -58,6 +58,13 @@ def _d(v) -> date | None:
     return d if d is None or d.year >= 1990 else None
 
 
+def _event_d(v, as_of: date | None) -> date | None:
+    """An event (breach) date, or None when it is a placeholder or falls after the filing that reports it:
+    California lists DaVita's breach as '11/20/2027, 12/14/2023' in a notice of 2024-07-03 (0181)."""
+    d = _d(v)
+    return d if d is None or as_of is None or d <= as_of else None
+
+
 def _parse_d(v) -> date | None:
     if not v:
         return None
@@ -98,7 +105,7 @@ def parse_wa(rows: list) -> tuple[list[Disclosure], int]:
             bad += 1
             continue
         d = Disclosure("wa_ag", str(rid), name, submitted, "regulator_filing",
-                       event_date=_d(r.get("datestart")), state=r.get("entitystate"),
+                       event_date=_event_d(r.get("datestart"), submitted), state=r.get("entitystate"),
                        sector=r.get("businesstype") or r.get("industrytype"),
                        url="https://www.atg.wa.gov/data-breach-notifications", record=r)
         n = _int(r.get("washingtoniansaffected"))
@@ -129,7 +136,7 @@ def parse_de(rows: list) -> tuple[list[Disclosure], int]:
         pdf = (r.get("sample_of_notice") or {}).get("url") if isinstance(r.get("sample_of_notice"), dict) else None
         rid = f"{name}|{r.get('date_of_notice')}|{r.get('date_of_breach')}"
         d = Disclosure("de_ag", rid, name, notice, "regulator_filing",
-                       event_date=_d(r.get("date_of_breach")), url=pdf, record=r)
+                       event_date=_event_d(r.get("date_of_breach"), notice), url=pdf, record=r)
         n = _int(r.get("total_affected"))
         if n:
             d.facts.append(Fact("people_affected", n, None, "persons", "exact"))
@@ -152,7 +159,8 @@ def parse_ca(body: str) -> tuple[list[Disclosure], int]:
             bad += 1
             continue
         breach = (r.get("Date(s) of Breach  (if known)") or r.get("Date(s) of Breach (if known)") or "").strip()
-        first = _d(breach.split(",")[0]) if breach else None
+        # the first PLAUSIBLE date of the list: a typo in the first one must not hide the rest (0181)
+        first = next((x for x in (_event_d(p, reported) for p in breach.split(",")) if x), None) if breach else None
         out.append(Disclosure("ca_ag", f"{name}|{reported.isoformat()}|{breach}", name, reported,
                               "regulator_filing", event_date=first,
                               url="https://oag.ca.gov/privacy/databreach/list", record=dict(r)))
@@ -276,11 +284,26 @@ def jsf_button(html_text: str, label: str) -> str | None:
 HIBP_URL = "https://haveibeenpwned.com/api/v3/breaches"
 
 
+# 0181: an HIBP entry that is not one organisation's breach - a stealer-log or malware corpus, a combo list or other
+# compilation, a credential dump of unknown origin, a scrape, a misattribution. Same rule as the SQL function
+# breach_core.hibp_not_a_victim (parity test in tests/test_breach_data_quality.py).
+HIBP_NOT_A_VICTIM_TITLE = re.compile(r"(stealer log|combo ?lists?|credential stuffing|^operation\s|compilation|collection\s*#|"
+                                     r"\bdumps?\b|scrape|separate data breaches|^not\s|misattributed)", re.I)
+HIBP_NOT_A_VICTIM_NAMED = frozenset({"Exploit.In", "Naz.API"})
+
+
+def hibp_not_a_victim(r: dict) -> bool:
+    if any(str(r.get(k)).lower() == "true" for k in ("IsStealerLog", "IsMalware", "IsSpamList", "IsFabricated")):
+        return True
+    title = r.get("Title") or ""
+    return bool(HIBP_NOT_A_VICTIM_TITLE.search(title)) or title in HIBP_NOT_A_VICTIM_NAMED
+
+
 def parse_hibp(rows: list) -> tuple[list[Disclosure], int]:
     out, bad = [], 0
     for r in rows if isinstance(rows, list) else []:
         name, added = (r.get("Title") or r.get("Name") or "").strip(), _d(r.get("AddedDate"))
-        if not name or not added or r.get("IsFabricated") or r.get("IsSpamList"):
+        if not name or not added or hibp_not_a_victim(r):
             bad += 0 if (name and added) else 1
             continue
         d = Disclosure("hibp", str(r.get("Name")), name, added, "breach_index",
