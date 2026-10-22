@@ -1,7 +1,8 @@
 name: Breach victim profiles
 
 # Victim profile from the ransomware leak post. Method breach-profile-v1: pipeline/zdc_breach/profile.py;
-# migration supabase/migrations/0145_breach_victim_profiles.sql. Daily.
+# migration supabase/migrations/0145_breach_victim_profiles.sql. Daily. Then the victim names step: method
+# breach-names-v1, pipeline/zdc_breach/names.py, migration 0172.
 #
 # PUBLIC, LIKE THE OTHER SCHEDULED PIPELINES. Each run asks TypeSafe Jev (model jev-1.13.0, frozen question set
 # p1-q2) about leak-post descriptions not yet profiled (newest first) or whose description changed, and stores the
@@ -58,7 +59,7 @@ jobs:
       - name: Install
         run: pip install --only-binary ':all:' --require-hashes -r requirements-ci.txt
       - name: Unit tests
-        run: python -m pytest -q tests/test_breach_profile.py
+        run: python -m pytest -q tests/test_breach_profile.py tests/test_breach_names.py
 
   profile:
     needs: test
@@ -118,6 +119,14 @@ jobs:
           python -m zdc_breach.profile --report breach-profile-report.json \
             run --limit "$LIMIT" --deadline-min "$DEADLINE" --max-usd "$MAX_USD" > /dev/null
 
+      # breach-names-v1 (migration 0172): the company a leak post names when the listed name is a post title. Same key,
+      # same counts-only rule; its own small ceiling. Runs after profiling (a failed profile run skips it).
+      - name: Resolve victim names
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+        run: python -m zdc_breach.names --report breach-names-report.json run --limit 400 --deadline-min 10 --max-usd 0.5 > /dev/null
+
       - name: Summary
         if: always()
         run: |
@@ -142,12 +151,26 @@ jobs:
           else
             echo "No report produced: the run failed before writing one." >> "$GITHUB_STEP_SUMMARY"
           fi
+          if [ -f breach-names-report.json ]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r = json.load(open("breach-names-report.json"))
+          print(f"\n### Victim names ({r.get('method_version')}, q_hash {r.get('q_hash')})\n")
+          print(f"- {r.get('resolvable', 0)} title-like of {r.get('listed', 0)} listed; selected {r.get('selected', 0)}, asked {r.get('asked', 0)}, "
+                f"written {r.get('written', 0)}, spelling changes {r.get('canonical_changed', 0)}; stopped: {r.get('stopped') or 'no'}; "
+                f"{r.get('calls', 0)} Jev calls, {r.get('usd', 0)} USD (cap {r.get('max_usd')})\n")
+          for k, v in (r.get('reasons') or {}).items():
+              print(f"- {k}: {v}")
+          PY
+          fi
 
       # Counts only (see the header): safe to keep as a public artifact.
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: breach-profile-report-${{ github.run_id }}
-          path: pipeline/breach-profile-report.json
+          path: |
+            pipeline/breach-profile-report.json
+            pipeline/breach-names-report.json
           if-no-files-found: warn
           retention-days: 14
