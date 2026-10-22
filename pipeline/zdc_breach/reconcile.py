@@ -16,6 +16,11 @@ the range and says sources differ.
 DETERMINISTIC. Same claims in, byte-identical facts out: every choice is ordered by stable keys,
 ties broken by claim_id.
 
+DATA TYPES (0170): the claim is chosen by breach_core.incident_data_types in SQL - the gate above, OTHER_ORDER,
+and within a basis a structured value before a machine-read one - and its items are split_data_types', stored
+per claim in claims.value_items when it is filed and refreshed here. The public view reads the same function, so
+a claim filed between runs (agent_load) reaches the list on the next list rebuild.
+
 NOT HERE (0137, ADR 0009): which CVEs a breach is linked to. That is breach_core.cve_link_gate, the one
 gate, applied by rebuild_cve_links in the list rebuild; incident_facts.cve_ids is no longer written. A
 private source (sources.publication = 'private') feeds no fact and counts as no source.
@@ -94,6 +99,22 @@ def split_data_types(text: str | None) -> list[str]:
     return [x for x in out if not (x in seen or seen.add(x))]
 
 
+def refresh_value_items(cur) -> int:
+    """claims.value_items := split_data_types(value_text) for every data_types claim where it differs (0170).
+    Filing writes it (resolve.add_claim, Resolver.claim); this catches every other writer and any change to the
+    split rules, and runs before the facts and the list are rebuilt. One pipelined batch."""
+    cur.execute("select claim_id, value_text, value_items from breach_core.claims where field = 'data_types'")
+    todo = []
+    for cid, text, have in cur.fetchall():
+        items = split_data_types(text)
+        if have is None or items != have:
+            todo.append((items, cid))
+    if todo:
+        with cur.connection.pipeline():
+            cur.executemany("update breach_core.claims set value_items = %s where claim_id = %s", todo)
+    return len(todo)
+
+
 def _rank(order):
     def key(c):
         return (order.index(c["basis"]) if c["basis"] in order else 99,
@@ -155,11 +176,22 @@ def build(cur) -> int:
                     where not i.suppressed and s.source_id not in (select source_id from breach_core.private_sources)
                     group by 1""")
     nsrc = dict(cur.fetchall())
+    refresh_value_items(cur)
+    # Data types: the CLAIM is chosen in SQL (breach_core.incident_data_types, 0170) - the same gate and order
+    # public.breach_incidents applies at list time - and its items are split_data_types' (claims.value_items),
+    # so incident_facts and the public view cannot disagree, and a claim filed between runs reaches the list on
+    # the next rebuild_victims_list(), not the next run.
+    cur.execute("""select i.incident_id, breach_core.incident_data_types(i.incident_id)
+                     from breach_core.incidents i
+                    where not i.suppressed
+                      and exists (select 1 from breach_core.claims c
+                                   where c.incident_id = i.incident_id and c.field = 'data_types')""")
+    dtypes = {i: d for i, d in cur.fetchall() if d is not None}
 
     cur.execute("delete from breach_core.incident_facts")
     n = 0
     rows: list[dict] = []
-    for inc in sorted(set(by) | set(nsrc), key=str):
+    for inc in sorted(set(by) | set(nsrc) | set(dtypes), key=str):
         f = by.get(inc, {})
         row = {"incident_id": inc, "n_sources": nsrc.get(inc, 0), "method_version": METHOD_VERSION,
                "has_disagreement": False}
@@ -177,9 +209,8 @@ def build(cur) -> int:
             if prefix == "people":
                 row.update(people_min=lo, people_max=hi, people_n_sources=k)
             row["has_disagreement"] |= dis
-        dt = choose(f.get("data_types", []), OTHER_ORDER)
-        if dt:
-            row["data_types"] = sorted(set(split_data_types(dt["value_text"])))
+        if inc in dtypes:
+            row["data_types"] = dtypes[inc]
         for field, col in (("vector", "vector"), ("actor", "actor")):
             best = choose(f.get(field, []), OTHER_ORDER)
             if best:

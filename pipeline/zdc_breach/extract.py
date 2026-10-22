@@ -400,6 +400,59 @@ def _names_org(quote: str, org: str) -> bool:
     return bool(tokens) and all(t in q.split() for t in tokens[:2])
 
 
+# ---- coarse breach dates (dates audit fix 2, 2026-10-21) -------------------------------------------------
+# A follow-up names its breach by year far more often than by day: "convicted in the 2019 Capital One data
+# breach", "a June 2024 attack". The model is told to give full dates only, so those years were lost and the
+# resolver dated the breach by the article. A coarse date is accepted only where the year sits NEXT TO a breach
+# noun in one sentence (the year before the noun with at most four words between, or "breach in/of/from/during
+# <month> <year>"), so "the original 2022 sentence" or "2019 revenue" never date a breach. Stored as
+# event_year ('2019') / event_month ('2024-06') claims. They are never published (no gold set labels them, so
+# no extractor version can activate them); resolve_incident uses them to MATCH an existing incident.
+_MONTH = (r"(?P<mon>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|"
+          r"sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?")
+_MONTH_NUM = {m: i for i, m in enumerate(("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct",
+                                          "nov", "dec"), 1)}
+_BREACH_NOUN = (r"(?:data[- ])?(?:breach(?:es)?|hack|cyber[- ]?attacks?|attacks?|cyber[- ]?incidents?|"
+                r"(?:security )?incidents?|intrusions?|ransomware|compromise|leak)")
+_NOT_A_BREACH_AFTER = r"(?!\s+(?:investigations?\s+)?(?:report|survey|index|statistics|study|trends))"
+COARSE_BEFORE = re.compile(r"(?i)(?<![\w$,.-])(?:" + _MONTH + r"\s+(?:of\s+)?)?(?P<year>(?:19|20)\d\d)(?:['’]s)?"
+                           r"\s+(?:[\w&.'’-]+\s+){0,4}?" + _BREACH_NOUN + r"\b" + _NOT_A_BREACH_AFTER)
+COARSE_AFTER = re.compile(r"(?i)\b" + _BREACH_NOUN + r"\s+(?:\w+\s+){0,2}?(?:in|of|from|during)\s+(?:"
+                          + _MONTH + r"\s+(?:of\s+)?)?(?P<year>(?:19|20)\d\d)(?![\d-])")
+_SENTENCE = re.compile(r"[^.!?\n]*(?:[.!?]+|\n|$)")
+COARSE_FIELDS = ("event_year", "event_month")
+
+
+def coarse_mentions(sentence: str) -> set[tuple[int, int | None]]:
+    """(year, month or None) for every breach year in the sentence that sits next to a breach noun."""
+    out = set()
+    for rx in (COARSE_BEFORE, COARSE_AFTER):
+        for m in rx.finditer(sentence or ""):
+            mon = m.group("mon")
+            out.add((int(m.group("year")), _MONTH_NUM[mon.lower()[:3]] if mon else None))
+    return out
+
+
+def _coarse_value(year: int, month: int | None) -> tuple[str, str]:
+    return ("event_month", f"{year:04d}-{month:02d}") if month else ("event_year", f"{year:04d}")
+
+
+def _coarse_candidates(document: str, org: str, single: bool) -> list[Candidate]:
+    """Coarse breach dates read from the document's own sentences that name the organisation (or from any
+    sentence of a one-organisation document) - deterministic, so reproducible from the stored text."""
+    seen, out = set(), []
+    for sm in _SENTENCE.finditer(document or ""):
+        s = sm.group(0).strip()
+        if not s or len(s) > 600 or not (single or _names_org(s, org)):
+            continue
+        for y, mo in sorted(coarse_mentions(s), key=lambda t: (t[0], t[1] or 0)):
+            fld, val = _coarse_value(y, mo)
+            if (fld, val) not in seen:
+                seen.add((fld, val))
+                out.append(Candidate(fld, val, "none", "not_applicable", s))
+    return out
+
+
 def validate(output: dict, document: str) -> list[ExtractedIncident]:
     """Turn the model's JSON into incidents with every candidate accepted or rejected."""
     if not isinstance(output, dict) or not output.get("is_incident_report"):
@@ -423,10 +476,20 @@ def validate(output: dict, document: str) -> list[ExtractedIncident]:
         actors = {norm_name(str(f.get("value"))) for f in facts if f.get("field") in ("actor", "ransomware_family")}
         if norm_name(org) in actors:
             continue
+        cands = []
         for f in facts:
             c = Candidate(str(f.get("field")), f.get("value"), str(f.get("unit") or "none"),
                           str(f.get("qualifier") or "exact"), str(f.get("quote") or ""),
                           f.get("currency"), f.get("money_kind"), f.get("cve_role"))
+            # A model's year or year-month in event_date is a coarse date, judged as one (fix 2).
+            m = re.fullmatch(r"((?:19|20)\d\d)(?:-(\d\d))?", str(c.value or "").strip()) if c.field == "event_date" else None
+            if m:
+                c.field, c.value = _coarse_value(int(m.group(1)), int(m.group(2)) if m.group(2) else None)
+                c.qualifier = "not_applicable"
+            cands.append(c)
+        have = {(c.field, str(c.value)) for c in cands}
+        cands += [c for c in _coarse_candidates(document, org, single) if (c.field, c.value) not in have]
+        for c in cands:
             c.basis = "threat_actor_claim" if actor_claim(c.quote) else basis
             c.reject_reason = _judge(c, document, c.basis)
             loc = locate(c.quote, document) if c.quote else None
@@ -442,6 +505,16 @@ def validate(output: dict, document: str) -> list[ExtractedIncident]:
 
 
 def _judge(c: Candidate, document: str, basis: str) -> str | None:
+    if c.field in COARSE_FIELDS:
+        m = re.fullmatch(r"((?:19|20)\d\d)(?:-(\d\d))?", str(c.value or ""))
+        if not m or (c.field == "event_month") != bool(m.group(2)) or (m.group(2) and not 1 <= int(m.group(2)) <= 12):
+            return "not_a_coarse_date"
+        if not grounding.quote_in_document(c.quote, document):
+            return "quote_not_in_document"
+        want = (int(m.group(1)), int(m.group(2)) if m.group(2) else None)
+        if want not in coarse_mentions(grounding.norm(c.quote or "")) and want not in coarse_mentions(c.quote or ""):
+            return "year_not_next_to_breach_noun"
+        return None
     if c.field == "category":
         # What kind of operation it was, stated in a sentence that is in the document, carries the
         # category's own cue word, and does not hedge. Never inferred from an actor's reputation.

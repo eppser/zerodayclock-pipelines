@@ -28,7 +28,7 @@ import psycopg
 
 from zdc_kev import db as runs_db
 
-from . import (confidence, cve_agent_load, cve_extract, db, evals, extract, http, linkage_db, reconcile, resolve, sources_actors, sources_leak, sources_media,
+from . import (confidence, cve_agent_load, cve_extract, db, doc_kind, evals, extract, http, linkage_db, reconcile, resolve, sources_actors, sources_leak, sources_media,
                sources_news, sources_reg, sources_size, sources_wa_site, thumbs)
 from .fx import Fx
 from .llm import MODEL, BudgetExceeded, OpenRouter
@@ -205,9 +205,9 @@ def run_structured(ctx, cur, source_id: str) -> dict:
 
 _WA_DT_SQL = """with new as (
         insert into breach_core.claims (incident_id, field, value_text, unit, qualifier, as_of, basis,
-                                        source_id, source_record_id, accepted)
+                                        source_id, source_record_id, accepted, value_items)
         values (%(inc)s, 'data_types', %(v)s, 'none', 'not_applicable', %(as_of)s, 'regulator_filing',
-                'wa_ag', %(sid)s, true)
+                'wa_ag', %(sid)s, true, %(items)s)
         on conflict do nothing returning claim_id)
     update breach_core.claims c set superseded_by = (select claim_id from new)
      where exists (select 1 from new) and c.incident_id = %(inc)s and c.field = 'data_types'
@@ -281,7 +281,8 @@ def apply_wa_site(cur, changed: set) -> dict:
         inc = inc_of.get(did) if did else None
         if not inc or not n.data_types or (n.site_id in has_claim and n.site_id not in changed):
             continue
-        rows.append({"inc": inc, "v": n.data_types[:500], "as_of": n.date_reported, "sid": n.site_id})
+        rows.append({"inc": inc, "v": n.data_types[:500], "as_of": n.date_reported, "sid": n.site_id,
+                     "items": resolve.value_items("data_types", n.data_types[:500])})
     if rows:
         with cur.connection.pipeline():
             cur.executemany(_WA_DT_SQL, rows)
@@ -837,32 +838,62 @@ def extract_doc(ctx, cur, sha, text, url, title, *, forced_incident=None, forced
     if not res.ok:
         return 0   # no extraction row: the backlog retries it once more
     return file_output(ctx, cur, sha, text, res.data, ext_id, call_id=call_id, published=published,
-                       source_id=source_id, forced_incident=forced_incident, forced_basis=forced_basis)
+                       source_id=source_id, forced_incident=forced_incident, forced_basis=forced_basis, title=title)
 
 
 def file_output(ctx, cur, sha, text, output, ext_id, *, call_id=None, published=None, source_id=None,
-                forced_incident=None, forced_basis=None) -> int:
+                forced_incident=None, forced_basis=None, title=None) -> int:
     """Store one extractor output and file its claims through the gate - shared by the OpenRouter
-    path above and by zdc_breach.agent_load (Claude subagents), so both pass the same validator."""
+    path above and by zdc_breach.agent_load (Claude subagents), so both pass the same validator.
+
+    A FOLLOW-UP (doc_kind: lawsuit, settlement, fine, sentencing, arrest, ruling, anniversary, re-notice) is
+    attach-only (dates audit fix 1): its claims join an existing incident of the same organisation; it never
+    creates an incident or an organisation and never sets a first-public date. One that matches nothing is
+    recorded in breach_core.press_review (private) and files no claim."""
     cur.execute("""insert into breach_core.extractions (doc_sha256, extractor_id, output, ok, error, call_id)
                    values (%s,%s,%s,true,null,%s) returning extraction_id""",
                 (sha, ext_id, json.dumps(output) if output is not None else None, call_id))
     extraction_id = cur.fetchone()[0]
     as_of = (published or datetime.now(timezone.utc)).date()
+    if title is None:
+        cur.execute("select title from breach_raw.documents where doc_sha256 = %s", (sha,))
+        r = cur.fetchone()
+        title = r[0] if r else None
+    kind = doc_kind.classify(title, output)
+    rep = ctx.report.setdefault("follow_ups", {"attached": 0, "held_for_review": 0})
     for ei in extract.validate(output, text):
         basis = forced_basis or ei.basis
+        ev = next((date.fromisoformat(c.value) for c in ei.candidates
+                   if c.accepted and c.field == "event_date" and len(str(c.value)) == 10), None)
+        # a coarse year later than the article is not the breach it reports on
+        coarse = sorted({(int(str(c.value)[:4]), int(str(c.value)[5:7]) if c.field == "event_month" else None)
+                         for c in ei.candidates if c.accepted and c.field in extract.COARSE_FIELDS
+                         and int(str(c.value)[:4]) <= as_of.year}, key=lambda t: (t[0], t[1] or 0))
         if forced_incident:
             inc = forced_incident
+        elif kind.follow_up:
+            org, how = resolve.find_or_create_org(cur, name=ei.organization, domain=norm_domain(ei.domain),
+                                                  country=norm_country(ei.country), sector=ei.sector,
+                                                  name_en=ei.organization_en,
+                                                  name_en_in_text=ei.organization_en_in_text, create=False)
+            inc, why = resolve.attach_follow_up(cur, org_id=org, name=ei.organization, source_id=source_id or "news",
+                                                doc=sha + ":" + resolve_key(ei.organization), event_date=ev,
+                                                coarse=coarse, public_date=as_of)
+            if inc is None:
+                hold_for_review(cur, sha=sha, extraction_id=extraction_id, organization=ei.organization, org_id=org,
+                                kind=kind, reason=why, coarse=coarse, title=title, published=as_of)
+                rep["held_for_review"] += 1
+                continue
+            rep["attached"] += 1
+            resolve.set_flag(cur, inc, "threat_actor_claim" if basis == "threat_actor_claim" else "news")
         else:
             org, how = resolve.find_or_create_org(cur, name=ei.organization, domain=norm_domain(ei.domain),
                                                   country=norm_country(ei.country), sector=ei.sector,
                                                   name_en=ei.organization_en,
                                                   name_en_in_text=ei.organization_en_in_text)
-            ev = next((date.fromisoformat(c.value) for c in ei.candidates
-                       if c.accepted and c.field == "event_date" and len(str(c.value)) == 10), None)
             inc, _ = resolve.resolve_incident(cur, org_id=org, org_how=how, source_id=source_id or "news",
                                               doc=sha + ":" + resolve_key(ei.organization), event_date=ev,
-                                              public_date=as_of)
+                                              public_date=as_of, coarse=coarse)
             # From an article, the only flags set directly are "reported" and "claimed". A model's
             # reading that a regulator or the victim said something does not unlock a name.
             resolve.set_flag(cur, inc, "threat_actor_claim" if basis == "threat_actor_claim" else "news")
@@ -875,6 +906,20 @@ def file_output(ctx, cur, sha, text, output, ext_id, *, call_id=None, published=
             cb = c.basis if (c.basis == "threat_actor_claim" and not forced_basis) else basis
             file_candidate(ctx, cur, inc, c, cb, source_id or "sec_8k", sha, extraction_id, as_of, text)
     return 1
+
+
+def hold_for_review(cur, *, sha, extraction_id, organization, org_id, kind, reason, coarse, title, published,
+                    incident_id=None) -> None:
+    """A follow-up nothing could take (or, from the repair tool, an incident held back): recorded privately for
+    a person to attach, dismiss or release. breach_core.press_review has no public grant (0171)."""
+    from .normalize import norm_name
+    cur.execute("""insert into breach_core.press_review (doc_sha256, extraction_id, organization, org_norm, org_id,
+                                                         incident_id, doc_kind, kind_reason, reason, coarse_dates,
+                                                         title, published_at)
+                   values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) on conflict do nothing""",
+                (sha, extraction_id, organization[:300], norm_name(organization)[:300], org_id, incident_id, kind.kind,
+                 kind.reason, reason, [f"{y:04d}" + (f"-{m:02d}" if m else "") for y, m in coarse],
+                 (title or "")[:500] or None, published))
 
 
 def resolve_key(org: str) -> str:

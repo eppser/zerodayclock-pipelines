@@ -69,7 +69,7 @@ def load(conn, model: str, lines: list[dict], dry_run: bool = False) -> dict:
                 r = cur.fetchone()
                 forced = r[0] if r else None
             run.file_output(ctx, cur, sha, text, output, ext_id, published=published, source_id=source_id,
-                            forced_incident=forced, forced_basis="regulator_filing" if forced else None)
+                            forced_incident=forced, forced_basis="regulator_filing" if forced else None, title=title)
             out["filed"] += 1
         out["claims"] = ctx.report["claims"]
         out["extractor_ids"] = sorted(registered)

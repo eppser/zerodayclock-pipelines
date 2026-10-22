@@ -50,6 +50,9 @@ from .normalize import has_cjk, norm_domain, norm_name
 EVENT_WINDOW = timedelta(days=30)
 CARD_ISSUERS = ("american express", "discover financial")   # = linkage.CARD_ISSUERS
 PUBLIC_WINDOW = timedelta(days=90)
+# A follow-up stating the breach date, matched to an incident that has only a filing date: the filing came
+# after the breach, within this lag (HIPAA allows 60 days from DISCOVERY, and discovery trails the breach).
+FILING_LAG = timedelta(days=270)
 
 
 # An alias shorter than this is not used to find an organisation: "NTT" or "AGC" alone names
@@ -99,8 +102,10 @@ def _take_over(cur, org_id, name, domain, country, sector, cik):
 
 def find_or_create_org(cur, *, name: str, domain: str | None = None, cik: str | None = None,
                        country: str | None = None, sector: str | None = None,
-                       name_en: str | None = None, name_en_in_text: bool = False) -> tuple[str, str]:
-    """(org_id, how) where how is 'sec_cik' | 'domain' | 'name' | 'name_en' | 'new'."""
+                       name_en: str | None = None, name_en_in_text: bool = False,
+                       create: bool = True) -> tuple[str | None, str]:
+    """(org_id, how) where how is 'sec_cik' | 'domain' | 'name' | 'name_en' | 'new'. With create=False (a
+    follow-up, which may only attach) an organisation that is not found is (None, 'not_found')."""
     nn = norm_name(name)
     domain = norm_domain(domain)
     alias = _alias(name_en, nn, name, name_en_in_text)
@@ -142,6 +147,8 @@ def find_or_create_org(cur, *, name: str, domain: str | None = None, cik: str | 
             _take_over(cur, r[0], name, domain, country, sector, cik)
             _add_alias(cur, r[0], alias)
             return r[0], how
+    if not create:
+        return None, "not_found"
     cur.execute("""insert into breach_core.organizations (display_name, norm_name, domain, country, sector, sec_cik,
                                                           aliases, alias_norms)
                    values (%s,%s,%s,%s,%s,%s,%s,%s) returning org_id""",
@@ -166,10 +173,44 @@ def already_linked(cur, source_id: str, record_id: str = "", doc: str = ""):
     return r[0] if r else None
 
 
+def coarse_window(year: int, month: int | None) -> tuple[date, date]:
+    """The dates a coarse breach date stands for (dates audit fix 2). A year matches its own year and reaches
+    one month across each New Year ("the 2019 breach" can be one stated as 2018-12-30 or 2020-01-02); a month
+    matches itself and its neighbours, which crosses the Dec/Jan boundary the same way."""
+    if month is None:
+        return date(year - 1, 12, 1), date(year + 1, 1, 31)
+    lo = date(year, month, 1) - timedelta(days=1)
+    hi = date(year + (month == 12), month % 12 + 1, 1)
+    hi_end = date(hi.year + (hi.month == 12), hi.month % 12 + 1, 1) - timedelta(days=1)
+    return date(lo.year, lo.month, 1), hi_end
+
+
+def in_coarse(d: date | None, coarse) -> bool:
+    return bool(d and coarse) and any(lo <= d <= hi for lo, hi in (coarse_window(y, m) for y, m in coarse))
+
+
+def matches_coarse(ev: date | None, pub: date, coarse) -> bool:
+    """Does an existing incident fall in a coarse breach date? By its event date when it has one; an incident
+    known only by its filing date (HHS, California) matches when it was filed in the window or within
+    FILING_LAG after it - a breach in June 2024 filed in October 2024 is the same breach."""
+    if not coarse:
+        return False
+    if ev:
+        return in_coarse(ev, coarse)
+    return any(lo <= pub <= hi + FILING_LAG for lo, hi in (coarse_window(y, m) for y, m in coarse))
+
+
 def resolve_incident(cur, *, org_id: str, org_how: str, source_id: str, record_id: str = "",
-                     doc: str = "", event_date: date | None, public_date: date) -> tuple[str, str]:
+                     doc: str = "", event_date: date | None, public_date: date,
+                     coarse: list[tuple[int, int | None]] | None = None) -> tuple[str, str]:
     """(incident_id, match_method) for this source row, creating the incident if needed, and
-    recording the link. Idempotent: a row already linked returns its incident unchanged."""
+    recording the link. Idempotent: a row already linked returns its incident unchanged.
+
+    coarse (dates audit fix 2): the breach years / year-months the document grounds ("the 2019 breach").
+    When the row states no full event date, an incident of the same organisation whose own date (its event
+    date, else its first public date) falls in a coarse window is matched FIRST - same organisation and same
+    year, by the rules above (a hard key merges, a name links) - before the 90-day window around the
+    article's date, which is what made a 2025 ruling on the 2019 Capital One breach a new 2025 incident."""
     linked = already_linked(cur, source_id, record_id, doc)
     if linked:
         return linked, "source_key"
@@ -182,9 +223,15 @@ def resolve_incident(cur, *, org_id: str, org_how: str, source_id: str, record_i
                               incident_id in (select incident_id from breach_core.private_only_incidents)
                          from breach_core.incidents
                         where org_id = %s order by first_public_date""", (org_id,))
-        for inc_id, ev, pub, private_only in cur.fetchall():
+        rows = cur.fetchall()
+        use_coarse = bool(coarse) and not event_date
+        if use_coarse:     # coarse matches first, each group in first-public order (a stable sort)
+            rows.sort(key=lambda r: not matches_coarse(r[1], r[2], coarse))
+        for inc_id, ev, pub, private_only in rows:
             if event_date and ev:
                 close, same = abs(ev - event_date) <= EVENT_WINDOW, ev == event_date
+            elif use_coarse and matches_coarse(ev, pub, coarse):
+                close, same = True, False
             else:
                 close, same = abs(pub - public_date) <= PUBLIC_WINDOW, False
             if not close:
@@ -222,6 +269,72 @@ def resolve_incident(cur, *, org_id: str, org_how: str, source_id: str, record_i
     return incident, method
 
 
+def attach_follow_up(cur, *, org_id: str | None, name: str, source_id: str, doc: str, event_date: date | None,
+                     coarse: list[tuple[int, int | None]] | None, public_date: date) -> tuple[str | None, str]:
+    """A follow-up document (doc_kind: lawsuit, settlement, fine, sentencing, anniversary, re-notice ...) is
+    ATTACH-ONLY: (incident_id, how) of an EXISTING incident of this organisation, or (None, reason). It never
+    creates an incident and never moves an incident's dates - a ruling in 2025 is not news of a 2025 breach.
+
+    Which incident, in order: the stated full event date (within 30 days); else a coarse breach year/month;
+    else, with no date at all, an incident first public within 90 days of the article (an update to a recent
+    breach), else the organisation's only incident. A stated date that matches nothing is not overridden by
+    "the only incident" - the dates disagree, so a person decides (press_review). Private-only incidents are
+    never targets (attaching a public source would publish them), nor are suppressed ones.
+
+    WHOSE incidents: the organisation found (org_id, by the usual identity rules) AND every organisation with the
+    same normalised name. An article rarely states the country a regulator row carries (live: a press "DaVita"
+    with no country beside the filed "DaVita Inc.", US), and the country rule exists to stop two incidents being
+    MERGED by name; a follow-up creates nothing, and a name shared by two breaches with no date to choose between
+    them is "ambiguous" and goes to a person. Structured (regulator / index / leak) incidents are preferred,
+    then roots, then the earliest."""
+    linked = already_linked(cur, source_id, "", doc)
+    if linked:
+        return linked, "source_key"
+    has, forced = _override(cur, source_id, "", doc)
+    if has:
+        if not forced:
+            return None, "override_says_new"
+        target, how = forced, "manual"
+    else:
+        nn = norm_name(name)
+        cur.execute("""select i.incident_id, i.event_date, i.first_public_date, i.possible_duplicate_of is null
+                         from breach_core.incidents i join breach_core.organizations o on o.org_id = i.org_id
+                        where (i.org_id = %s or (o.norm_name = %s and %s <> ''))
+                          and not i.suppressed and i.first_public_date <= %s
+                          and i.incident_id not in (select incident_id from breach_core.private_only_incidents)
+                        order by not (i.regulator_filed or i.victim_confirmed or exists (
+                                     select 1 from breach_core.incident_sources s join breach_core.sources src using (source_id)
+                                      where s.incident_id = i.incident_id
+                                        and src.kind in ('regulator', 'breach_index', 'leak_tracker'))),
+                                 i.possible_duplicate_of is not null, i.first_public_date, i.incident_id""",
+                    (org_id, nn, nn, public_date))
+        rows = cur.fetchall()
+        target, how = None, "no_matching_incident"
+        if event_date:
+            # an incident with its own event date: within 30 days; one known only by its filing date (HHS
+            # lists no breach date): filed within FILING_LAG after the stated breach
+            hit = [r for r in rows if r[1] and abs(r[1] - event_date) <= EVENT_WINDOW] or \
+                  [r for r in rows if not r[1] and timedelta(0) <= r[2] - event_date <= FILING_LAG]
+            target, how = (hit[0][0], "event_window") if hit else (None, "no_matching_incident")
+        elif coarse:
+            hit = [r for r in rows if matches_coarse(r[1], r[2], coarse)]
+            target, how = (hit[0][0], "event_year") if hit else (None, "no_matching_incident")
+        else:
+            near = [r for r in rows if abs(r[2] - public_date) <= PUBLIC_WINDOW]
+            roots = [r for r in rows if r[3]]
+            if near:
+                target, how = near[0][0], "public_window"
+            elif len(roots) == 1:
+                target, how = roots[0][0], "only_incident"
+            elif roots:
+                how = "ambiguous"
+        if target is None:
+            return None, how
+    cur.execute("""insert into breach_core.incident_sources (incident_id, source_id, source_record_id, doc_sha256, match_method)
+                   values (%s,%s,'',%s,'follow_up') on conflict do nothing""", (target, source_id, doc or ""))
+    return target, how
+
+
 FLAG_FOR_BASIS = {"regulator_filing": "regulator_filed", "victim_statement": "victim_confirmed",
                   "news_citing_victim": "media_reported", "news": "media_reported",
                   "threat_actor_claim": "actor_claimed"}
@@ -234,6 +347,15 @@ def set_flag(cur, incident_id: str, basis: str) -> None:
                     (incident_id,))
 
 
+def value_items(field: str, value_text) -> list[str] | None:
+    """The items a data_types value lists, as reconcile.split_data_types reads them (0170): stored on the claim
+    when it is filed, so the list's SQL reads the one split definition without waiting for a run."""
+    if field != "data_types":
+        return None
+    from .reconcile import split_data_types
+    return split_data_types(value_text)
+
+
 def add_claim(cur, *, incident_id: str, field: str, value_num=None, value_text=None, unit="none",
               qualifier="not_applicable", as_of: date, basis: str, source_id: str,
               source_record_id: str | None = None, doc_sha256: str | None = None, quote=None,
@@ -244,13 +366,13 @@ def add_claim(cur, *, incident_id: str, field: str, value_num=None, value_text=N
         """insert into breach_core.claims (incident_id, field, value_num, value_text, unit, qualifier,
                money_kind, currency, amount_usd, fx_rate, fx_date, fx_source, as_of, basis, source_id,
                source_record_id, doc_sha256, quote, quote_start, quote_end, subject_match,
-               extraction_id, accepted, reject_reason)
-           values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               extraction_id, accepted, reject_reason, value_items)
+           values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
            on conflict do nothing""",
         (incident_id, field, value_num, value_text, unit, qualifier, money_kind, currency,
          amount_usd, fx_rate, fx_date, fx_source, as_of, basis, source_id, source_record_id,
          doc_sha256, quote, quote_start, quote_end, subject_match, extraction_id, accepted,
-         reject_reason))
+         reject_reason, value_items(field, value_text)))
 
 
 # ---- batched form ------------------------------------------------------------------------------
@@ -259,8 +381,8 @@ import uuid  # noqa: E402
 _CLAIM_SQL = """insert into breach_core.claims (incident_id, field, value_num, value_text, unit, qualifier,
                money_kind, currency, amount_usd, fx_rate, fx_date, fx_source, as_of, basis, source_id,
                source_record_id, doc_sha256, quote, quote_start, quote_end, subject_match,
-               extraction_id, accepted, reject_reason)
-           values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               extraction_id, accepted, reject_reason, value_items)
+           values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
            on conflict do nothing"""
 
 
@@ -435,7 +557,8 @@ class Resolver:
               qualifier="not_applicable", as_of, basis, source_id, source_record_id=None):
         self.writes.append((_CLAIM_SQL, (incident_id, field, value_num, value_text, unit, qualifier, None, None,
                                          None, None, None, None, as_of, basis, source_id, source_record_id,
-                                         None, None, None, None, None, None, True, None)))
+                                         None, None, None, None, None, None, True, None,
+                                         value_items(field, value_text))))
 
     def flush(self):
         if not self.writes:
