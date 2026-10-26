@@ -516,7 +516,7 @@ class _ProbeHttp:
         self.calls.append((url, headers, params))
         now = dt.datetime(2026, 10, 26, tzinfo=dt.timezone.utc)
         code = next((c for k, c in self.status.items() if k in url), 200)
-        body = json.dumps({"success": True, "result": self.cf}).encode() if "cloudflare" in url else b"{}"
+        body = json.dumps({"success": True, "result": self.cf}).encode() if "tokens/verify" in url else b"{}"
         return Response(url, code, body if code == 200 else None, None if code == 200 else f"HTTP {code}", now, now)
 
 
@@ -526,7 +526,7 @@ ENV = {"CLOUDFLARE_RADAR_TOKEN": "t" * 40, "CROWDSEC_CTI_API_KEY": "c" * 40, "VU
 def test_probe_all_keys_answer():
     from zdc_netthreat import probe
     rows = probe.probe(_ProbeHttp(), ENV, dt.date(2026, 10, 26))
-    assert [r["source"] for r in rows] == ["cloudflare", "crowdsec_cti", "vulncheck", "shodan"]
+    assert [r["source"] for r in rows] == ["cloudflare", "cloudflare_radar", "crowdsec_fire", "vulncheck_backup", "shodan"]
     assert all(r["ok"] for r in rows) and "2027-10-21" in rows[0]["note"]
 
 
@@ -534,7 +534,7 @@ def test_probe_flags_a_refused_key_a_missing_key_and_a_near_expiry():
     from zdc_netthreat import probe
     env = dict(ENV); del env["SHODAN_API_KEY"]
     rows = {r["source"]: r for r in probe.probe(_ProbeHttp(status={"crowdsec": 403}), env, dt.date(2026, 10, 26))}
-    assert not rows["crowdsec_cti"]["ok"] and rows["crowdsec_cti"]["status"] == 403
+    assert not rows["crowdsec_fire"]["ok"] and rows["crowdsec_fire"]["status"] == 403
     assert not rows["shodan"]["ok"] and rows["shodan"]["note"] == "key not set"
     soon = probe.probe(_ProbeHttp(cf={"status": "active", "expires_on": "2026-11-10T00:00:00Z"}), ENV, dt.date(2026, 10, 26))
     assert not soon[0]["ok"] and "15 days" in soon[0]["note"]

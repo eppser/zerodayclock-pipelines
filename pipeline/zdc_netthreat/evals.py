@@ -18,10 +18,12 @@ FLOORS = {"crowdsec": 10_000, "dshield": 5_000, "blocklist_de": 5_000, "cins": 5
           "tor_exits": 300, "cloudflare": 1_000, "shadowserver_country": 1_000}
 REQUIRED = ("crowdsec", "dshield", "blocklist_de", "cins", "vulncheck", "threatfox", "urlhaus",
             "phishing_db", "cloudflare")
-#: Sources read as a snapshot of the moment the run fetches them (a trailing window: CrowdSec
-#: since=7d, blocklist.de and ThreatFox 48 h, the others "current"), not bounded by the scored week.
-#: VulnCheck, Cloudflare and Shadowserver are asked for the week's own dates and are not listed.
-SNAPSHOT = ("crowdsec", "dshield", "blocklist_de", "cins", "threatfox", "urlhaus", "phishing_db", "shodan")
+#: Scored sources read as a snapshot of the moment the run fetches them (a trailing window:
+#: CrowdSec since=7d, blocklist.de and ThreatFox 48 h, the others "current"), not bounded by the
+#: scored week. VulnCheck is filtered to the week and is not listed; Shodan, Cloudflare's 12w/52w
+#: lists and bot shares are relative to the fetch too, but are shown, not fitted, so they do not
+#: decide whether a week is provisional.
+SNAPSHOT = ("crowdsec", "dshield", "blocklist_de", "cins", "threatfox", "urlhaus", "phishing_db")
 IP_RX = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
 
 

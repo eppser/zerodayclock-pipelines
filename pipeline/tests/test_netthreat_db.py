@@ -343,6 +343,16 @@ def test_the_tuesday_retry_skips_a_collected_week(db, monkeypatch):
     assert q(db, "select count(*) from raw.pipeline_runs where pipeline = 'netthreat'")[0][0] == runs
 
 
+def test_a_week_blocked_only_by_scoring_is_not_recollected(db, monkeypatch):
+    _tiny_week(monkeypatch)
+    assert nrun.main(["--week", WEEK.isoformat()]) == 0
+    db.execute("update raw.pipeline_runs set ok = false where pipeline = 'netthreat'")   # as if a v2 gate blocked it
+    db.commit()
+    fetches = q(db, "select count(*) from net_raw.fetches")[0][0]
+    assert nrun.main(["--week", WEEK.isoformat(), "--skip-if-collected"]) == 0
+    assert q(db, "select count(*) from net_raw.fetches")[0][0] == fetches
+
+
 def test_a_failed_collection_is_retried(db, monkeypatch):
     _tiny_week(monkeypatch)
     monkeypatch.delenv("CROWDSEC_CTI_API_KEY")
@@ -382,10 +392,12 @@ def test_an_unchanged_feed_is_flagged(db, tmp_path, monkeypatch):
 def test_an_abandoned_run_row_is_closed(db, monkeypatch):
     _tiny_week(monkeypatch)
     db.execute("""insert into raw.pipeline_runs (run_id, pipeline, mode, trigger, started_at)
-                  values (gen_random_uuid(), 'netthreat', 'full', 'test', now() - interval '5 hours')""")
+                  values (gen_random_uuid(), 'netthreat', 'full', 'old', now() - interval '5 hours'),
+                         (gen_random_uuid(), 'netthreat', 'full', 'live', now() - interval '1 hour')""")
     db.commit()
     nrun.main(["--week", WEEK.isoformat()])
-    assert q(db, "select count(*) from raw.pipeline_runs where pipeline = 'netthreat' and finished_at is null")[0][0] == 0
+    open_rows = q(db, "select trigger from raw.pipeline_runs where pipeline = 'netthreat' and finished_at is null")
+    assert open_rows == [("live",)]                         # a run that may still be going is left alone
 
 
 def test_a_week_not_yet_over_is_refused(db):

@@ -582,8 +582,8 @@ def main(argv: list[str] | None = None) -> int:
     report: dict = {"pipeline": PIPELINE, "week": week.isoformat(), "method": METHOD,
                     "started_at": dt.datetime.now(dt.timezone.utc).isoformat()}
     conn = psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=60)
-    if args.skip_if_collected and not args.score_only and db.week_collected(conn, week):
-        log.info("week %s already has a successful collection; nothing to retry", week)
+    if args.skip_if_collected and not args.score_only and db.week_collected(conn, week, evals.REQUIRED):
+        log.info("week %s was collected (every required source answered); nothing to retry", week)
         conn.close()
         return 0
     closed = db.close_abandoned_runs(conn)

@@ -447,15 +447,16 @@ def feeds_unchanged(conn, week_start: dt.date, sources: tuple[str, ...]) -> list
         return [r[0] for r in cur.fetchall()]
 
 
-def week_collected(conn, week_start: dt.date) -> bool:
-    """True when a successful full collection already exists for the week (the Tuesday retry
-    then has nothing to do)."""
+def week_collected(conn, week_start: dt.date, required: tuple[str, ...]) -> bool:
+    """True when the newest fetch of every required source for the week succeeded: the week is
+    collected even if a scoring gate then blocked it, and a Tuesday re-collection would only score
+    it from later days (round-5 review). Run ok-ness is not the test: a scoring gate sets it false."""
     with conn.cursor() as cur:
-        cur.execute("""select exists (select 1 from raw.pipeline_runs r
-                                       where r.pipeline = 'netthreat' and r.mode = 'full' and r.ok
-                                         and exists (select 1 from net_raw.fetches f
-                                                      where f.run_id = r.run_id and f.week_start = %s))""", (week_start,))
-        return bool(cur.fetchone()[0])
+        cur.execute("""select count(*) filter (where ok) from (
+                           select distinct on (source_id) source_id, ok from net_raw.fetches
+                            where week_start = %s and source_id = any(%s)
+                            order by source_id, finished_at desc) f""", (week_start, list(required)))
+        return cur.fetchone()[0] == len(required)
 
 
 def close_abandoned_runs(conn, older_than_hours: int = 3) -> int:
