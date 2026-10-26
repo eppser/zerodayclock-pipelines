@@ -1,0 +1,202 @@
+name: Breach R2 weekly (full chain + chart check)
+
+# Keeps the staging chart "Breaches made public, running total per year" up to date. The chart reads
+# public.admin_breach_r2_monthly_events() -> breach_core.r2_monthly_events() (0192), computed live from the private shadow
+# breach_core.r2_victims_shadow, which only breach_core.rebuild_r2_shadow() refreshes. Once a week this workflow
+#   1. runs the whole R2 chain: python -m zdc_breach.r2_hourly (events -> reported -> structured -> combined -> shadow
+#      rebuild), the same idempotent job as breach-r2.yml, with a larger spend cap for a week of backlog;
+#   2. runs python -m zdc_breach.r2_chart_check, which reads the chart's function (read-only, statement_timeout 60 s) and
+#      turns the run RED when the chart data is wrong or stale: shadow older than 8 days, total events != distinct events in
+#      the shadow, a future month, a decreasing running total, the last complete month missing or empty, the last month far
+#      outside the trailing-12-month median (fail below 0.2x / above 5x), too many undated events (fail above 15%).
+#      Warn-only findings (exit 2) show as annotations and in the job summary and do not fail the run. Thresholds: the
+#      docstring of pipeline/zdc_breach/r2_chart_check.py.
+#
+# IDEMPOTENT NEXT TO breach-r2.yml (hourly). Both run the same chain; a second pass right after the first writes nothing.
+# They share one concurrency group so they never overlap. GitHub keeps ONE pending run per group and replaces an older
+# pending run with a newer one: if the hourly run starts while this one waits, this run can be dropped and the next Monday
+# covers it (the hourly run keeps the shadow fresh in the meantime). Enabling the hourly workflow therefore does not break this
+# one; it makes the chart check pass on any day.
+#
+# SCHEDULE. Mondays 05:41 UTC. GitHub delays scheduled runs by 5-7 hours; the 8-day freshness limit absorbs that.
+#
+# PUBLIC, LIKE THE OTHER SCHEDULED PIPELINES. Logs, reports and the summary carry COUNTS ONLY: never a victim name, a leak
+# text, a connection detail or the key.
+
+on:
+  schedule:
+    - cron: '41 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      max_usd:
+        description: 'Stop the events step before Jev spend passes this many USD'
+        type: string
+        default: '1.0'
+      combined_max_usd:
+        description: 'Same cap for the combined step'
+        type: string
+        default: '1.0'
+      deadline_min:
+        description: 'Do not start a step after this many minutes (what is written is kept)'
+        type: string
+        default: '25'
+      dry_run:
+        description: 'Compute events and reported dates only; write nothing. The chart check still runs and may fail on a stale shadow'
+        type: boolean
+        default: false
+      environment:
+        description: 'Target environment'
+        type: choice
+        options: [staging, production]
+        default: staging
+
+# The SAME group as breach-r2.yml: the two never run at once.
+concurrency:
+  group: breach-r2-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Tests run with no environment, so nothing they install can reach a secret.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-ci.txt
+      - name: Unit tests
+        run: python -m pytest -q tests/test_breach_r2_incremental.py tests/test_breach_r2_events.py tests/test_breach_r2_reported.py tests/test_breach_r2_chart_check.py
+
+  r2:
+    needs: test
+    runs-on: ubuntu-latest
+    # r2_hourly stops starting steps at --deadline-min; this is the backstop.
+    timeout-minutes: 40
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Require the Jev key
+        working-directory: .
+        env:
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+        run: |
+          if [ -z "$TYPESAFE_API_KEY" ]; then
+            echo "::error::TYPESAFE_API_KEY is not set in the '${{ github.event.inputs.environment || 'staging' }}' environment; nothing was run."
+            exit 1
+          fi
+      - name: Mask database connection details
+        working-directory: .
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.parse
+          u = urllib.parse.urlsplit(os.environ.get("DATABASE_URL", ""))
+          for v in {u.hostname, u.username, u.password}:
+              if v:
+                  print(f"::add-mask::{v}")
+                  print(f"::add-mask::{urllib.parse.unquote(v)}")
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-run.txt
+
+      - name: R2 chain (events, reported, structured, combined, shadow rebuild)
+        id: chain
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+          MAX_USD: ${{ github.event.inputs.max_usd || '1.0' }}
+          COMBINED_MAX_USD: ${{ github.event.inputs.combined_max_usd || '1.0' }}
+          DEADLINE: ${{ github.event.inputs.deadline_min || '25' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          case "$DEADLINE" in ''|*[!0-9]*) echo "deadline_min must be a whole number"; exit 1;; esac
+          case "$MAX_USD$COMBINED_MAX_USD" in ''|*[!0-9.]*) echo "max_usd values must be numbers"; exit 1;; esac
+          FLAGS=""
+          [ "$DRY_RUN" = "true" ] && FLAGS="--dry-run"
+          # stdout is the same counts-only report; it is not echoed so the log stays minimal.
+          # Exit codes (r2_hourly): 1 a step failed, 2 deadline, 3 TypeSafe out of funds, 5 another run holds the lock.
+          python -m zdc_breach.r2_hourly --report r2-hourly-report.json --max-usd "$MAX_USD" \
+            --combined-max-usd "$COMBINED_MAX_USD" --deadline-min "$DEADLINE" $FLAGS > /dev/null
+
+      # Runs even when the chain failed: a failed chain AND stale data should both be visible. Read-only.
+      # Exit 0 ok, 1 fail (the step and the run go red), 2 warnings only (annotation, run stays green).
+      - name: Chart check
+        if: always() && steps.chain.conclusion != 'skipped'
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          set +e
+          python -m zdc_breach.r2_chart_check --report r2-chart-check.json > /dev/null
+          rc=$?
+          if [ "$rc" = "2" ]; then
+            echo "::warning::Breach chart check: warnings only (see the job summary)"
+            exit 0
+          fi
+          [ "$rc" != "0" ] && echo "::error::Breach chart check FAILED (see the job summary): the chart data is wrong or stale"
+          exit $rc
+
+      - name: Summary
+        if: always()
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          def load(p):
+              return json.load(open(p)) if os.path.exists(p) else None
+          r, c = load("r2-hourly-report.json"), load("r2-chart-check.json")
+          if r:
+              print(f"### Breach R2 chain (exit {r.get('exit_code')}, {r.get('seconds')} s{', dry run' if r.get('dry_run') else ''})\n")
+              if r.get("degraded"):
+                  print("> **DEGRADED: " + ", ".join(r["degraded"]) + ".**\n")
+              for name, s in (r.get("steps") or {}).items():
+                  rep = s.get("report") or {}
+                  extra = ""
+                  if name == "events":
+                      extra = f"{rep.get('new_events', 0)} new events, {rep.get('members_to_add', 0)} members to add, {rep.get('jev_usd', 0)} USD"
+                  elif name == "reported":
+                      extra = f"{rep.get('missing', 0)} events without a reported-date row"
+                  elif name == "shadow":
+                      extra = f"{rep.get('rows', 0)} rows"
+                  print(f"- {name}: {s.get('status')}{' (' + s['error'] + ')' if s.get('error') else ''} {extra}")
+          else:
+              print("No chain report: the run failed before writing one.")
+          if c:
+              print(f"\n### Chart check: {c.get('status').upper()} (exit {c.get('exit_code')})\n")
+              print(f"events={c.get('events')} undated={c.get('undated')} months={c.get('months')} last_month={c.get('last_month')} built_at={c.get('built_at')}\n")
+              print("| check | status | numbers |\n|---|---|---|")
+              for k in c.get("checks", []):
+                  nums = ", ".join(f"{a}={b}" for a, b in k.items() if a not in ("id", "status"))
+                  print(f"| {k['id']} | {k['status']} | {nums} |")
+          else:
+              print("\nNo chart check report.")
+          PY
+
+      # Counts only (see the header): safe to keep as a public artifact.
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: breach-r2-weekly-report-${{ github.run_id }}
+          path: |
+            pipeline/r2-hourly-report.json
+            pipeline/r2-chart-check.json
+          if-no-files-found: warn
+          retention-days: 14
