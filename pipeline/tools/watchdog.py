@@ -56,6 +56,23 @@ def collect(conn) -> list[dict]:
             for name, ok_at, any_at in cur.fetchall():
                 last_ok[f"{table}:{name}"] = (ok_at, any_at)
 
+        # 0195: some pipelines count only the modes that collect (netthreat: 'full'; a score-only
+        # re-run fetches nothing and must not reset the clock). Same rule as public.pipeline_health.
+        cur.execute("""select exists (select 1 from information_schema.columns where table_schema = 'core'
+                          and table_name = 'pipeline_expectations' and column_name = 'counted_modes')""")
+        has_counted = bool(cur.fetchone()[0])          # a database before 0195 counts every mode
+        if has_counted:
+            cur.execute("""select pipeline, runs_table, counted_modes from core.pipeline_expectations
+                            where counted_modes is not null""")
+        for name, table, modes in (cur.fetchall() if has_counted else []):
+            if table not in KNOWN_RUNS_TABLES:
+                continue
+            cur.execute(f"""select max(started_at) filter (where ok and mode = any(%s))
+                              from {table} where pipeline = %s""", (list(modes), name))   # noqa: S608
+            ok_at = cur.fetchone()[0]
+            any_at = last_ok.get(f"{table}:{name}", (None, None))[1]
+            last_ok[f"{table}:{name}"] = (ok_at, any_at)
+
         cur.execute("select now()")
         now = cur.fetchone()[0]
 

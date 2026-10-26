@@ -21,8 +21,9 @@ def ago(hours: float) -> datetime:
 class FakeConn:
     """Answers by which query was asked, never by call order."""
 
-    def __init__(self, expectations, runs):
+    def __init__(self, expectations, runs, counted=(), counted_ok=None):
         self.expectations, self.runs = expectations, runs
+        self.counted, self.counted_ok = list(counted), counted_ok
 
     def cursor(self):
         outer = self
@@ -31,8 +32,13 @@ class FakeConn:
             def __enter__(self): return self
             def __exit__(self, *a): return False
             def execute(self, sql, params=None): self._last = sql
-            def fetchone(self): return (NOW,)
+            def fetchone(self):
+                if "mode = any" in self._last:
+                    return (outer.counted_ok,)
+                return (NOW,)
             def fetchall(self):
+                if "counted_modes is not null" in self._last:
+                    return outer.counted
                 if "pipeline_expectations" in self._last:
                     return outer.expectations
                 for table, rows in outer.runs.items():
@@ -125,3 +131,19 @@ def test_database_size_states():                    # mutant: size never checked
     assert W.size_state(int(5.7e9), 6.5, 7.5) == "OK"
     assert W.size_state(int(6.6e9), 6.5, 7.5) == "LARGE"
     assert W.size_state(int(7.5e9), 6.5, 7.5) == "TOO LARGE"
+
+
+class TestCountedModes:
+    """0195: a score-only atlas re-run (mode incremental) is not a collection and must not reset the clock."""
+
+    def test_an_uncounted_mode_does_not_reset_the_clock(self):
+        rows = watchdog.collect(FakeConn(
+            [exp("netthreat", 200)], {"raw.pipeline_runs": [("netthreat", ago(2), ago(2))]},
+            counted=[("netthreat", "raw.pipeline_runs", ["full"])], counted_ok=ago(250)))
+        assert state_of(rows, "netthreat") == "OVERDUE"
+
+    def test_a_counted_mode_is_ok(self):
+        rows = watchdog.collect(FakeConn(
+            [exp("netthreat", 200)], {"raw.pipeline_runs": [("netthreat", ago(2), ago(2))]},
+            counted=[("netthreat", "raw.pipeline_runs", ["full"])], counted_ok=ago(30)))
+        assert state_of(rows, "netthreat") == "OK"
