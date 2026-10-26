@@ -90,6 +90,19 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python -m tools.watchdog
 
+      # The atlas's keys are used once a week, so a revoked or expiring key used to surface only
+      # when the Monday run failed. One quota-free request per key, daily; prints status codes and
+      # the Cloudflare token's expiry, never a key (audit 2026-10-26).
+      - name: Check the atlas's credentials still answer
+        if: always()
+        working-directory: pipeline
+        env:
+          CLOUDFLARE_RADAR_TOKEN: ${{ secrets.CLOUDFLARE_RADAR_TOKEN }}
+          CROWDSEC_CTI_API_KEY: ${{ secrets.CROWDSEC_CTI_API_KEY }}
+          VULNCHECK_API_TOKEN: ${{ secrets.VULNCHECK_API_TOKEN }}
+          SHODAN_API_KEY: ${{ secrets.SHODAN_API_KEY }}
+        run: python -m zdc_netthreat.probe
+
       # Written whether or not the check passed, so the record of an alarm survives the
       # failure that produced it.
       - name: Report

@@ -505,3 +505,46 @@ def test_a_week_not_yet_over_is_refused_before_any_connection(monkeypatch):
     monkeypatch.setattr(nrun, "utc_today", lambda: dt.date(2026, 10, 26))
     monkeypatch.delenv("DATABASE_URL", raising=False)
     assert nrun.main(["--week", "2026-10-26"]) == 2
+
+
+# ---- daily credential probe (audit 2026-10-26) ---------------------------------------------
+class _ProbeHttp:
+    def __init__(self, status=None, cf=None):
+        self.status, self.cf, self.calls = status or {}, cf or {"status": "active", "expires_on": "2027-10-21T00:00:00Z"}, []
+
+    def get(self, url, headers=None, params=None):
+        self.calls.append((url, headers, params))
+        now = dt.datetime(2026, 10, 26, tzinfo=dt.timezone.utc)
+        code = next((c for k, c in self.status.items() if k in url), 200)
+        body = json.dumps({"success": True, "result": self.cf}).encode() if "cloudflare" in url else b"{}"
+        return Response(url, code, body if code == 200 else None, None if code == 200 else f"HTTP {code}", now, now)
+
+
+ENV = {"CLOUDFLARE_RADAR_TOKEN": "t" * 40, "CROWDSEC_CTI_API_KEY": "c" * 40, "VULNCHECK_API_TOKEN": "v" * 40, "SHODAN_API_KEY": "s" * 32}
+
+
+def test_probe_all_keys_answer():
+    from zdc_netthreat import probe
+    rows = probe.probe(_ProbeHttp(), ENV, dt.date(2026, 10, 26))
+    assert [r["source"] for r in rows] == ["cloudflare", "crowdsec_cti", "vulncheck", "shodan"]
+    assert all(r["ok"] for r in rows) and "2027-10-21" in rows[0]["note"]
+
+
+def test_probe_flags_a_refused_key_a_missing_key_and_a_near_expiry():
+    from zdc_netthreat import probe
+    env = dict(ENV); del env["SHODAN_API_KEY"]
+    rows = {r["source"]: r for r in probe.probe(_ProbeHttp(status={"crowdsec": 403}), env, dt.date(2026, 10, 26))}
+    assert not rows["crowdsec_cti"]["ok"] and rows["crowdsec_cti"]["status"] == 403
+    assert not rows["shodan"]["ok"] and rows["shodan"]["note"] == "key not set"
+    soon = probe.probe(_ProbeHttp(cf={"status": "active", "expires_on": "2026-11-10T00:00:00Z"}), ENV, dt.date(2026, 10, 26))
+    assert not soon[0]["ok"] and "15 days" in soon[0]["note"]
+
+
+def test_probe_never_prints_a_key(capsys, monkeypatch):
+    from zdc_netthreat import probe
+    monkeypatch.setattr(probe, "Http", lambda *a, **k: _ProbeHttp())
+    for k, v in ENV.items():
+        monkeypatch.setenv(k, v)
+    assert probe.main() == 0
+    out = capsys.readouterr().out
+    assert not any(v in out for v in ENV.values())
