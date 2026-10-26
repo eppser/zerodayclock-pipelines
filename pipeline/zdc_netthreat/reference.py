@@ -49,11 +49,24 @@ def latest_org_file(index_html: str) -> str:
     return files[-1]
 
 
+# RFC 5737 documentation /24s and 192.0.0/24 (IETF protocol assignments), as /24 indexes; mirrors
+# src/lib/address-map.ts reserved24 (audit round 2, 2026-10-14).
+SPECIAL_24 = ((192 << 16) | 0, (192 << 16) | 2, (198 << 16) | (51 << 8) | 100, (203 << 16) | 113)   # 192.0.0, 192.0.2, 198.51.100, 203.0.113
+
+
+def reserved16(b16: int) -> bool:
+    """Special-purpose space at /16 grain (mirrors src/lib/address-map.ts reserved16): never routed
+    on the internet, so an announcement there is a bogon and is left off the map."""
+    o1, o2 = b16 >> 8, b16 & 255
+    return (o1 in (0, 10, 127) or o1 >= 224 or (o1 == 100 and 64 <= o2 < 128) or (o1 == 169 and o2 == 254)
+            or (o1 == 172 and 16 <= o2 < 32) or (o1 == 192 and o2 == 168) or (o1 == 198 and o2 in (18, 19)))
+
+
 class Routing:
     """/24 -> origin AS lookup over the whole IPv4 space (2^24 slots, 64 MB)."""
 
     def __init__(self, gz_bytes: bytes):
-        pf = []
+        pf, moas = [], {}
         with gzip.open(io.BytesIO(gz_bytes), "rt") as fh:
             for line in fh:
                 parts = line.split("\t")
@@ -63,12 +76,15 @@ class Routing:
                 ln = int(ln)
                 if ln > 24 or ln < 8:
                     continue
-                first = re.split(r"[_,]", origin.strip())[0]
-                if not first.isdigit():
+                origins = [x for x in re.split(r"[_,]", origin.strip()) if x.isdigit()]
+                if not origins:
                     continue
                 o = list(map(int, ip.split(".")))
-                pf.append(((o[0] << 16) | (o[1] << 8) | o[2], ln, int(first)))
+                pf.append(((o[0] << 16) | (o[1] << 8) | o[2], ln, int(origins[0])))
+                if len(origins) > 1:                   # MOAS: every origin, in CAIDA's order
+                    moas.setdefault(((o[0] << 16) | (o[1] << 8) | o[2], ln), tuple(dict.fromkeys(map(int, origins))))
         pf.sort(key=lambda x: x[1])                 # shorter first: longer overwrite
+        self._pf, self._moas = pf, moas
         self.s24 = array.array("I", [0]) * (1 << 24)
         for start, ln, a in pf:
             n = 1 << (24 - ln)
@@ -80,6 +96,43 @@ class Routing:
         self.size24 = collections.Counter(self.s24)
         self.size24.pop(0, None)
         self.rows = len(pf)
+
+    def runs(self) -> list[tuple[int, int, int, int, tuple[int, ...]]]:
+        """The routing table at its own grain: contiguous /24s with one origin set and one covering
+        prefix length, split at every /16 boundary, as (first /24 index, last /24 index, first
+        origin AS, covering prefix length, other origins). A /24 index is an IPv4 address shifted
+        right by 8, so nothing finer than a /24 can be stored. Left out: unrouted space, and
+        announcements inside special-purpose space (bogons; audit 2026-10-14: 100.123.81.0/24).
+        Co-announced (MOAS) prefixes keep every origin; the first is CAIDA's first."""
+        import numpy as np
+        sets: dict[tuple[int, ...], int] = {}
+        oid = np.zeros(1 << 24, dtype=np.uint32)
+        plen = np.zeros(1 << 24, dtype=np.uint8)
+        for start, ln, a in self._pf:                # shortest first: the most specific wins
+            key = self._moas.get((start, ln), (a,))
+            k = sets.setdefault(key, len(sets) + 1)
+            n = 1 << (24 - ln)
+            oid[start:start + n] = k
+            plen[start:start + n] = ln
+        for o in SPECIAL_24:                         # special-purpose /24s inside ordinary /16s are bogons too
+            oid[o] = 0
+        start_ = np.empty(oid.size, dtype=bool)
+        start_[0] = True
+        start_[1:] = (oid[1:] != oid[:-1]) | (plen[1:] != plen[:-1])
+        start_[::256] = True                         # a run never crosses a /16
+        starts = np.flatnonzero(start_)
+        ends = np.empty_like(starts)
+        ends[:-1] = starts[1:] - 1
+        ends[-1] = oid.size - 1
+        ids, lens = oid[starts], plen[starts]
+        by_id = {v: k for k, v in sets.items()}
+        out = []
+        for lo, hi, k, ln in zip(starts.tolist(), ends.tolist(), ids.tolist(), lens.tolist()):
+            if k == 0 or reserved16(lo >> 8):
+                continue
+            origins = by_id[k]
+            out.append((lo, hi, origins[0], ln, origins[1:]))
+        return out
 
     def asn(self, ip: str) -> int:
         """Origin AS for a dotted-quad IPv4 address; 0 if unrouted or not IPv4."""

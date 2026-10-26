@@ -18,6 +18,10 @@ FLOORS = {"crowdsec": 10_000, "dshield": 5_000, "blocklist_de": 5_000, "cins": 5
           "tor_exits": 300, "cloudflare": 1_000, "shadowserver_country": 1_000}
 REQUIRED = ("crowdsec", "dshield", "blocklist_de", "cins", "vulncheck", "threatfox", "urlhaus",
             "phishing_db", "cloudflare")
+#: Sources read as a snapshot of the moment the run fetches them (a trailing window: CrowdSec
+#: since=7d, blocklist.de and ThreatFox 48 h, the others "current"), not bounded by the scored week.
+#: VulnCheck, Cloudflare and Shadowserver are asked for the week's own dates and are not listed.
+SNAPSHOT = ("crowdsec", "dshield", "blocklist_de", "cins", "threatfox", "urlhaus", "phishing_db", "shodan")
 IP_RX = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
 
 
@@ -413,3 +417,64 @@ def check_v2_forward(conn, method_version: str = "v2") -> EvalResult:
                     for w, s, n, a, sp, k in last)
     return EvalResult("v2_forward", INFO, True, f"{len(rows)//2} week pair(s); latest: {txt}" + ("" if len(rows) >= 14 else " (credible at 8 weeks)"),
                       {"pairs": [[str(w), s, n, a, sp, k] for w, s, n, a, sp, k in rows]})
+
+
+def check_netblock(conn, week_start, method_version: str = "v2") -> EvalResult:
+    """The netblock map (0112) must add up: its routed /24s equal the routing file's, and its listed
+    /24s equal the routed size of the listed networks. WARN: the map is a view, the scores stand."""
+    with conn.cursor() as cur:
+        cur.execute("select to_regclass('net_derived.netblock_v2') is not null")
+        if not cur.fetchone()[0]:
+            return EvalResult("netblock", INFO, True, "netblock map not in this schema", {})
+        cur.execute("""select coalesce(sum(routed24), 0), coalesce(sum(listed24), 0), count(*), max(routing_file)
+                         from net_derived.netblock_v2 where week_start = %s and method_version = %s""", (week_start, method_version))
+        routed, listed, cells, f = cur.fetchone()
+        if not cells:
+            return EvalResult("netblock", WARN, False, "no netblock map written this week", {})
+        cur.execute("select routed24 from net_core.routing_files where routing_file = %s", (f,))
+        r = cur.fetchone()
+        # any origin listed (MOAS runs count once), the same rule the map uses
+        cur.execute("""select coalesce(sum(hi24 - lo24 + 1), 0) from net_core.routed_runs r
+                        where r.routing_file = %s
+                          and exists (select 1 from net_derived.network_scores_v2 s
+                                       where s.week_start = %s and s.method_version = %s and s.listed
+                                         and s.asn = any(array[r.asn] || coalesce(r.moas, '{}'::bigint[])))""",
+                    (f, week_start, method_version))
+        want_listed = cur.fetchone()[0]
+    ok = r is not None and r[0] == routed and want_listed == listed
+    return EvalResult("netblock", WARN, ok,
+                      f"{cells:,} routed /16s, {routed:,} /24s, {listed:,} in listed networks" if ok
+                      else f"map does not add up: routed {routed:,} vs file {r[0] if r else None}, listed {listed:,} vs {want_listed:,}",
+                      {"cells": cells, "routed24": routed, "listed24": listed})
+
+
+# ---- collection timing (audit 2026-10-26) ----------------------------------------------------
+def check_collection_lag(lags: dict[str, float], warn_h: float = 24, block_h: float = 48) -> EvalResult:
+    """Hours between the end of the scored week and the fetch of each snapshot source. The week
+    labelled 2026-10-12 was fetched on 2026-10-21: blocklist.de's 48 hours lay wholly in the next
+    week and CrowdSec's 7 days overlapped the labelled week by 4.6, yet every gate passed. A fetch
+    more than `block_h` hours after the week ends scores mostly other days: ERROR, so the week is
+    served as provisional. Over `warn_h` (a Tuesday retry) is shown."""
+    late = {s: round(h, 1) for s, h in lags.items() if s in SNAPSHOT and h > warn_h}
+    worst = max((lags[s] for s in lags if s in SNAPSHOT), default=None)
+    if worst is None:
+        return EvalResult("collection_lag", WARN, False, "no snapshot fetch recorded for this week", {})
+    blocked = {s: h for s, h in late.items() if h > block_h}
+    if blocked:
+        return EvalResult("collection_lag", ERROR, False,
+                          f"fetched {max(blocked.values()):.0f} h after the week ended (limit {block_h:.0f} h): "
+                          + ", ".join(sorted(blocked)) + " cover mostly later days", {"late": late})
+    return EvalResult("collection_lag", WARN, not late,
+                      f"snapshot sources fetched within {worst:.0f} h of the week's end" if not late
+                      else "fetched late: " + ", ".join(f"{s} {h:.0f} h" for s, h in sorted(late.items())),
+                      {"late": late, "worst_h": round(worst, 1)})
+
+
+def check_feeds_changed(unchanged: list[str]) -> EvalResult:
+    """A scored feed whose content is byte-identical to the previous week's has stopped updating
+    upstream (Phishing.Database's IP list last changed 2026-09-26 and was scored for two more weeks
+    as if fresh). WARN: the counts are real but old, and the feed's owner needs telling."""
+    return EvalResult("feeds_changed", WARN, not unchanged,
+                      "every scored feed changed since the previous week" if not unchanged
+                      else "unchanged since the previous week (stale upstream?): " + ", ".join(sorted(unchanged)),
+                      {"unchanged": sorted(unchanged)})

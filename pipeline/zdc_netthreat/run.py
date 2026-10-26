@@ -44,6 +44,11 @@ SECRET_ENVS = ("CROWDSEC_CTI_API_KEY", "VULNCHECK_API_TOKEN", "SHODAN_API_KEY",
 EXCLUDE_RESEARCH = {"crowdsec", "dshield", "blocklist_de", "cins"}
 
 
+def utc_today() -> dt.date:
+    """Today in UTC; a function so tests can move the clock."""
+    return dt.datetime.now(dt.timezone.utc).date()
+
+
 def last_complete_week(today: dt.date) -> dt.date:
     """Monday of the ISO week that ended before `today`."""
     return today - dt.timedelta(days=today.isoweekday() - 1 + 7)
@@ -103,6 +108,8 @@ def collect(conn, run_id, week: dt.date, http: Http, secrets: dict, wanted: list
     db.insert_reference(conn, fid, "pfx2as", path, routing.rows)
     # Every routed network's size, for the v2 fit (silent networks are its zeros) and for score-only re-runs.
     report["routed_sizes"] = db.insert_routed_sizes(conn, fid, routing.size24)
+    # The same table at /24 grain, for the IP lookup and the netblock map (0112). Public routing data.
+    report["routed_runs"] = db.store_routed_runs(conn, path, routing.runs())
     ref["routing_fetch"] = fid
     idx = http.get(reference.ORG_INDEX)
     org_file = reference.latest_org_file(idx.body.decode()) if idx.ok else None
@@ -323,6 +330,7 @@ def score(conn, week: dt.date, report: dict, http: Http | None = None, run_id: s
     # Every routed network's size first, in its own transaction: a refetch for a pre-0102 week is
     # stored before any derived row is touched, so v1 and v2 still land together or not at all.
     size24, size_note = ensure_routed_sizes(conn, week, http, run_id, write)
+    routing_file = ensure_routed_runs(conn, week, http, write)
     fetches = db.latest_fetches(conn, week)
     counts = db.counts_for(conn, list(fetches.values()))
     nets = db.networks(conn)
@@ -424,6 +432,8 @@ def score(conn, week: dt.date, report: dict, http: Http | None = None, run_id: s
     v2 = score_v2_week(conn, week, counts, nets, total_routed, universe, size24, size_note)
     if write:
         db.replace_week_v2(conn, week, METHOD_V2, v2["rows"], v2["fits"])
+        if routing_file:
+            report["netblock"] = {"cells": db.replace_netblock_v2(conn, week, METHOD_V2, routing_file), "routing_file": routing_file}
         conn.commit()
     else:
         conn.rollback()
@@ -477,6 +487,32 @@ def ensure_routed_sizes(conn, week: dt.date, http: Http | None, run_id: str | No
     return size24, "refetched:" + routing_file
 
 
+def ensure_routed_runs(conn, week: dt.date, http: Http | None, write: bool) -> str | None:
+    """The week's routing table as /24 runs (0112). Stored by collect; a week collected before 0112
+    refetches its routing file by name from CAIDA (public, read-only) once. None when the week has
+    no routing file or the schema predates 0112; the scores do not depend on it."""
+    with conn.cursor() as cur:
+        cur.execute("select to_regclass('net_core.routed_runs') is not null and to_regclass('net_derived.netblock_v2') is not null")
+        if not cur.fetchone()[0]:
+            log.warning("netblock: migration 0112 not applied; map skipped")
+            return None
+    routing_file = db.week_routing_file(conn, week)
+    if not routing_file:
+        return None
+    if db.routed_runs_stored(conn, routing_file):
+        return routing_file
+    if http is None or not write:
+        return None
+    r = http.get(reference.PFX_BASE + routing_file)
+    if not r.ok:
+        log.warning("netblock: routing file %s unavailable (%s); map skipped", routing_file, r.error)
+        return None
+    n = db.store_routed_runs(conn, routing_file, reference.Routing(r.body).runs())
+    conn.commit()
+    log.info("netblock: %d runs stored from %s", n, routing_file)
+    return routing_file
+
+
 def score_v2_week(conn, week: dt.date, counts: dict, nets: dict, total_routed: int, universe: list[int],
                   size24: dict[int, int], size_note: str) -> dict:
     """Gather the rest of v2's inputs from the stored week and fit both sides."""
@@ -512,6 +548,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--sources", default=",".join(sources.ALL))
     ap.add_argument("--score-only", action="store_true")
     ap.add_argument("--no-write", action="store_true", help="fit and run the gates, write no derived rows (implies --score-only)")
+    ap.add_argument("--skip-if-collected", action="store_true",
+                    help="exit 0 without a run row when the week already has a successful full collection (the Tuesday retry)")
     ap.add_argument("--abuse-limit", type=int, default=500)
     ap.add_argument("--trigger", default=os.environ.get("GITHUB_EVENT_NAME", "manual"))
     ap.add_argument("--report")
@@ -531,15 +569,27 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError(f"killed by {signal.Signals(signum).name} (job timeout or cancel?)")
     signal.signal(signal.SIGTERM, _killed)
     signal.signal(signal.SIGINT, _killed)
-    week = dt.date.fromisoformat(args.week) if args.week else last_complete_week(dt.datetime.now(dt.timezone.utc).date())
+    week = dt.date.fromisoformat(args.week) if args.week else last_complete_week(utc_today())
     if week.isoweekday() != 1:
         log.error("--week must be a Monday, got %s", week)
+        return 2
+    if week + dt.timedelta(days=7) > utc_today():
+        # a week not yet over would be stored as the newest week and served (audit 2026-10-26)
+        log.error("--week %s has not ended yet", week)
         return 2
     secrets = {k: os.environ.get(k, "") for k in SECRET_ENVS}
     wanted = [s.strip() for s in args.sources.split(",") if s.strip()]
     report: dict = {"pipeline": PIPELINE, "week": week.isoformat(), "method": METHOD,
                     "started_at": dt.datetime.now(dt.timezone.utc).isoformat()}
     conn = psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=60)
+    if args.skip_if_collected and not args.score_only and db.week_collected(conn, week):
+        log.info("week %s already has a successful collection; nothing to retry", week)
+        conn.close()
+        return 0
+    closed = db.close_abandoned_runs(conn)
+    if closed:
+        log.warning("closed %d abandoned run row(s)", closed)
+    conn.commit()
     run_id = runs_db.start_run(conn, PIPELINE, "incremental" if args.score_only else "full", args.trigger,
                                os.environ.get("GITHUB_SHA"))
     conn.commit()
@@ -569,6 +619,12 @@ def main(argv: list[str] | None = None) -> int:
             # are re-applied to what the week's fetches recorded.
             status, volumes = db.week_fetch_status(conn, week)
             results += [evals.check_sources_answered(status), evals.check_volume_floors(volumes, status)]
+        # when the week's snapshot sources were really read, and whether any stopped changing; both
+        # judged on the fetches the scores use, so a score-only rebuild answers for them too
+        lags = db.week_collection_lag(conn, week)
+        report["collection_lag_h"] = {k: round(v, 1) for k, v in lags.items()}
+        results += [evals.check_collection_lag(lags),
+                    evals.check_feeds_changed(db.feeds_unchanged(conn, week, sources.IP_SCORED))]
         sc = score(conn, week, report, http=Http(pause=1.0), run_id=run_id, write=not args.no_write)
         v2s = sc["v2"]["summary"]
         results += [evals.check_model_sane(sc["fit"].prevalence, dict(zip(sc["groups"], sc["fit"].hit_rate))),
@@ -585,6 +641,7 @@ def main(argv: list[str] | None = None) -> int:
                     evals.check_v2_checks_drift(v2s, (prev_fits or {}).get("attack", {}).get("checks") if prev_fits else None)]
         if not args.no_write:
             results.append(evals.check_v2_forward(conn, METHOD_V2))
+            results.append(evals.check_netblock(conn, week, METHOD_V2))
         if not args.no_write:
             results += [evals.check_week_replaced(conn, week, METHOD), evals.check_v2_week_replaced(conn, week, METHOD_V2)]
         report["checks"] = [{"name": r.name, "severity": r.severity, "passed": r.passed, "summary": r.summary} for r in results]

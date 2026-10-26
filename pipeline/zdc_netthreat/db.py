@@ -339,3 +339,131 @@ def previous_week_v2(conn, week_start: dt.date, method_version: str, max_gap_day
                     (method_version, base))
         rows = {(a, s): (lo, l) for a, s, lo, l in cur.fetchall()}
     return fits, rows
+
+
+# ---- routing runs and the netblock map (0112) -------------------------------------------------
+def week_routing_file(conn, week_start: dt.date) -> str | None:
+    """The routing file the week was mapped with (its newest ok routing fetch, collect or refetch)."""
+    with conn.cursor() as cur:
+        cur.execute("""select notes->>'file' from net_raw.fetches
+                        where week_start = %s and source_id = 'reference' and ok
+                          and notes->>'kind' in ('pfx2as', 'pfx2as_refetch')
+                        order by finished_at desc limit 1""", (week_start,))
+        r = cur.fetchone()
+    return r[0] if r else None
+
+
+def routed_runs_stored(conn, routing_file: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("select 1 from net_core.routing_files where routing_file = %s", (routing_file,))
+        return cur.fetchone() is not None
+
+
+def store_routed_runs(conn, routing_file: str, runs: list[tuple], keep: int = 2, chunk: int = 100_000) -> int:
+    """The routing table as /24 runs (lo24, hi24, first origin, covering prefix length, other
+    origins), for the IP lookup and the netblock map. Replaces the file's runs if present, then keeps
+    the newest `keep` files plus the file the latest mapped week points to, so a lookup never loses
+    its routing (audit 2026-10-14). Inserted as arrays in chunks through the pooler."""
+    with conn.cursor() as cur:
+        cur.execute("delete from net_core.routed_runs where routing_file = %s", (routing_file,))
+        cur.execute("delete from net_core.routing_files where routing_file = %s", (routing_file,))
+        for i in range(0, len(runs), chunk):
+            part = runs[i:i + chunk]
+            cur.execute("""insert into net_core.routed_runs (routing_file, lo24, hi24, asn, plen, moas)
+                           select %s, lo, hi, a, ln, nullif(string_to_array(m, ','), '{}')::bigint[]
+                             from unnest(%s::int[], %s::int[], %s::bigint[], %s::smallint[], %s::text[]) as t(lo, hi, a, ln, m)""",
+                        (routing_file, [r[0] for r in part], [r[1] for r in part], [r[2] for r in part],
+                         [r[3] if len(r) > 3 else None for r in part], [",".join(map(str, r[4])) if len(r) > 4 and r[4] else "" for r in part]))
+        cur.execute("insert into net_core.routing_files (routing_file, runs, routed24) values (%s, %s, %s)",
+                    (routing_file, len(runs), sum(r[1] - r[0] + 1 for r in runs)))
+        keepers = """(select routing_file from net_core.routing_files order by stored_at desc, routing_file desc limit %(k)s)
+                     union (select routing_file from net_derived.netblock_v2
+                             where week_start = (select max(week_start) from net_derived.netblock_v2))"""
+        cur.execute(f"delete from net_core.routed_runs where routing_file not in ({keepers})", {"k": keep})
+        cur.execute(f"delete from net_core.routing_files where routing_file not in ({keepers})", {"k": keep})
+    return len(runs)
+
+
+def replace_netblock_v2(conn, week_start: dt.date, method_version: str, routing_file: str) -> int:
+    """Every routed /16 for the week: routed /24s, the dominant origin network, and how many of its
+    /24s belong to networks listed for attacks, listed for hosting, listed either way, or over the
+    10x bar without being listed. A /24 takes the band of the network that announces it; nothing
+    here is evidence seen in that block. Replaces the week."""
+    with conn.cursor() as cur:
+        cur.execute("delete from net_derived.netblock_v2 where week_start = %s and method_version = %s", (week_start, method_version))
+        # A co-announced (MOAS) run counts as listed when ANY of its origins is listed, and as
+        # scored when any is reported (audit 2026-10-14: the first-origin rule decided listing
+        # inside Google's space); the dominant network is still the first origin.
+        cur.execute("""
+            with r as (select lo24, lo24 >> 8 as b16, asn, coalesce(moas, '{}'::bigint[]) as moas, (hi24 - lo24 + 1)::int as n
+                         from net_core.routed_runs where routing_file = %(f)s),
+                 s as (select asn, bool_or(side = 'attack' and listed) as la, bool_or(side = 'host' and listed) as lh, max(band) as band
+                         from net_derived.network_scores_v2 where week_start = %(w)s and method_version = %(v)s group by asn),
+                 o as (select r.lo24, unnest(array[r.asn] || r.moas) as origin from r),
+                 f as (select o.lo24, bool_or(s.la) as la, bool_or(s.lh) as lh, max(s.band) as band
+                         from o join s on s.asn = o.origin group by o.lo24),
+                 rf as (select r.b16, r.asn, r.n, coalesce(f.la, false) as la, coalesce(f.lh, false) as lh, f.band, f.lo24 is not null as scored
+                          from r left join f using (lo24)),
+                 d as (select distinct on (b16) b16, asn as dom_asn, n as dom24
+                         from (select b16, asn, sum(n)::int as n from rf group by 1, 2) x order by b16, n desc, asn)
+            insert into net_derived.netblock_v2 (week_start, method_version, b16, routed24, dom_asn, dom24,
+                                                 attack24, host24, listed24, bar24, scored24, routing_file)
+            select %(w)s, %(v)s, rf.b16, sum(rf.n), d.dom_asn, d.dom24,
+                   coalesce(sum(rf.n) filter (where rf.la), 0), coalesce(sum(rf.n) filter (where rf.lh), 0),
+                   coalesce(sum(rf.n) filter (where rf.la or rf.lh), 0),
+                   coalesce(sum(rf.n) filter (where rf.band >= 1 and not (rf.la or rf.lh)), 0),
+                   coalesce(sum(rf.n) filter (where rf.scored), 0), %(f)s
+              from rf join d using (b16)
+             group by rf.b16, d.dom_asn, d.dom24""", {"f": routing_file, "w": week_start, "v": method_version})
+        return cur.rowcount
+
+
+def week_collection_lag(conn, week_start: dt.date) -> dict[str, float]:
+    """Hours from the end of the week (the following Monday 00:00 UTC) to the request of each
+    source's newest successful fetch for it: the fetch the scores actually use."""
+    with conn.cursor() as cur:
+        cur.execute("""select distinct on (source_id) source_id,
+                              extract(epoch from requested_at - ((%s::date + 7)::timestamp at time zone 'UTC')) / 3600.0
+                         from net_raw.fetches where week_start = %s and ok and source_id <> 'reference'
+                        order by source_id, finished_at desc""", (week_start, week_start))
+        return {sid: float(h) for sid, h in cur.fetchall()}
+
+
+def feeds_unchanged(conn, week_start: dt.date, sources: tuple[str, ...]) -> list[str]:
+    """Sources whose newest ok fetch for this week has the same content hash as their newest ok
+    fetch for the previous collected week."""
+    with conn.cursor() as cur:
+        cur.execute("""with cur as (select distinct on (source_id) source_id, content_sha256 from net_raw.fetches
+                                     where week_start = %s and ok and source_id = any(%s)
+                                     order by source_id, finished_at desc),
+                            prev as (select distinct on (source_id) source_id, content_sha256 from net_raw.fetches
+                                      where week_start = (select max(week_start) from net_raw.fetches
+                                                           where week_start < %s and ok)
+                                        and ok and source_id = any(%s)
+                                      order by source_id, finished_at desc)
+                       select cur.source_id from cur join prev using (source_id)
+                        where cur.content_sha256 is not null and cur.content_sha256 = prev.content_sha256""",
+                    (week_start, list(sources), week_start, list(sources)))
+        return [r[0] for r in cur.fetchall()]
+
+
+def week_collected(conn, week_start: dt.date) -> bool:
+    """True when a successful full collection already exists for the week (the Tuesday retry
+    then has nothing to do)."""
+    with conn.cursor() as cur:
+        cur.execute("""select exists (select 1 from raw.pipeline_runs r
+                                       where r.pipeline = 'netthreat' and r.mode = 'full' and r.ok
+                                         and exists (select 1 from net_raw.fetches f
+                                                      where f.run_id = r.run_id and f.week_start = %s))""", (week_start,))
+        return bool(cur.fetchone()[0])
+
+
+def close_abandoned_runs(conn, older_than_hours: int = 3) -> int:
+    """Run rows a killed runner never closed (two from 2026-10-12 stayed open). The job's hard
+    limit is 2 h, so an open row older than 3 h cannot belong to a live run."""
+    with conn.cursor() as cur:
+        cur.execute("""update raw.pipeline_runs set finished_at = now(), ok = false,
+                              error = coalesce(error, 'never closed: runner killed or lost')
+                        where pipeline = 'netthreat' and finished_at is null
+                          and started_at < now() - make_interval(hours => %s)""", (older_than_hours,))
+        return cur.rowcount

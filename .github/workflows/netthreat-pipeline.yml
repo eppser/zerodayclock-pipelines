@@ -1,6 +1,6 @@
 name: Network threat atlas pipeline
 
-# Weekly, Mondays 06:30 UTC: collects every source at its native window for the ISO week
+# Weekly, Mondays 06:30 UTC (retried Tuesdays when Monday did not collect): collects every source at its native window for the ISO week
 # that just ended, then scores that week (migration 0094, ADR 0006). Runs in the PUBLIC
 # pipelines repository (owner decision 2026-10-14, after a security review): the inputs are
 # licensed feeds (CrowdSec Enterprise, VulnCheck, Shodan), so the run logs, the summary and the
@@ -16,6 +16,11 @@ name: Network threat atlas pipeline
 on:
   schedule:
     - cron: '30 6 * * 1'
+    # Tuesday retry (audit 2026-10-26): the 2026-10-19 Monday run failed and nothing re-ran it until
+    # a dispatch on Wednesday, by which time the week's 48-hour feeds had rolled past it. The retry
+    # exits at once when Monday collected the week (--skip-if-collected); a run later still is served
+    # provisional by the collection_lag gate, never as a clean week scored from the wrong days.
+    - cron: '30 6 * * 2'
   # GitHub runs `schedule` and `workflow_dispatch` only for workflows on the default branch.
   # Until this file is on main, a push to staging that touches the pipeline runs it against
   # staging, so the staging page can be filled without a production change.
@@ -92,6 +97,7 @@ jobs:
         run: |
           set -euo pipefail
           args=(--trigger "${{ github.event_name }}" --report netthreat-report.json)
+          if [ "${{ github.event_name }}" = "schedule" ]; then args+=(--skip-if-collected); fi
           if [ -n "${WEEK:-}" ]; then args+=(--week "$WEEK"); fi
           if [ "${SCORE_ONLY:-false}" = "true" ]; then args+=(--score-only); fi
           # 115 minutes inside a 120-minute job: a TERM from a parent we control reaches Python (and
