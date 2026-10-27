@@ -14,7 +14,6 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import gzip
-import zlib
 import io
 import json
 import logging
@@ -24,7 +23,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
-from .client import Http, Response
+from .client import Http, Response, gunzip_capped
 
 log = logging.getLogger("zdc_netthreat")
 
@@ -396,9 +395,8 @@ def spamhaus_drop(http: Http, ctx: SourceContext) -> SourceResult:
 def _gunzip_capped(data: bytes, cap: int = 512 * 1024 ** 2) -> bytes:
     """gzip.decompress with an output ceiling: the list is fetched over plain http (the mirror offers no https), so
     anyone on the path could hand the runner a decompression bomb (security review 2026-10-26)."""
-    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
-    out = d.decompress(data, cap + 1)
-    if len(out) > cap or d.unconsumed_tail:
+    out = gunzip_capped(data, cap)
+    if out is None:
         raise ValueError(f"uceprotect list inflates past {cap:,} bytes")
     return out
 

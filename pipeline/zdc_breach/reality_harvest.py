@@ -190,20 +190,36 @@ class _PublicHTTPSConnection(http.client.HTTPSConnection):
         self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
 
 
+def _is_public(addr):
+    """A global unicast address, and not an IPv4 address smuggled inside IPv6 (::ffff:127.0.0.1, ::127.0.0.1,
+    64:ff9b::7f00:1 - Python reports the last two as global)."""
+    ip = ipaddress.ip_address(addr.split('%')[0])
+    if ip.version == 6:
+        inner = ip.ipv4_mapped or ip.sixtofour
+        if inner is None and int(ip) >> 32 == 0:
+            inner = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)            # IPv4-compatible ::a.b.c.d
+        if inner is None and ip in ipaddress.ip_network('64:ff9b::/96'):
+            inner = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)            # NAT64
+        if inner is not None and not inner.is_global:
+            return False
+    return ip.is_global
+
+
 def _public_socket(host, port, timeout):
     infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    addrs = [i[4][0] for i in infos]
-    if not addrs or not all(ipaddress.ip_address(a.split('%')[0]).is_global for a in addrs):
+    if not infos or not all(_is_public(i[4][0]) for i in infos):
         raise OSError(f'refused non-public address for {host}')
-    fam, typ, proto, _, sa = infos[0]
-    s = socket.socket(fam, typ, proto)
-    s.settimeout(timeout if isinstance(timeout, (int, float)) else None)
-    try:
-        s.connect(sa)
-    except Exception:
-        s.close()
-        raise
-    return s
+    err = None
+    for fam, typ, proto, _, sa in infos:                                  # every vetted address in turn, as before
+        s = socket.socket(fam, typ, proto)
+        s.settimeout(timeout if isinstance(timeout, (int, float)) else None)
+        try:
+            s.connect(sa)
+            return s
+        except OSError as e:
+            err = e
+            s.close()
+    raise err or OSError(f'no address for {host}')
 
 
 class _PublicHTTPHandler(urllib.request.HTTPHandler):
@@ -228,7 +244,11 @@ class _WebOnlyRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-_PUBLIC_WEB = urllib.request.build_opener(_PublicHTTPHandler, _PublicHTTPSHandler, _WebOnlyRedirect)
+# No ProxyHandler: a proxy from the environment would connect to the target instead of us, past the address check.
+_PUBLIC_WEB = urllib.request.OpenerDirector()
+for _h in (_PublicHTTPHandler(), _PublicHTTPSHandler(), _WebOnlyRedirect(), urllib.request.HTTPErrorProcessor(),
+           urllib.request.HTTPDefaultErrorHandler(), urllib.request.UnknownHandler()):
+    _PUBLIC_WEB.add_handler(_h)
 
 
 def fetch_home(h):
@@ -343,7 +363,7 @@ def tls_subject(host):
     for h in (host, 'www.' + host):
         try:
             ctx = ssl.create_default_context()
-            with socket.create_connection((h, 443), timeout=8) as s:
+            with _public_socket(h, 443, 8) as s:
                 with ctx.wrap_socket(s, server_hostname=h) as t:
                     c = t.getpeercert()
             subj = {k: v for x in c.get('subject', ()) for k, v in x}

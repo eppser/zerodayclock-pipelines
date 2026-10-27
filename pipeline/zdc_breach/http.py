@@ -65,12 +65,19 @@ _OPENER = urllib.request.build_opener(_HttpsOnly)
 def gunzip_capped(data: bytes, cap: int) -> bytes | None:
     """gzip.decompress with a ceiling on the OUTPUT. max_bytes bounded what was read, not what it inflates to: a few
     MB of gzip from a hostile source can become tens of GB and kill the runner (security review 2026-10-26).
-    None when the output passes `cap`."""
-    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
-    out = d.decompress(data, cap + 1)
-    if len(out) > cap or d.unconsumed_tail:
-        return None
-    return out
+    None when the output passes `cap`; EOFError when the stream is truncated, as gzip.decompress."""
+    out = bytearray()
+    while data:
+        d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        out += d.decompress(data, cap + 1 - len(out))
+        if len(out) > cap or d.unconsumed_tail:
+            return None
+        if not d.eof:
+            raise EOFError("truncated gzip stream")
+        # A gzip file may hold several members back to back (gzip.decompress reads them all); padding after the
+        # last one is ignored, as gzip does.
+        data = d.unused_data if d.unused_data[:2] == b"\x1f\x8b" else b""
+    return bytes(out)
 
 
 def get(url: str, *, timeout: int = 60, retries: int = 2, sleep=time.sleep,
