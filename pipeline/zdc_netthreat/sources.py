@@ -23,7 +23,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
-from .client import Http, Response
+from .client import Http, Response, gunzip_capped
 
 log = logging.getLogger("zdc_netthreat")
 
@@ -392,6 +392,15 @@ def spamhaus_drop(http: Http, ctx: SourceContext) -> SourceResult:
     return res
 
 
+def _gunzip_capped(data: bytes, cap: int = 512 * 1024 ** 2) -> bytes:
+    """gzip.decompress with an output ceiling: the list is fetched over plain http (the mirror offers no https), so
+    anyone on the path could hand the runner a decompression bomb (security review 2026-10-26)."""
+    out = gunzip_capped(data, cap)
+    if out is None:
+        raise ValueError(f"uceprotect list inflates past {cap:,} bytes")
+    return out
+
+
 def uceprotect_l3(http: Http, ctx: SourceContext) -> SourceResult:
     r = http.get("http://wget-mirrors.uceprotect.net/rbldnsd-all/dnsbl-3.uceprotect.net.gz")
     res = SourceResult("uceprotect_l3", [r])
@@ -399,7 +408,7 @@ def uceprotect_l3(http: Http, ctx: SourceContext) -> SourceResult:
         scores: dict[int, float] = {}
         # The server sends Content-Encoding: gzip on some mirrors, so the client may have
         # decompressed it already (measured 2026-10-12). Accept either.
-        raw = gzip.decompress(r.body) if r.body[:2] == b"\x1f\x8b" else r.body
+        raw = _gunzip_capped(r.body) if r.body[:2] == b"\x1f\x8b" else r.body
         for line in raw.decode("utf-8", "replace").splitlines():
             if True:
                 m = re.search(r"/AS(\d+) is UCEPROTECT-Level3 listed because of a spamscore of (\d+(?:\.\d+)?)", line)
