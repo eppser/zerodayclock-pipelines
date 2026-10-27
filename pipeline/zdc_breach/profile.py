@@ -498,10 +498,21 @@ class JevError(Exception):
     pass
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """A 301/302 on this POST was re-sent as a GET with the Bearer token still attached, to whatever host the
+    redirect named. The model endpoint has no reason to redirect: a 3xx is an error (security review 2026-10-26)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT = urllib.request.build_opener(_RefuseRedirect)
+
+
 def _urllib_transport(method, url, headers, body, timeout):
     r = urllib.request.Request(url, method=method, headers=headers, data=body)
     try:
-        with urllib.request.urlopen(r, timeout=timeout) as resp:
+        with _NO_REDIRECT.open(r, timeout=timeout) as resp:
             return resp.status, dict(resp.headers), json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         txt = e.read().decode(errors='replace')[:2000]

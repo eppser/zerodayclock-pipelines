@@ -37,6 +37,17 @@ def strip_tags(obj: Any) -> Any:
     return obj
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib forwards every request header, x-api-key included, to whatever host a redirect names. The CrowdSec
+    API has no reason to redirect, so a 3xx becomes an HTTPError (security review 2026-10-26; zdc_osm does the same)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT = urllib.request.build_opener(_RefuseRedirect)
+
+
 @dataclass(frozen=True)
 class Response:
     url: str
@@ -63,7 +74,7 @@ class CrowdSecClient:
                     "x-api-key": self._key,
                     "User-Agent": UA,
                 })
-                with urllib.request.urlopen(req, timeout=self._timeout) as r:
+                with _NO_REDIRECT.open(req, timeout=self._timeout) as r:
                     body = strip_tags(json.loads(r.read() or b"null"))
                 if self._pause:
                     time.sleep(self._pause)

@@ -548,3 +548,39 @@ def test_probe_never_prints_a_key(capsys, monkeypatch):
     assert probe.main() == 0
     out = capsys.readouterr().out
     assert not any(v in out for v in ENV.values())
+
+
+def test_http_keeps_api_key_off_a_redirect_to_another_host():
+    # Security review 2026-10-26: httpx forwarded x-api-key on a cross-host redirect.
+    import httpx
+    from zdc_netthreat.client import Http
+    seen = {}
+    def handler(req):
+        seen[req.url.host] = req.headers.get("x-api-key")
+        if req.url.host == "api.example.test" and req.url.path == "/a":
+            return httpx.Response(302, headers={"location": "/b"})
+        if req.url.host == "api.example.test":
+            return httpx.Response(302, headers={"location": "https://cdn.other.test/file"})
+        return httpx.Response(200, content=b"ok")
+    h = Http(pause=0, transport=httpx.MockTransport(handler))
+    r = h.get("https://api.example.test/a", headers={"x-api-key": "k-secret"})
+    assert r.ok and r.body == b"ok"
+    assert seen["api.example.test"] == "k-secret"     # same host: the key still travels
+    assert seen["cdn.other.test"] is None             # other host: it does not
+
+
+def test_http_refuses_a_cross_host_redirect_to_plain_http_and_caps_the_body(monkeypatch):
+    import httpx
+    import zdc_netthreat.client as c
+    def handler(req):
+        if req.url.host == "api.example.test":
+            return httpx.Response(302, headers={"location": "http://evil.test/x"})
+        return httpx.Response(200, content=b"x")
+    h = c.Http(pause=0, retries=0, transport=httpx.MockTransport(handler))
+    r = h.get("https://api.example.test/a", headers={"x-api-key": "k"})
+    assert not r.ok and "refused redirect" in r.error
+
+    monkeypatch.setattr(c, "MAX_BODY", 10)
+    h2 = c.Http(pause=0, retries=0, transport=httpx.MockTransport(lambda req: httpx.Response(200, content=b"y" * 100)))
+    r2 = h2.get("https://feed.example.test/")
+    assert not r2.ok and "larger than" in r2.error

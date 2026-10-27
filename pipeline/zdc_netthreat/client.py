@@ -46,6 +46,9 @@ class Response:
         return json.loads(self.body)
 
 
+MAX_BODY = 2 * 1024 ** 3   # decoded bytes; see Http._fetch
+
+
 class Http:
     """Polite GET with retries on 429/5xx. `pause` is the minimum gap between requests,
     held across threads, so callers may share one client between workers."""
@@ -58,6 +61,37 @@ class Http:
         self._c = httpx.Client(timeout=timeout, follow_redirects=True, transport=transport,
                                headers={"User-Agent": UA})
 
+    def _fetch(self, url: str, headers: dict, params: dict | None) -> tuple[httpx.Response, bytes]:
+        """One GET, following redirects by hand (security review 2026-10-26).
+
+        httpx's own redirect handling strips Authorization on a cross-origin hop but keeps every other header, so a
+        302 from a feed's host (or its CDN, if compromised) to anywhere else received the CrowdSec CTI `x-api-key`.
+        Here the caller's headers travel only while the host stays the same; a hop to another host goes without them,
+        and only over https.
+
+        The body is read with a cap on its DECODED size: a gzip-encoded answer of a few MB can inflate to tens of GB
+        and kill the runner. MAX_BODY is far above the largest feed (the VulnCheck backup).
+        """
+        send_headers, cur, prm = dict(headers), url, params
+        origin = httpx.URL(url).host
+        for _ in range(10):
+            with self._c.stream("GET", cur, headers=send_headers, params=prm, follow_redirects=False) as r:
+                if r.is_redirect and r.headers.get("location"):
+                    nxt = r.url.join(r.headers["location"])
+                    if nxt.host != origin:
+                        if nxt.scheme != "https":
+                            raise httpx.UnsupportedProtocol(f"refused redirect to {nxt.scheme}:// on another host")
+                        send_headers = {}
+                    cur, prm = nxt, None
+                    continue
+                buf = bytearray()
+                for chunk in r.iter_bytes():
+                    buf += chunk
+                    if len(buf) > MAX_BODY:
+                        raise httpx.DecodingError(f"body larger than {MAX_BODY:,} bytes after decoding")
+                return r, bytes(buf)
+        raise httpx.TooManyRedirects("more than 10 redirects")
+
     def get(self, url: str, headers: dict | None = None, params: dict | None = None) -> Response:
         last_err = None
         for attempt in range(self.retries + 1):
@@ -68,11 +102,11 @@ class Http:
                 self._last = time.monotonic()
             t0 = datetime.now(timezone.utc)
             try:
-                r = self._c.get(url, headers=headers or {}, params=params)
+                r, content = self._fetch(url, headers or {}, params)
                 t1 = datetime.now(timezone.utc)
                 shown = str(r.request.url)
                 if r.status_code == 200:
-                    return Response(shown, 200, r.content, None, t0, t1, dict(r.headers))
+                    return Response(shown, 200, content, None, t0, t1, dict(r.headers))
                 last_err = f"HTTP {r.status_code}: {redact(r.text[:200])}"
                 if r.status_code in (429, 500, 502, 503, 504) and attempt < self.retries:
                     time.sleep(min(300, 10 * 2 ** attempt))

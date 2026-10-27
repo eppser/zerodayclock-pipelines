@@ -9,6 +9,7 @@ carrying a hidden prompt in another feed (zdc_crowdsec), so they never get past 
 from __future__ import annotations
 
 import gzip
+import zlib
 import hashlib
 import json
 import time
@@ -61,6 +62,17 @@ class _HttpsOnly(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_HttpsOnly)
 
 
+def gunzip_capped(data: bytes, cap: int) -> bytes | None:
+    """gzip.decompress with a ceiling on the OUTPUT. max_bytes bounded what was read, not what it inflates to: a few
+    MB of gzip from a hostile source can become tens of GB and kill the runner (security review 2026-10-26).
+    None when the output passes `cap`."""
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    out = d.decompress(data, cap + 1)
+    if len(out) > cap or d.unconsumed_tail:
+        return None
+    return out
+
+
 def get(url: str, *, timeout: int = 60, retries: int = 2, sleep=time.sleep,
         accept: str = "*/*", opener=None, max_bytes: int = 40_000_000) -> Fetched:
     """429 and 5xx are retried with Retry-After honoured; anything else is returned as is.
@@ -78,7 +90,10 @@ def get(url: str, *, timeout: int = 60, retries: int = 2, sleep=time.sleep,
                     return Fetched(url, r.status, b"", f"body over {max_bytes} bytes", started,
                                    datetime.now(timezone.utc), dict(r.headers))
                 if r.headers.get("Content-Encoding") == "gzip":
-                    body = gzip.decompress(body)
+                    body = gunzip_capped(body, max_bytes)
+                    if body is None:
+                        return Fetched(url, r.status, b"", f"body over {max_bytes} bytes after decompression",
+                                       started, datetime.now(timezone.utc), dict(r.headers))
                 return Fetched(url, r.status, body, None, started, datetime.now(timezone.utc),
                                dict(r.headers))
         except urllib.error.HTTPError as e:
