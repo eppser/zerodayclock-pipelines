@@ -931,6 +931,38 @@ def check_corpus_cohorts_populated(conn) -> EvalResult:
                       {"rows": rows, "metrics": metrics})
 
 
+def check_corpus_weekly_fresh(conn) -> EvalResult:
+    """The weekly chart (0198) must end on the last complete ISO week before the corpus censoring date, start where
+    derived.weekly_window says, hold every week of that window for both metrics, and carry ONE censoring date equal to
+    the corpus cohorts'. This is the check that fails if the weekly rebuild stops running, freezes on an old window
+    (January), or drifts from the monthly chart above it. Skipped, not failed, before 0198 is applied."""
+    with conn.cursor() as cur:
+        cur.execute("select to_regclass('derived.corpus_weekly') is not null")
+        if not cur.fetchone()[0]:
+            return EvalResult("corpus_weekly_fresh", ERROR, True, "derived.corpus_weekly absent (0198 not applied); skipped", {})
+        cur.execute("""
+            with c as (select max(censored_at) as cut from derived.corpus_cohorts),
+                 w as (select ww.start_week, ww.last_week, c.cut from c, derived.weekly_window(c.cut) ww)
+            select w.cut, w.start_week, w.last_week,
+                   (select min(week_start) from derived.corpus_weekly),
+                   (select max(week_start) from derived.corpus_weekly),
+                   (select count(*) from derived.corpus_weekly),
+                   (select count(distinct censored_at) from derived.corpus_weekly),
+                   (select max(censored_at) from derived.corpus_weekly)
+              from w""")
+        cut, start, last, lo, hi, rows, ncut, wcut = cur.fetchone()
+    if cut is None:
+        return EvalResult("corpus_weekly_fresh", ERROR, False, "no corpus cohorts to compare against", {})
+    weeks = (last - start).days // 7 + 1
+    ok = (lo, hi) == (start, last) and rows == 2 * weeks and ncut == 1 and wcut == cut
+    return EvalResult("corpus_weekly_fresh", ERROR, ok,
+                      f"weeks {lo}..{hi} ({rows} rows), censored {wcut}"
+                      + ("" if ok else f" — expected {start}..{last} ({2 * weeks} rows), censored {cut}: "
+                                       "the weekly chart is stale or has drifted from the monthly one"),
+                      {"window": [str(lo), str(hi)], "expected": [str(start), str(last)], "rows": rows,
+                       "expected_rows": 2 * weeks, "censored_at": str(wcut), "corpus_censored_at": str(cut)})
+
+
 def check_cohort_boundaries_agree(conn) -> EvalResult:
     """The two cohort charts sit on one page and must stop at the same month.
 
@@ -1044,6 +1076,7 @@ VIEW_BASE_TABLES = [
     ("public.technology_coverage",   "derived.technology_coverage"),
     ("public.corpus_cohorts",        "derived.corpus_cohorts"),
     ("public.kev_bulk_loads",        "derived.kev_bulk_loads"),
+    ("public.corpus_weekly",         "derived.corpus_weekly"),   # 0198; absent views are skipped
     ("public.patch_window_cohorts",  "derived.patch_window_cohorts"),
     ("public.kev_technology_cohorts","derived.kev_technology_cohorts"),
     ("public.severity_predictiveness","derived.severity_predictiveness"),
@@ -1940,6 +1973,7 @@ def run_db_evals(conn) -> list[EvalResult]:
         check_independence_counts_agree(conn),
         check_corpus_cohorts_populated(conn),
         check_cohort_boundaries_agree(conn),
+        check_corpus_weekly_fresh(conn),
         check_corpus_monotonic(conn),
         check_kev_bulk_loads_flagged(conn),
         check_patch_window_bands_sum(conn),

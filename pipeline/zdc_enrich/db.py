@@ -201,6 +201,22 @@ def rebuild_corpus_cohorts(conn, *, method_version: str, censored_at: date,
         return cur.fetchone()[0]
 
 
+def rebuild_corpus_weekly(conn, *, method_version: str, censored_at: date,
+                          run_id: str | None = None) -> int:
+    """Rebuild the weekly CVE / KEV counts (migration 0198), same censoring date as the corpus cohorts.
+
+    The window is decided in SQL by derived.weekly_window(censored_at) and rolls on its own. Guarded: before 0198 is
+    applied the function is absent and this returns 0 rather than failing the run (the scheduled run executes main's
+    code against a database that may be a migration behind, or ahead).
+    """
+    if not _function_exists(conn, "derived.rebuild_corpus_weekly(text,date)"):
+        log.warning("derived.rebuild_corpus_weekly is not defined; skipped (0198 not applied)")
+        return 0
+    with conn.cursor() as cur:
+        cur.execute("select derived.rebuild_corpus_weekly(%s, %s)", (method_version, censored_at))
+        return cur.fetchone()[0]
+
+
 def rebuild_patch_window_cohorts(conn, *, method_version: str, censored_at: date,
                                  run_id: str | None = None) -> int:
     """Rebuild the patch-window band series (the top chart)."""

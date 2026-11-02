@@ -164,6 +164,8 @@ def main(argv: list[str] | None = None) -> int:
     REBUILDS = [
         ("technology_rows", "derived.technology_cohorts", db.rebuild_technology),
         ("corpus_rows", "derived.corpus_cohorts", db.rebuild_corpus_cohorts),
+        # 0198, the weekly companion. Guarded in db.py: absent the migration it returns 0.
+        ("corpus_weekly_rows", "derived.corpus_weekly", db.rebuild_corpus_weekly),
         ("patch_window_rows", "derived.patch_window_cohorts", db.rebuild_patch_window_cohorts),
         ("kev_technology_rows", "derived.kev_technology_cohorts", db.rebuild_kev_technology),
         ("severity_rows", "derived.severity_predictiveness", db.rebuild_severity_predictiveness),
