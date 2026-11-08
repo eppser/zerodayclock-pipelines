@@ -313,3 +313,23 @@ def network_type(asn: int, name: str, pdb_type: str | None, dc_share: float | No
 SCANNER_RX = re.compile(r"censys|modat|shodan|onyphe|driftnet|binaryedge|stretchoid|"
                         r"internet-measurement|alpha ?strike|recyber|leakix|criminalip|expanse|"
                         r"palo alto|rapid7|shadowserver|bitsight|internet census", re.I)
+
+
+def web_url(v) -> str | None:
+    """A network's self-declared PeeringDB website, kept only if it is an http(s) URL with a host.
+
+    The atlas renders it as a link, and anyone who controls a PeeringDB record controls the string; a `javascript:`
+    value would run script on the site when clicked (security review 2026-10-26). The page checks too (safeHref).
+    """
+    import urllib.parse
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    try:
+        u = urllib.parse.urlsplit(s)
+    except ValueError:
+        return None
+    if u.scheme.lower() not in ("http", "https") or not u.netloc or re.search(r"[\s\"'<>]", s):
+        return None
+    return s[:300]
+

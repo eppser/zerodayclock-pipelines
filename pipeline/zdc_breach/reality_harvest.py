@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import html
+import http.client
+import ipaddress
 import json
 import random
 import re
@@ -170,13 +172,92 @@ def resolves(h):
     return False
 
 
+class _PublicHTTPConnection(http.client.HTTPConnection):
+    """Connects only to a public address (security review 2026-10-26).
+
+    The hosts fetched here come from leak-site posts, so a ransomware group chooses them: a victim domain whose A record
+    is 127.0.0.1, 10.x or 169.254.169.254 made the runner GET an internal service. The name is resolved once, every
+    address is checked, and the socket goes to the checked address, so a second lookup (DNS rebinding) cannot swap it.
+    """
+
+    def connect(self):
+        self.sock = _public_socket(self.host, self.port, self.timeout)
+
+
+class _PublicHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self):
+        sock = _public_socket(self.host, self.port, self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+def _is_public(addr):
+    """A global unicast address, and not an IPv4 address smuggled inside IPv6 (::ffff:127.0.0.1, ::127.0.0.1,
+    64:ff9b::7f00:1 - Python reports the last two as global)."""
+    ip = ipaddress.ip_address(addr.split('%')[0])
+    if ip.version == 6:
+        inner = ip.ipv4_mapped or ip.sixtofour
+        if inner is None and int(ip) >> 32 == 0:
+            inner = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)            # IPv4-compatible ::a.b.c.d
+        if inner is None and ip in ipaddress.ip_network('64:ff9b::/96'):
+            inner = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)            # NAT64
+        if inner is not None and not inner.is_global:
+            return False
+    return ip.is_global
+
+
+def _public_socket(host, port, timeout):
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    if not infos or not all(_is_public(i[4][0]) for i in infos):
+        raise OSError(f'refused non-public address for {host}')
+    err = None
+    for fam, typ, proto, _, sa in infos:                                  # every vetted address in turn, as before
+        s = socket.socket(fam, typ, proto)
+        s.settimeout(timeout if isinstance(timeout, (int, float)) else None)
+        try:
+            s.connect(sa)
+            return s
+        except OSError as e:
+            err = e
+            s.close()
+    raise err or OSError(f'no address for {host}')
+
+
+class _PublicHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_PublicHTTPConnection, req)
+
+
+class _PublicHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self):
+        super().__init__(context=ssl.create_default_context())
+
+    def https_open(self, req):
+        return self.do_open(_PublicHTTPSConnection, req, context=self._context)
+
+
+class _WebOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    """urllib would follow a redirect to ftp:// as well; only http(s) here, and every hop goes through the checks above."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme not in ('http', 'https'):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# No ProxyHandler: a proxy from the environment would connect to the target instead of us, past the address check.
+_PUBLIC_WEB = urllib.request.OpenerDirector()
+for _h in (_PublicHTTPHandler(), _PublicHTTPSHandler(), _WebOnlyRedirect(), urllib.request.HTTPErrorProcessor(),
+           urllib.request.HTTPDefaultErrorHandler(), urllib.request.UnknownHandler()):
+    _PUBLIC_WEB.add_handler(_h)
+
+
 def fetch_home(h):
     """One GET of / (https, https://www., then http): status, final URL, title, og:site_name, parked."""
     o = {'host': h}
     for url in ('https://' + h + '/', 'https://www.' + h + '/', 'http://' + h + '/'):
         try:
             req = urllib.request.Request(url, headers={'User-Agent': UA_WEB, 'Accept': 'text/html,*/*;q=0.8'})
-            with urllib.request.urlopen(req, timeout=10, context=ssl.create_default_context()) as r:
+            with _PUBLIC_WEB.open(req, timeout=10) as r:
                 body = r.read(200000).decode(r.headers.get_content_charset() or 'utf-8', errors='replace')
                 o['status'] = r.status
                 o['final_url'] = r.geturl()
@@ -282,7 +363,7 @@ def tls_subject(host):
     for h in (host, 'www.' + host):
         try:
             ctx = ssl.create_default_context()
-            with socket.create_connection((h, 443), timeout=8) as s:
+            with _public_socket(h, 443, 8) as s:
                 with ctx.wrap_socket(s, server_hostname=h) as t:
                     c = t.getpeercert()
             subj = {k: v for x in c.get('subject', ()) for k, v in x}
@@ -297,7 +378,7 @@ def tls_subject(host):
 def page(url):
     try:
         req = urllib.request.Request(url, headers={'User-Agent': UA_WEB, 'Accept': 'text/html'})
-        with urllib.request.urlopen(req, timeout=10, context=ssl.create_default_context()) as r:
+        with _PUBLIC_WEB.open(req, timeout=10) as r:
             body = r.read(150000).decode(r.headers.get_content_charset() or 'utf-8', errors='replace')
             st = r.status
             fu = r.geturl()

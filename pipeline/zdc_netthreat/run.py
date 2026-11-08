@@ -219,7 +219,7 @@ def collect(conn, run_id, week: dt.date, http: Http, secrets: dict, wanted: list
                          routed_24s=routing.size24.get(a, 0), announced_ipv4=routing.announced.get(a, 0),
                          prefixes=routing.prefixes.get(a, 0), pdb_type=pd.get("info_type") or None,
                          pdb_traffic=pd.get("info_traffic") or None, pdb_scope=pd.get("info_scope") or None,
-                         pdb_policy=pd.get("policy_general") or None, website=(pd.get("website") or None),
+                         pdb_policy=pd.get("policy_general") or None, website=reference.web_url(pd.get("website")),
                          scanner=bool(reference.SCANNER_RX.search(f"{name} {og.org_name if og else ''} {og.handle if og else ''}")),
                          updated_week=week, routing_fetch_id=ref["routing_fetch"]))
     db.upsert_networks(conn, rows)

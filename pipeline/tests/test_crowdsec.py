@@ -286,26 +286,48 @@ class TestErrorDetail:
     """A bare "HTTP 403" cost a round trip to find out whose 403 it was — the API's or
     the CDN in front of it. Only the body distinguishes them."""
 
-    def _client(self, code, body):
+    def _client(self, code, body, monkeypatch):
+        import types
         import urllib.error
         from zdc_crowdsec import client as cl
         c = cl.CrowdSecClient("k", retries=1)
         def boom(*a, **k):
             raise urllib.error.HTTPError("u", code, "x", {}, io.BytesIO(body))
-        cl.urllib.request.urlopen = boom
+        # The client opens through its no-redirect opener (security review 2026-10-26), not urlopen.
+        monkeypatch.setattr(cl, "_NO_REDIRECT", types.SimpleNamespace(open=boom))
         return c
 
-    def test_error_carries_the_response_body(self):
-        r = self._client(403, b"error code: 1010").get("/cves")
+    def test_error_carries_the_response_body(self, monkeypatch):
+        r = self._client(403, b"error code: 1010", monkeypatch).get("/cves")
         assert "1010" in r.error and r.status == 403
 
-    def test_error_survives_an_unreadable_body(self):
-        r = self._client(403, b"").get("/cves")
+    def test_error_survives_an_unreadable_body(self, monkeypatch):
+        r = self._client(403, b"", monkeypatch).get("/cves")
         assert r.error == "HTTP 403"
 
-    def test_body_is_bounded(self):
-        r = self._client(403, b"x" * 5000).get("/cves")
+    def test_body_is_bounded(self, monkeypatch):
+        r = self._client(403, b"x" * 5000, monkeypatch).get("/cves")
         assert len(r.error) < 260
+
+    def test_a_redirect_is_refused_and_the_key_never_leaves(self):
+        import threading, http.server
+        from zdc_crowdsec import client as cl
+        seen = []
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(s):
+                seen.append((s.path, s.headers.get("x-api-key")))
+                s.send_response(302); s.send_header("Location", f"http://127.0.0.1:{srv.server_port}/stolen"); s.end_headers()
+            def log_message(*a): pass
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            old = cl.BASE
+            cl.BASE = f"http://127.0.0.1:{srv.server_port}"
+            r = cl.CrowdSecClient("k-secret", retries=1).get("/a")
+        finally:
+            cl.BASE = old
+            srv.shutdown()
+        assert r.status == 302 and [p for p, _ in seen] == ["/a"]
 
 
 class TestNotSilentlyEmpty:

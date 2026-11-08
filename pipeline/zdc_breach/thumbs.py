@@ -27,7 +27,9 @@ def screenshot_url(path: str) -> str | None:
 
 def header_thumb(png: bytes) -> tuple[bytes, int, int]:
     """WebP of the page header only, WIDTH px wide."""
-    with Image.open(io.BytesIO(png)) as im:
+    # Only the formats a screenshot arrives in: the bytes come from a third party, and without `formats` Pillow tries
+    # every decoder it has (PSD, TIFF, EPS via Ghostscript...) on them (security review 2026-10-26).
+    with Image.open(io.BytesIO(png), formats=["PNG", "JPEG", "WEBP"]) as im:
         im = im.convert("RGB")
         w, h = im.size
         cut = int(min(h * HEADER_FRACTION, HEADER_MAX_PX * (w / 1280)))
