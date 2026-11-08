@@ -1,0 +1,115 @@
+name: Site security probe
+
+# Asks the live site, from outside, whether the controls the 2026-10-26 security review put in place
+# are still in place: HTTP redirects to HTTPS, the certificate is not about to expire, every response
+# carries the security headers, every spelling of the admin prefix asks for a password (on the custom
+# domain, on the bare pages.dev aliases, and on every old deployment hostname Cloudflare still keeps),
+# cross-site POSTs are refused, and the pages render. A second job asks the database what the anon
+# role can read, write and execute, against an allowlist.
+#
+# CI proves the code does this; this proves the deployment does. The two drift (an env var missing on
+# a fresh environment, an old deployment never deleted, a view granted to anon by hand), and nothing
+# else looks.
+#
+# Daily at 06:10 UTC, away from every pipeline's hour and from the watchdog's 13:00. Fails the run on
+# a FAIL-severity check; WARN and INFO land in the step summary and the report artifact.
+
+on:
+  schedule:
+    - cron: '10 6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: site-probe
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # The judgement functions, tested without the network and without any secret in scope.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-ci.txt
+      - name: Unit tests
+        run: python -m pytest -q tests/test_site_probe.py
+
+  # Outside-in. Standard library only. The only credential is a Pages:Read token, used to list the
+  # deployment hostnames; without it the probe still runs and says so.
+  probe:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: site-probe
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Probe the live site
+        working-directory: pipeline
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PAGES_READ_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SITE_PROBE_HEADER: ${{ secrets.SITE_PROBE_HEADER }}
+        run: python -m tools.site_probe --json > site-probe-report.json
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: site-probe-report
+          path: pipeline/site-probe-report.json
+          retention-days: 14
+
+  # Inside-out: what the anon role holds in `public`, against tools/anon_allowlist.txt.
+  exposure:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: staging
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Mask database connection details
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.parse
+          u = urllib.parse.urlsplit(os.environ.get("DATABASE_URL", ""))
+          for v in {u.hostname, u.username, u.password}:
+              if v:
+                  print(f"::add-mask::{v}")
+                  print(f"::add-mask::{urllib.parse.unquote(v)}")
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        working-directory: pipeline
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-run.txt
+      - name: Compare the anon role's grants with the allowlist
+        working-directory: pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python -m tools.site_probe --exposure --json > exposure-report.json
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        if: always()
+        with:
+          name: site-probe-exposure
+          path: pipeline/exposure-report.json
+          retention-days: 14

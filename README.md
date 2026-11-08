@@ -17,6 +17,7 @@ repository, so pull requests here cannot be merged. Please open an issue instead
 | `enrich-pipeline.yml` | `zdc_enrich` | Derived tables, FIRST EPSS scores, and the eval gate over them |
 | `patch-pipeline.yml` | `zdc_patch` | Vendor patch-release dates from first-party advisories |
 | `watchdog.yml` | `tools/watchdog.py` | Alerts when any pipeline stops completing on schedule |
+| `site-probe.yml` | `tools/site_probe.py` | Probes the live site daily: HTTPS, headers, admin paths, CSRF refusals, old deployments, anon grants |
 | `honeypot-pipeline.yml` | `zdc_honeypot` | Shadowserver honeypot exploitation counts per CVE (licensed API) |
 | `crowdsec-pipeline.yml` | `zdc_crowdsec` | CrowdSec tracker exploitation counts per CVE (licensed API) |
 | `osm-pipeline.yml` | `zdc_osm` | OpenSourceMalware's latest verified malicious packages (token-gated) |

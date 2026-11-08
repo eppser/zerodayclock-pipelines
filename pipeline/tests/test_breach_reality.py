@@ -376,3 +376,14 @@ def test_person_shaped_name_ignores_wikidata_and_gleif():     # mutant: wd_ok/gl
 def test_edgar_individual_filer_is_not_an_organisation():     # mutant: edgar_individual filter removed
     assert run('Patricia Martinez', ev(extras={'edgar': [{'entity': 'Martinez Patricia'}]}))['label'] == 'ambiguous'
     assert R.edgar_individual('Patricia Martinez', 'Martinez Patricia') and not R.edgar_individual('Patricia Martinez', 'Martinez Patricia Inc')
+
+
+# ---- public-address guard (security review 2026-10-26; advisor round 2026-11-08) --------------
+def test_public_address_guard_refuses_every_non_unicast_shape():
+    refused = ["127.0.0.1", "10.1.2.3", "100.64.0.1", "169.254.169.254", "192.168.1.1", "0.0.0.0", "224.0.0.1",
+               "239.255.255.250", "240.0.0.1", "255.255.255.255", "::1", "::ffff:127.0.0.1", "::127.0.0.1",
+               "64:ff9b::7f00:1", "2002:7f00:1::1", "ff02::1", "fe80::1%en0", "::ffff:224.0.0.1"]
+    for a in refused:
+        assert not H._is_public(a), a
+    for a in ["8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "::ffff:8.8.8.8"]:
+        assert H._is_public(a), a

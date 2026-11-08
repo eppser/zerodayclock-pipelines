@@ -200,9 +200,10 @@ def _is_public(addr):
             inner = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)            # IPv4-compatible ::a.b.c.d
         if inner is None and ip in ipaddress.ip_network('64:ff9b::/96'):
             inner = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)            # NAT64
-        if inner is not None and not inner.is_global:
+        if inner is not None and not (inner.is_global and not inner.is_multicast):
             return False
-    return ip.is_global
+    # is_global alone admits IPv4 multicast (224/4): connect() would fail anyway, refuse it up front.
+    return ip.is_global and not (ip.is_multicast or ip.is_reserved or ip.is_unspecified)
 
 
 def _public_socket(host, port, timeout):

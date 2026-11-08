@@ -810,6 +810,67 @@ def measure_multi_source_agreement(conn) -> EvalResult:
     )
 
 
+def check_source_not_frozen(conn, max_age_days: int = 21, today: date | None = None) -> EvalResult:
+    """Has any enabled catalogue stopped changing?
+
+    "Unchanged upstream, nothing to do" is the right answer for one run and the wrong
+    answer for four weeks of them. CIRCL's kev_entries dump stopped regenerating on
+    2026-10-04 (Last-Modified frozen, /api/vulnerability/last/kev empty); every run after
+    that reported the source unchanged, every eval passed, and the catalogue silently
+    contributed nothing new to derived.kev_consolidated for a month. The collector cannot
+    tell a quiet feed from a dead one, so this measures the age of the newest STORED
+    change per source (first_seen_at or last_changed_at, whichever is later) - a 304 or an
+    identical content hash touches neither.
+
+    WARN, not ERROR: a frozen upstream is not this pipeline's fault and must not block the
+    other catalogues. Twenty-one days: CISA's longest quiet spells since 2022 were 15, 15,
+    17 and 18 days between additions (2022-07, 2022-12, 2023-03, 2024-03), and CIRCL's
+    longest before its freeze was 14, so a fortnight would have cried wolf four times and
+    three weeks still catches a month. Its name is also persisted in the run's notes
+    ("warned"), where the blocking names already go, so the silence is visible after the
+    run and not only in its log.
+    """
+    today = today or date.today()
+    with conn.cursor() as cur:
+        cur.execute(
+            """select s.source_id,
+                      greatest(max(e.first_seen_at), max(e.last_changed_at))::date
+                 from core.kev_sources s
+                 left join core.kev_entries e on e.source_id = s.source_id
+                where s.enabled
+                group by s.source_id
+                order by s.source_id"""
+        )
+        rows = cur.fetchall()
+
+    ages: dict[str, int | None] = {}
+    frozen: dict[str, dict] = {}
+    for source_id, last_change in rows:
+        age = (today - last_change).days if last_change else None
+        ages[source_id] = age
+        if age is None or age > max_age_days:
+            frozen[source_id] = {"last_change": str(last_change) if last_change else None,
+                                 "age_days": age}
+
+    def describe(source_id: str) -> str:
+        f = frozen[source_id]
+        if f["last_change"] is None:
+            return f"{source_id} has no stored entries"
+        return f"{source_id} unchanged for {f['age_days']} days (last change {f['last_change']})"
+
+    return EvalResult(
+        name="source_not_frozen",
+        severity=WARN,
+        passed=not frozen,
+        summary=(
+            f"every enabled source changed within {max_age_days} days"
+            if not frozen
+            else "frozen upstream: " + "; ".join(describe(s) for s in sorted(frozen))
+        ),
+        detail={"frozen": frozen, "ages_days": ages, "max_age_days": max_age_days},
+    )
+
+
 def run_db_evals(conn, collect_results=(), persistence_errors=None) -> list[EvalResult]:
     return [
         check_persisted(conn, collect_results, persistence_errors or {}),
@@ -823,6 +884,7 @@ def run_db_evals(conn, collect_results=(), persistence_errors=None) -> list[Eval
         measure_source_agreement(conn),
         check_suspected_non_independence(conn),
         check_coverage_not_dropped(conn),
+        check_source_not_frozen(conn),
         check_withdrawal_spike(conn),
         measure_source_overlap(conn),
         measure_multi_source_agreement(conn),

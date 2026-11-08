@@ -228,7 +228,10 @@ def main(argv: list[str] | None = None) -> int:
                # Stored counts, so the next run's coverage check compares like with like.
                "source_counts": db.live_entry_counts(conn),
                "skipped_records": {r.source_id: len(r.skipped) for r in results if r.skipped},
-               "evals": [r.name for r in report.results if r.blocking]},
+               "evals": [r.name for r in report.results if r.blocking],
+               # Warnings are not blocking, so they used to live only in the log: a frozen
+               # catalogue (source_not_frozen) was invisible once the run had scrolled by.
+               "warned": [r.name for r in report.results if not r.passed and not r.blocking]},
         **counters,
     )
     conn.commit()

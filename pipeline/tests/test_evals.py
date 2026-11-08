@@ -728,3 +728,63 @@ class TestPressureLateArrivalsSettled:
     def test_late_arrivals_in_the_window_still_fail(self):
         conn = self.FakeConn(date(2026, 10, 8), counts=(1000, 5, 40))
         assert not enrich_evals.check_pressure_late_arrivals_settled(conn).passed
+
+
+class TestSourceNotFrozen:
+    """A catalogue whose stored entries stopped changing is reported, not waited out.
+
+    CIRCL's kev_entries dump stopped regenerating on 2026-10-04 (Last-Modified frozen, the
+    API's /last/kev empty). Every run after that logged "unchanged upstream" and every eval
+    passed, so a dead feed looked healthy for four weeks. A quiet weekend is not a frozen
+    feed: CISA adds nothing on many Fridays-to-Mondays.
+    """
+
+    class FakeConn:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def cursor(self):
+            conn = self
+
+            class Cur:
+                def __enter__(self): return self
+                def __exit__(self, *a): return False
+                def execute(self, sql, params=None): self.sql = sql
+                def fetchall(self): return list(conn.rows)
+            return Cur()
+
+    TODAY = date(2026, 11, 2)
+
+    def test_passes_when_every_source_changed_recently(self):
+        conn = self.FakeConn([("cisa", date(2026, 10, 30)), ("vulncheck", date(2026, 11, 2))])
+        r = evals.check_source_not_frozen(conn, today=self.TODAY)
+        assert r.passed and r.detail["frozen"] == {}
+        assert r.detail["ages_days"] == {"cisa": 3, "vulncheck": 0}
+
+    def test_a_quiet_fortnight_is_not_frozen(self):
+        conn = self.FakeConn([("cisa", date(2026, 10, 19))])
+        assert evals.check_source_not_frozen(conn, today=self.TODAY).passed
+
+    def test_cisas_longest_quiet_spell_is_not_frozen(self):
+        # 18 days without an addition (2024-03-25) is the longest CISA gap since 2022.
+        conn = self.FakeConn([("cisa", date(2026, 10, 15))])
+        assert evals.check_source_not_frozen(conn, today=self.TODAY).passed
+        conn = self.FakeConn([("cisa", date(2026, 10, 11))])      # 22 days: over the line
+        assert not evals.check_source_not_frozen(conn, today=self.TODAY).passed
+
+    def test_warns_on_a_source_frozen_beyond_the_limit(self):
+        conn = self.FakeConn([("circl", date(2026, 10, 4)), ("cisa", date(2026, 10, 30))])
+        r = evals.check_source_not_frozen(conn, today=self.TODAY)
+        assert not r.passed
+        assert r.severity == evals.WARN              # visible in the summary, never blocks a run
+        assert r.detail["frozen"] == {"circl": {"last_change": "2026-10-04", "age_days": 29}}
+        assert "circl" in r.summary and "29" in r.summary
+
+    def test_a_source_with_no_stored_entries_is_frozen(self):
+        conn = self.FakeConn([("euvd", None)])
+        r = evals.check_source_not_frozen(conn, today=self.TODAY)
+        assert not r.passed and r.detail["frozen"]["euvd"]["last_change"] is None
+
+    def test_runs_in_the_db_eval_set(self):
+        import inspect
+        assert "check_source_not_frozen" in inspect.getsource(evals.run_db_evals)
