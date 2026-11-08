@@ -453,3 +453,11 @@ class TestShadowserverDailyLimit:
         result = ShadowserverObservations().collect(client, state, "full", today=date(2026, 8, 28))
         assert result.unchanged is False
         assert result.complete_snapshot is True
+
+
+def test_the_retired_dashboard_adapter_is_not_registered():
+    """0200 disabled the `shadowserver` source; a registered adapter for it would fail
+    collectors_have_adapters (idle adapter) on every run."""
+    from zdc_obs.sources import registered_ids
+    assert "shadowserver" not in registered_ids()
+    assert set(registered_ids()) == {"msrc", "vulncheck_canary"}

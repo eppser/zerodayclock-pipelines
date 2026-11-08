@@ -139,6 +139,9 @@ def main(argv: list[str] | None = None) -> int:
 
     corpus = db.corpus_counts(conn)
     log.info("corpus: %(total)s CVEs (%(in_cve_project)s CVE Project, %(in_nvd)s NVD)", corpus)
+    pruned = db.prune_superseded_payloads(conn)
+    if pruned:
+        log.info("pruned %d superseded hourly payload(s), %.1f MB", pruned[0], pruned[1] / 1e6)
 
     report.add(evals.check_no_silent_empty(results))
     report.add(evals.check_sources_reported(results))

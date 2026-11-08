@@ -232,3 +232,22 @@ def corpus_counts(conn) -> dict:
                        from core.cves""")
         t, c, n, p, r = cur.fetchone()
     return {"total": t, "in_cve_project": c, "in_nvd": n, "published": p, "rejected": r}
+
+
+def prune_superseded_payloads(conn) -> tuple[int, int] | None:
+    """0202: drop hourly cvelistV5 delta payloads once that day's end-of-day delta is stored (it contains
+    them). Returns (payloads pruned, gzip bytes freed), or None where 0202 is not applied. A failure is
+    logged and rolled back, never fatal: the watchdog's database-size check is what catches a stalled prune."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("select to_regprocedure('raw.prune_superseded_cve_payloads()') is not null")
+            if not cur.fetchone()[0]:
+                return None
+            cur.execute("select pruned, bytes from raw.prune_superseded_cve_payloads()")
+            n, b = cur.fetchone()
+        conn.commit()
+        return int(n), int(b)
+    except Exception as exc:  # noqa: BLE001
+        conn.rollback()
+        log.warning("payload prune failed: %s: %s", type(exc).__name__, exc)
+        return None

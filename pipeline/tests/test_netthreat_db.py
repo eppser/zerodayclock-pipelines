@@ -23,6 +23,7 @@ import psycopg
 import pytest
 
 from zdc_netthreat import run as nrun
+from zdc_netthreat import sources as src
 from zdc_netthreat.client import Response
 
 import os
@@ -103,7 +104,7 @@ ROUTES = {
     "cinsscore": "\n".join(BAD_IPS[:9]).encode(),
     "api.vulncheck.com": json.dumps({"data": [{"url": "https://serve.test/vc.zip?Signature=S", "sha256": hashlib.sha256(VC).hexdigest()}]}).encode(),
     "serve.test": VC,
-    "threatfox": ("\n".join(f'"2030-01-08", "1", "{ip}:443", "ip:port", "botnet_cc", "x", "X", "XRat", "", "100"' for ip in BAD_IPS[:5])).encode(),
+    "threatfox": ("\n".join(f'"2030-01-13 12:00:00", "1", "{ip}:443", "ip:port", "botnet_cc", "x", "X", "XRat", "", "100"' for ip in BAD_IPS[:5])).encode(),
     "urlhaus": b"# none\n",
     "Phishing.Database": "\n".join(BAD_IPS[:7]).encode(),
     "api.shodan.io": json.dumps({"facets": {"asn": [{"value": f"as{BAD}", "count": 40}, {"value": f"as{BIG}", "count": 2}]}}).encode(),
@@ -156,7 +157,7 @@ def db(monkeypatch):
     monkeypatch.setattr(nrun, "utc_today", lambda: dt.date(2030, 1, 14))     # the fake fetch day
     monkeypatch.setenv("DATABASE_URL", DSN)
     for k, v in {"CROWDSEC_CTI_API_KEY": "c" * 40, "VULNCHECK_API_TOKEN": "v" * 40, "SHODAN_API_KEY": "s" * 32,
-                 "CLOUDFLARE_RADAR_TOKEN": "t" * 40}.items():
+                 "CLOUDFLARE_RADAR_TOKEN": "t" * 40, "ABUSECH_AUTH_KEY": "a" * 48}.items():
         monkeypatch.setenv(k, v)
     yield cx
     cleanup(cx)
@@ -244,6 +245,33 @@ def test_collect_and_score_a_week(db, tmp_path, monkeypatch):
     s16 = q(db, "select public.netthreat_slash16(%s)", (20 << 8) | 1)[0][0]
     assert s16["runs"] == [[(20 << 16) | (1 << 8), (20 << 16) | (1 << 8) | 1, OTHER, None, False, False, 23, []]]
     assert q(db, "select jsonb_array_length(public.netthreat_slash16(%s)->'runs')", (192 << 8) | 0)[0][0] == 0
+
+
+def test_an_unreachable_country_source_keeps_the_last_good_country_week(db, tmp_path, monkeypatch):
+    """0201 + context floor: the dashboard times out, the week still publishes, and the atlas shows
+    the newest week that has country rows, named in countries_week."""
+    _tiny_week(monkeypatch)
+    from zdc_netthreat import evals
+    monkeypatch.setattr(evals, "CONTEXT_FLOORS", {"shadowserver_country": 1})
+    earlier = WEEK - dt.timedelta(days=7)
+    db.execute("""insert into net_derived.country_week (week_start, dataset, cc, mean_daily, per_million_users, ratio_to_world)
+                  values (%s, 'honeypot', 'GB', 12, 0.5, 1.0)""", (earlier,))
+    db.commit()
+
+    def down(http, ctx):
+        now = dt.datetime(2030, 1, 14, tzinfo=dt.timezone.utc)
+        return src.SourceResult("shadowserver_country", [Response("https://dashboard.shadowserver.org/x", 0, None,
+                                "ConnectTimeout: timed out", now, now)], extra={"country_rows": []},
+                                parse_error="dashboard unreachable: ConnectTimeout: timed out")
+    monkeypatch.setitem(src.ALL, "shadowserver_country", down)
+    report = tmp_path / "r.json"
+    assert nrun.main(["--week", WEEK.isoformat(), "--report", str(report)]) == 0
+    checks = {c["name"]: c for c in json.loads(report.read_text())["checks"]}
+    assert not checks["context_sources"]["passed"] and checks["context_sources"]["severity"] == "warn"
+    assert q(db, "select count(*) from net_derived.country_week where week_start = %s", WEEK)[0][0] == 0
+    doc = q(db, "select public.netthreat_atlas(%s)", WEEK)[0][0]
+    assert doc["week"] == WEEK.isoformat() and doc["countries_week"] == earlier.isoformat()
+    assert doc["countries"]["GB"]
 
 
 def test_rescoring_replaces_the_week(db, tmp_path, monkeypatch):

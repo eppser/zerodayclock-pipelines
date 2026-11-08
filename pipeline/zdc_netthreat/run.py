@@ -39,7 +39,7 @@ METHOD = "v1"
 METHOD_V2 = "v2"
 log = logging.getLogger("zdc_netthreat")
 SECRET_ENVS = ("CROWDSEC_CTI_API_KEY", "VULNCHECK_API_TOKEN", "SHODAN_API_KEY",
-               "CLOUDFLARE_RADAR_TOKEN", "CLOUDFLARE_EMAIL", "CLOUDFLARE_API_KEY")
+               "CLOUDFLARE_RADAR_TOKEN", "CLOUDFLARE_EMAIL", "CLOUDFLARE_API_KEY", "ABUSECH_AUTH_KEY")
 #: Research scanners are removed from these feeds only: they are what scanners pollute.
 EXCLUDE_RESEARCH = {"crowdsec", "dshield", "blocklist_de", "cins"}
 
@@ -604,7 +604,7 @@ def main(argv: list[str] | None = None) -> int:
             ipv4 = sum(v["ipv4"] for v in report.get("mapping", {}).values())
             unm = sum(v["unmapped"] for v in report.get("mapping", {}).values())
             results += [evals.check_sources_answered(got["status"]), evals.check_volume_floors(got["volumes"], got["status"]),
-                        evals.check_mapping(ipv4, unm)]
+                        evals.check_context_sources(got["volumes"], got["status"]), evals.check_mapping(ipv4, unm)]
             ds = report.get("sources", {}).get("dshield")
             with conn.cursor() as cur:
                 cur.execute("""select notes->'scale' from net_raw.fetches where run_id = %s and source_id = 'dshield'""", (run_id,))
@@ -618,7 +618,8 @@ def main(argv: list[str] | None = None) -> int:
             # A score-only rebuild still answers for the week it rebuilds: the collection gates
             # are re-applied to what the week's fetches recorded.
             status, volumes = db.week_fetch_status(conn, week)
-            results += [evals.check_sources_answered(status), evals.check_volume_floors(volumes, status)]
+            results += [evals.check_sources_answered(status), evals.check_volume_floors(volumes, status),
+                        evals.check_context_sources(volumes, status)]
         # when the week's snapshot sources were really read, and whether any stopped changing; both
         # judged on the fetches the scores use, so a score-only rebuild answers for them too
         lags = db.week_collection_lag(conn, week)

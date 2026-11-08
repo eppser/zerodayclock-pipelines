@@ -57,7 +57,7 @@ import json
 from datetime import date
 
 from ..models import ExploitationObservation, ObsCollectResult, extract_cve, parse_date
-from .base import ObservationSource, ObsSourceState, register
+from .base import ObservationSource, ObsSourceState
 
 BASE = "https://dashboard.shadowserver.org/statistics/honeypot/vulnerability/time-series/"
 
@@ -76,7 +76,9 @@ FULL_DAYS = 365
 DATASETS = ("connections", "unique_ips")
 
 
-@register
+# NOT registered since 2026-11-07 (migration 0200): the dashboard times out from GitHub's runners, and the
+# licensed shadowserver_api source (zdc_honeypot) supersedes it, as this module's docstring asked. The class stays
+# so its tests keep the parser honest should the source ever be re-enabled; re-enable both together.
 class ShadowserverObservations(ObservationSource):
     source_id = "shadowserver"
     observation_type = "attempt_observed"

@@ -15,7 +15,11 @@ from zdc_crowdsec.evals import ERROR, INFO, WARN, EvalResult
 FLOORS = {"crowdsec": 10_000, "dshield": 5_000, "blocklist_de": 5_000, "cins": 5_000,
           "vulncheck": 2_000, "threatfox": 300, "urlhaus": 200, "phishing_db": 1_000,
           "shodan": 100, "spamhaus_asndrop": 100, "spamhaus_drop": 100, "uceprotect_l3": 100,
-          "tor_exits": 300, "cloudflare": 1_000, "shadowserver_country": 1_000}
+          "tor_exits": 300, "cloudflare": 1_000}
+#: Context sources: shown on the atlas, not scored. Below its floor one is a WARNING, not a block: the
+#: Shadowserver dashboard times out from GitHub's runners since 2026-11-03, and the atlas then shows the
+#: newest week that has country rows (0201) rather than holding back the whole week (owner, 2026-11-07).
+CONTEXT_FLOORS = {"shadowserver_country": 1_000}
 REQUIRED = ("crowdsec", "dshield", "blocklist_de", "cins", "vulncheck", "threatfox", "urlhaus",
             "phishing_db", "cloudflare")
 #: Scored sources read as a snapshot of the moment the run fetches them (a trailing window:
@@ -44,6 +48,16 @@ def check_volume_floors(volumes: dict[str, int], asked=()) -> EvalResult:
     return EvalResult("volume_floors", ERROR, not low,
                       "every source above its floor" if not low
                       else "below floor: " + ", ".join(f"{s} {v:,} < {FLOORS[s]:,}" for s, v in low.items()),
+                      {"low": low})
+
+
+def check_context_sources(volumes: dict[str, int], asked=()) -> EvalResult:
+    """A context source that was asked and carried nothing leaves its atlas layer on an earlier week."""
+    low = {s: volumes.get(s, 0) for s in {*volumes, *asked} if s in CONTEXT_FLOORS and volumes.get(s, 0) < CONTEXT_FLOORS[s]}
+    return EvalResult("context_sources", WARN, not low,
+                      "every context source above its floor" if not low
+                      else "stale layer, earlier week shown: " + ", ".join(f"{s} {v:,} < {CONTEXT_FLOORS[s]:,}"
+                                                                          for s, v in low.items()),
                       {"low": low})
 
 

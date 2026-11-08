@@ -198,7 +198,7 @@ class FakeHttp:
 
 
 CTX = src.SourceContext(dt.date(2030, 1, 7), dt.date(2030, 1, 14),
-                        {"CROWDSEC_CTI_API_KEY": "k" * 40, "VULNCHECK_API_TOKEN": "v" * 40, "SHODAN_API_KEY": "s" * 32})
+                        {"CROWDSEC_CTI_API_KEY": "k" * 40, "VULNCHECK_API_TOKEN": "v" * 40, "SHODAN_API_KEY": "s" * 32, "ABUSECH_AUTH_KEY": "a" * 48})
 
 
 def test_crowdsec_pages_until_no_next_and_strips_tag_characters():
@@ -286,12 +286,52 @@ def test_vulncheck_checksum_mismatch_is_refused():
 
 
 def test_threatfox_and_urlhaus_parse():
-    tf = (b'# comment\n"2030-01-08 00:00:00", "1", "192.0.2.5:443", "ip:port", "botnet_cc", "win.x", "X", "XRat", "", "100"\n')
+    tf = (b'# comment\n"2030-01-06 00:00:00", "1", "192.0.2.5:443", "ip:port", "botnet_cc", "win.x", "X", "XRat", "", "100"\n')
     r = src.threatfox(FakeHttp({"threatfox": tf}), CTX)
     assert r.hits[0].ip == "192.0.2.5" and r.hits[0].categories == ("family:XRat",)
     uh = b'# c\n"1","2030-01-08","http://198.51.100.9:8080/bin.sh","online"\n"2","2030-01-08","http://example.test/a","online"\n'
     r = src.urlhaus(FakeHttp({"urlhaus": uh}), CTX)
     assert [h.ip for h in r.hits] == ["198.51.100.9"]
+
+
+def test_abusech_needs_the_key_and_never_stores_it():
+    no_key = src.SourceContext(CTX.week_start, CTX.week_end, {})
+    for fn in (src.threatfox, src.urlhaus):
+        http = FakeHttp({})
+        r = fn(http, no_key)
+        assert r.parse_error == "ABUSECH_AUTH_KEY is not set" and not http.calls and not r.hits
+    key = CTX.secrets["ABUSECH_AUTH_KEY"]
+    http = FakeHttp({"threatfox": 410, "urlhaus": 410})
+    for fn in (src.threatfox, src.urlhaus):
+        r = fn(http, CTX)
+        assert all(key not in (x.url + (x.error or "")) and "<auth-key>" in x.url for x in r.responses)
+    assert all(key in c[0] and "/v2/files/exports/" in c[0] for c in http.calls)
+
+
+def test_threatfox_full_dump_is_cut_to_the_last_48_hours_and_may_be_zipped():
+    # FakeHttp fetches at 2030-01-07 00:00 UTC: 2030-01-05 00:00 is the oldest kept.
+    rows = (b'"2030-01-06 23:00:00", "1", "192.0.2.5:443", "ip:port", "botnet_cc", "win.x", "X", "XRat", "", "100"\n'
+            b'"2030-01-04 23:59:59", "2", "192.0.2.6:443", "ip:port", "botnet_cc", "win.x", "X", "Old", "", "100"\n'
+            b'"2030-01-06 23:00:00", "3", "evil.test", "domain", "botnet_cc", "win.x", "X", "XRat", "", "100"\n')
+    zb = io.BytesIO()
+    with zipfile.ZipFile(zb, "w") as z:
+        z.writestr("full.csv", b"# ThreatFox\n" + rows)
+    for body in (rows, zb.getvalue()):
+        r = src.threatfox(FakeHttp({"threatfox": body}), CTX)
+        assert [h.ip for h in r.hits] == ["192.0.2.5"]
+
+
+def test_urlhaus_keeps_only_urls_still_online():
+    uh = (b'"1","2030-01-01","http://198.51.100.9/a","online"\n'
+          b'"2","2030-01-01","http://198.51.100.10/b","offline"\n')
+    assert [h.ip for h in src.urlhaus(FakeHttp({"urlhaus": uh}), CTX).hits] == ["198.51.100.9"]
+
+
+def test_shadowserver_country_stops_at_the_first_unreachable_request():
+    http = FakeHttp({"dashboard.shadowserver.org": 0})
+    r = src.shadowserver_country(http, CTX)
+    assert len(http.calls) == 1 and r.parse_error.startswith("dashboard unreachable")
+    assert r.extra["country_rows"] == []
 
 
 def test_uceprotect_scores():
@@ -451,6 +491,17 @@ def test_volume_floor_counts_a_source_that_recorded_nothing():
     assert not r.passed and "dshield 0" in r.summary
 
 
+def test_an_empty_context_source_warns_and_does_not_block():
+    from zdc_netthreat import evals as ev
+    assert "shadowserver_country" not in ev.FLOORS
+    ok = {s: f * 2 for s, f in ev.FLOORS.items()}
+    asked = [*ok, "shadowserver_country"]
+    assert ev.check_volume_floors(ok, asked).passed
+    r = ev.check_context_sources(ok, asked)
+    assert r.severity == ev.WARN and not r.passed and "shadowserver_country 0" in r.summary
+    assert ev.check_context_sources({**ok, "shadowserver_country": 3_000}, asked).passed
+
+
 def test_bot_shares_counts_only_the_global_list_as_ranked(monkeypatch):
     seen = {}
 
@@ -520,7 +571,7 @@ class _ProbeHttp:
         return Response(url, code, body if code == 200 else None, None if code == 200 else f"HTTP {code}", now, now)
 
 
-ENV = {"CLOUDFLARE_RADAR_TOKEN": "t" * 40, "CROWDSEC_CTI_API_KEY": "c" * 40, "VULNCHECK_API_TOKEN": "v" * 40, "SHODAN_API_KEY": "s" * 32}
+ENV = {"CLOUDFLARE_RADAR_TOKEN": "t" * 40, "CROWDSEC_CTI_API_KEY": "c" * 40, "VULNCHECK_API_TOKEN": "v" * 40, "SHODAN_API_KEY": "s" * 32, "ABUSECH_AUTH_KEY": "a" * 48}
 
 
 def test_probe_all_keys_answer():

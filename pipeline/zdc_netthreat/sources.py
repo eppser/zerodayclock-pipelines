@@ -233,14 +233,56 @@ def vulncheck(http: Http, ctx: SourceContext) -> SourceResult:
 
 
 # ---- abuse.ch -------------------------------------------------------------------------------
+#: abuse.ch retired its keyless exports in late October 2026 (the old /export/csv/ip-port/recent/ and
+#: /downloads/csv_online/ URLs answer 410 Gone). The replacements take a free Auth-Key from
+#: auth.abuse.ch IN THE URL PATH, so every Response is rewritten to hide it before it is stored.
+TF_EXPORT = "https://threatfox-api.abuse.ch/v2/files/exports/{key}/full.csv.zip"
+UH_EXPORT = "https://urlhaus-api.abuse.ch/v2/files/exports/{key}/recent.csv"
+#: ThreatFox's old "recent" export was the last 48 hours; the full dump is cut back to that window.
+TF_RECENT = dt.timedelta(hours=48)
+
+
+def _hide_key(r: Response, key: str) -> Response:
+    if not key:
+        return r
+    return Response(r.url.replace(key, "<auth-key>"), r.status, r.body,
+                    r.error.replace(key, "<auth-key>") if r.error else r.error,
+                    r.requested_at, r.finished_at, r.headers)
+
+
+def _abusech_key(ctx: SourceContext, res: SourceResult) -> str | None:
+    key = ctx.secrets.get("ABUSECH_AUTH_KEY")
+    if not key:
+        res.parse_error = "ABUSECH_AUTH_KEY is not set"
+    return key or None
+
+
+def _csv_text(body: bytes) -> io.TextIOBase:
+    """The export body as text: the first member of a zip, or the body itself."""
+    if body[:2] == b"PK":
+        z = zipfile.ZipFile(io.BytesIO(body))
+        return io.TextIOWrapper(z.open(z.namelist()[0]), encoding="utf-8", errors="replace")
+    return io.StringIO(body.decode("utf-8", "replace"))
+
+
 def threatfox(http: Http, ctx: SourceContext) -> SourceResult:
-    r = http.get("https://threatfox.abuse.ch/export/csv/ip-port/recent/")
-    res = SourceResult("threatfox", [r])
+    res = SourceResult("threatfox", [])
+    key = _abusech_key(ctx, res)
+    if not key:
+        return res
+    r = _hide_key(http.get(TF_EXPORT.format(key=key)), key)
+    res.responses.append(r)
     if r.ok:
-        rows = csv.reader((l for l in r.body.decode("utf-8", "replace").splitlines() if not l.startswith("#")),
-                          skipinitialspace=True)
+        cutoff = (r.requested_at - TF_RECENT).replace(tzinfo=None)
+        rows = csv.reader((l for l in _csv_text(r.body) if not l.startswith("#")), skipinitialspace=True)
         for row in rows:
             if len(row) > 7 and row[3] == "ip:port":
+                try:
+                    seen = dt.datetime.fromisoformat(row[0].strip()[:19])
+                except ValueError:
+                    continue
+                if seen < cutoff:
+                    continue
                 ip = row[2].rsplit(":", 1)[0]
                 if IPV4.match(ip):
                     res.hits.append(Hit(ip, (f"family:{(row[7] or row[5])[:40]}",)))
@@ -248,11 +290,19 @@ def threatfox(http: Http, ctx: SourceContext) -> SourceResult:
 
 
 def urlhaus(http: Http, ctx: SourceContext) -> SourceResult:
-    r = http.get("https://urlhaus.abuse.ch/downloads/csv_online/")
-    res = SourceResult("urlhaus", [r])
+    """URLs added in the last 30 days that are still online. The retired csv_online export also held
+    older URLs still online; those few are no longer seen."""
+    res = SourceResult("urlhaus", [])
+    key = _abusech_key(ctx, res)
+    if not key:
+        return res
+    r = _hide_key(http.get(UH_EXPORT.format(key=key)), key)
+    res.responses.append(r)
     if r.ok:
-        rows = csv.reader(l for l in r.body.decode("utf-8", "replace").splitlines() if not l.startswith("#"))
+        rows = csv.reader(l for l in _csv_text(r.body) if not l.startswith("#"))
         for row in rows:
+            if len(row) > 3 and row[3].strip() != "online":
+                continue
             if len(row) > 2:
                 m = re.match(r"https?://(\d+\.\d+\.\d+\.\d+)", row[2])
                 if m:
@@ -498,6 +548,13 @@ def shadowserver_country(http: Http, ctx: SourceContext) -> SourceResult:
                 r = http.get(SS_MAP, params={"json": 1, "date_range": "other_value", "day": day.isoformat(),
                                              "source": ds, "geo": "all", "data_set": data_set})
                 res.responses.append(r)
+                if r.status == 0:
+                    # Unreachable (since 2026-11-03 the dashboard times out from GitHub's runners): 42 requests
+                    # at ~100 s each of retries ran the job into its 120-minute limit and it was killed with
+                    # no report. One transport failure stops the source; the gate still reports it.
+                    res.parse_error = f"dashboard unreachable: {r.error}"
+                    res.extra["country_rows"] = []
+                    return res
                 if r.ok:
                     try:
                         got[data_set] = {k: v["count"] for k, v in (r.json().get("geo_data") or {}).items()}
