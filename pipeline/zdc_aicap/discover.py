@@ -125,6 +125,8 @@ def parse_vals_index(text: str, known_titles: set[str]) -> list[Candidate]:
             continue
         if title in known_titles:
             continue
+        if re.search(r"archived", cat.group(1), re.I):      # vals keeps retired versions listed; nothing to adopt
+            continue
         upd = re.search(r"^- Updated:\s*(\d{4}-\d{2}-\d{2})\s*$", body, re.M)
         out.append(Candidate(url=page.group(1), title=f"vals.ai: {title}", source="vals-index", published=upd.group(1) if upd else None))
     return out

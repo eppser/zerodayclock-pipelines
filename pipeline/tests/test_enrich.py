@@ -9,6 +9,7 @@ worse than no suite (CLAUDE.md, "Tests are part of the contract").
 from __future__ import annotations
 
 import gzip
+import json
 from datetime import date
 from decimal import Decimal
 
@@ -197,3 +198,49 @@ def test_eval_warns_once_skipped_rows_pass_the_limit():
     assert evals.check_epss_rows_not_skipped(noisy, limit=100).passed is False
     quiet = EpssCollectResult(skipped_rows=3)
     assert evals.check_epss_rows_not_skipped(quiet, limit=100).passed is True
+
+
+# ---------------------------------------------------------------- a crash is recorded, not swallowed
+def test_a_crash_before_the_first_try_block_is_recorded_on_the_run_row(monkeypatch, tmp_path):
+    """2026-11-07: two runs died inside the EPSS fetch (outside every try) and left run rows with
+    ok = null, no error and no report artifact. main() must record the crash and still fail."""
+    from zdc_enrich import db, epss, run as erun
+
+    class Conn:
+        def __init__(self):
+            self.rolled_back = self.committed = self.closed = False
+
+        def rollback(self):
+            self.rolled_back = True
+
+        def commit(self):
+            self.committed = True
+
+        def close(self):
+            self.closed = True
+
+    conn = Conn()
+    finished = {}
+    monkeypatch.setattr(db, "connect", lambda: conn)
+    monkeypatch.setattr(db, "start_run", lambda *a, **k: "run-1")
+    monkeypatch.setattr(db, "finish_run", lambda c, rid, **kw: finished.update(run_id=rid, **kw))
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def boom(*a, **k):
+        raise OSError("EPSS: read timed out")
+
+    monkeypatch.setattr(db, "last_epss_fetch_date", lambda c: None)
+    monkeypatch.setattr(epss, "make_client", lambda: Client())
+    monkeypatch.setattr(epss, "collect", boom)
+    rep = tmp_path / "r.json"
+    assert erun.main(["--report", str(rep)]) == 1
+    assert finished["run_id"] == "run-1" and finished["ok"] is False
+    assert finished["error"].startswith("crashed: OSError: EPSS: read timed out")
+    assert conn.rolled_back and conn.committed and conn.closed
+    assert json.loads(rep.read_text())["error"] == finished["error"]

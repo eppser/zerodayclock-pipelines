@@ -101,11 +101,15 @@ def set_abuse(conn, asn: int, role: str | None, personal: bool) -> None:
 
 # ---- reads for scoring --------------------------------------------------------------------
 def latest_fetches(conn, week_start: dt.date) -> dict[str, str]:
-    """The newest successful fetch per source for the week (a re-run supersedes)."""
+    """The newest successful fetch per source for the week (a re-run supersedes). Ties on
+    finished_at go to the newer RUN: two collections of one week can stamp the same instant (the
+    test fixture does, a clock-coarse runner could), and without the tie-break the scores would mix
+    one run's counts with the other's union, which is how CI failed one run in seven."""
     with conn.cursor() as cur:
-        cur.execute("""select distinct on (source_id) source_id, fetch_id from net_raw.fetches
-                        where week_start = %s and ok and source_id <> 'reference'
-                        order by source_id, finished_at desc""", (week_start,))
+        cur.execute("""select distinct on (f.source_id) f.source_id, f.fetch_id
+                         from net_raw.fetches f join raw.pipeline_runs r using (run_id)
+                        where f.week_start = %s and f.ok and f.source_id <> 'reference'
+                        order by f.source_id, f.finished_at desc, r.started_at desc""", (week_start,))
         return dict(cur.fetchall())
 
 
@@ -211,9 +215,9 @@ def latest_union_side(conn, week_start, side: str, feeds: tuple[str, ...] = ()) 
     with conn.cursor() as cur:
         run = None
         if feeds:
-            cur.execute("""select run_id from net_raw.fetches
-                            where week_start = %s and ok and source_id = any(%s)
-                            order by finished_at desc limit 1""", (week_start, list(feeds)))
+            cur.execute("""select f.run_id from net_raw.fetches f join raw.pipeline_runs r using (run_id)
+                            where f.week_start = %s and f.ok and f.source_id = any(%s)
+                            order by f.finished_at desc, r.started_at desc limit 1""", (week_start, list(feeds)))
             r = cur.fetchone()
             if r:
                 cur.execute("select 1 from net_raw.asn_union_side where run_id = %s and side = %s limit 1", (r[0], side))

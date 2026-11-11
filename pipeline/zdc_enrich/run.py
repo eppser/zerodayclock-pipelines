@@ -19,6 +19,7 @@ import argparse
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 from datetime import date, datetime, timezone
@@ -101,7 +102,36 @@ def main(argv: list[str] | None = None) -> int:
     conn = db.connect()
     run_id = db.start_run(conn, PIPELINE, "incremental", args.trigger, git_sha())
     conn.commit()
+    # A job cancel or timeout arrives as SIGTERM; raised, it lands in the handler below and the
+    # run row says so instead of staying open with ok = null.
+    signal.signal(signal.SIGTERM, _killed)
+    try:
+        return _run(args, conn, run_id, report)
+    except Exception as exc:  # noqa: BLE001 - RECORD the crash, then fail. On 2026-11-07 two runs
+        # died ~20 minutes in (the EPSS fetch, before any try block) and left their run rows open:
+        # no error, no report artifact, and the watchdog counted them as silence, not failure.
+        msg = f"crashed: {type(exc).__name__}: {str(exc)[:300]}"
+        log.exception("enrich: run crashed before it could record itself")
+        try:
+            conn.rollback()
+            db.finish_run(conn, run_id, ok=False, error=msg, notes={"crashed": True},
+                          sources_attempted=0, sources_ok=0, entries_seen=0, entries_inserted=0, entries_updated=0)
+            conn.commit()
+        except Exception:  # noqa: BLE001 - the database itself may be what failed
+            log.exception("enrich: could not record the crash either")
+        _write_report(args.report, report, {"error": msg})
+        return 1
+    finally:
+        conn.close()
 
+
+def _killed(signum, frame):  # noqa: ARG001
+    raise RuntimeError(f"killed by {signal.Signals(signum).name} (job timeout or cancel?)")
+
+
+def _run(args, conn, run_id: str, report: EvalReport) -> int:
+    """The run proper: EPSS, the detail rebuild, the cohort rebuilds, the database evals. Records
+    its own outcome on the run row; a crash is recorded by main()."""
     counters = dict(sources_attempted=0, sources_ok=0, entries_seen=0,
                     entries_inserted=0, entries_updated=0)
     result = EpssCollectResult()
@@ -227,7 +257,6 @@ def main(argv: list[str] | None = None) -> int:
         "epss_score_date": result.score_date,
         "epss_skipped": result.skipped_reason,
     })
-    conn.close()
     return 0 if run_ok else 1
 
 

@@ -149,7 +149,8 @@ def read_vals(http: Http) -> dict:
         if ix.status_code == 200:
             out["index_text"] = ix.text
             try:
-                out["index_version"], out["top10"] = source_vals.top10_from_index(ix.text)
+                out["index_version"], out["top10"] = source_vals.top10_from_index(
+                    ix.text, out["board"].version if out["board"] else None)
             except ValueError:
                 pass            # index_read and no top ten: the index gate reports it as an ERROR
     except Exception as e:  # noqa: BLE001

@@ -388,6 +388,16 @@ def test_a_failed_collection_is_retried(db, monkeypatch):
     monkeypatch.setenv("CROWDSEC_CTI_API_KEY", "c" * 40)
     assert nrun.main(["--week", WEEK.isoformat(), "--skip-if-collected"]) == 0
     assert q(db, "select count(*) from raw.pipeline_runs where pipeline = 'netthreat' and mode = 'full' and ok")[0][0] == 1
+    # Every count and both unions the scores use come from the retry, not from the failed first
+    # collection: the fake clock stamps both runs with the same instant, and the newest-fetch
+    # query must break that tie by run (it did not, and CI failed about one run in seven).
+    from zdc_netthreat import db as ndb
+    ok_run = q(db, "select run_id from raw.pipeline_runs where pipeline = 'netthreat' and ok")[0][0]
+    chosen = ndb.latest_fetches(db, WEEK)
+    runs = {r[0] for r in q(db, "select distinct run_id from net_raw.fetches where fetch_id = any(%s::uuid[])", list(chosen.values()))}
+    assert runs == {ok_run}
+    for side, feeds in (("attack", ("crowdsec", "dshield")), ("host", ("urlhaus", "phishing_db"))):
+        assert ndb.latest_union_side(db, WEEK, side, feeds)[1] == str(ok_run), side
 
 
 def test_a_late_collection_is_served_provisional(db, tmp_path, monkeypatch):

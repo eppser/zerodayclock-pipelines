@@ -327,6 +327,26 @@ def test_arxiv_parsing_keeps_recent_relevant_entries():
     assert [x.url for x in c] == ["https://arxiv.org/abs/2610.00001"]
 
 
+def test_the_index_section_is_chosen_by_version_then_live_over_archived():
+    """2026-11-09: vals listed the archived v1 top ten above the live v1.1 one; the first-section
+    parser compared the v1.1 board with v1's names and blocked the run."""
+    d = board_doc()
+    live = index_text(d)                                               # ## CyberBench v1.1 ... ## Other
+    archived = ("## CyberBench v1\n\n- Page: https://www.vals.ai/benchmarks/cyber-v1\n"
+                "- Category: Cyber (archived: no longer run on new models)\n- Updated: 2026-09-16\n\n"
+                "1. [Old King](https://www.vals.ai/models/old): 88.14%\n2. [Old Queen](https://www.vals.ai/models/q): 83.90%\n\n")
+    both = archived + live
+    assert source_vals.top10_from_index(both, "1.1")[0] == "1.1"
+    assert source_vals.top10_from_index(both, "1")[1][0] == ("Old King", 88.14)
+    assert source_vals.top10_from_index(both)[0] == "1.1"              # no board version: the live section
+    assert source_vals.top10_from_index(archived)[0] == "1"            # only an archived one: still an answer
+    assert source_vals.top10_from_index(both, "2.0")[0] == "1.1"       # unknown version: live, and the check names the mismatch
+    b = source_vals.parse(d)
+    iv, top = source_vals.top10_from_index(both, b.version)
+    assert checks.matches_index(b, iv, top, NAMES).passed
+    assert discover.parse_vals_index(both, {"CyberBench v1.1"}) == []  # the archived board is not a candidate
+
+
 def test_vals_index_reports_only_untracked_cyber_boards():
     txt = ("## CyberBench v1.1\n- Page: https://www.vals.ai/benchmarks/cyber\n- Category: Cyber\n\n"
            "## SOC Bench\n- Page: https://www.vals.ai/benchmarks/soc\n- Category: Security\n- Updated: 2026-10-01\n\n"

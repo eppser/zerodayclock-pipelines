@@ -88,12 +88,30 @@ def parse(doc: dict) -> Board:
     return board
 
 
-def top10_from_index(text: str) -> tuple[str | None, list[tuple[str, float]]]:
-    """(version, [(display name, percent)]) from the CyberBench section of llms-full.txt."""
-    m = re.search(r"^## CyberBench v?([\w.]+)\s*$(.*?)(?=^## |\Z)", text or "", re.M | re.S)
-    if not m:
+def top10_from_index(text: str, version: str | None = None) -> tuple[str | None, list[tuple[str, float]]]:
+    """(version, [(display name, percent)]) from the CyberBench section of llms-full.txt.
+
+    Since 2026-11 the index carries one section per version: `CyberBench v1` (archived, 26 models,
+    frozen) ABOVE `CyberBench v1.1` (live). Taking the first section compared the live board with
+    the archived top ten and blocked the 2026-11-09 run. The section is chosen by `version` (the
+    board's); without one, the live section wins over an archived one, then the highest version."""
+    sections = []
+    for m in re.finditer(r"^## CyberBench v?([\w.]+)\s*$(.*?)(?=^## |\Z)", text or "", re.M | re.S):
+        ver, body = m.group(1), m.group(2)
+        archived = bool(re.search(r"^- Category:.*archived", body, re.M | re.I))
+        sections.append((ver, archived, body))
+    if not sections:
         return None, []
-    rows = re.findall(r"^\d+\.\s+\[(.+?)\]\((.*?)\):\s*([\d.]+)%\s*$", m.group(2), re.M)
-    if len(rows) != len(re.findall(r"^\d+\.\s", m.group(2), re.M)):
+    if version is not None and any(v == version for v, _a, _b in sections):
+        ver, _archived, body = next(s for s in sections if s[0] == version)
+    else:
+        live = [s for s in sections if not s[1]] or sections
+        ver, _archived, body = max(live, key=lambda s: _version_key(s[0]))
+    rows = re.findall(r"^\d+\.\s+\[(.+?)\]\((.*?)\):\s*([\d.]+)%\s*$", body, re.M)
+    if len(rows) != len(re.findall(r"^\d+\.\s", body, re.M)):
         raise ValueError("the index's top-ten list changed format")
-    return m.group(1), [(n.strip(), float(p)) for n, _u, p in rows]
+    return ver, [(n.strip(), float(p)) for n, _u, p in rows]
+
+
+def _version_key(v: str) -> tuple:
+    return tuple(int(x) if x.isdigit() else x for x in re.split(r"[.]", v))
