@@ -104,11 +104,14 @@ def latest_fetches(conn, week_start: dt.date) -> dict[str, str]:
     """The newest successful fetch per source for the week (a re-run supersedes). Ties on
     finished_at go to the newer RUN: two collections of one week can stamp the same instant (the
     test fixture does, a clock-coarse runner could), and without the tie-break the scores would mix
-    one run's counts with the other's union, which is how CI failed one run in seven."""
+    one run's counts with the other's union, which is how CI failed one run in seven.
+    A retired source's stored fetches are history only (0203): they are not read here, so a
+    --score-only rebuild of an old week does not bring its networks back."""
     with conn.cursor() as cur:
         cur.execute("""select distinct on (f.source_id) f.source_id, f.fetch_id
                          from net_raw.fetches f join raw.pipeline_runs r using (run_id)
                         where f.week_start = %s and f.ok and f.source_id <> 'reference'
+                          and f.source_id not in (select source_id from net_core.source_manifest where retired_at is not null)
                         order by f.source_id, f.finished_at desc, r.started_at desc""", (week_start,))
         return dict(cur.fetchall())
 
@@ -157,9 +160,9 @@ def replace_week(conn, week_start: dt.date, method_version: str, source_rows, ne
             [(week_start, method_version, *r[:10], Jsonb(r[10])) for r in source_rows])
         cur.executemany(
             """insert into net_derived.network_scores (week_start, method_version, asn, score, groups, sensors,
-                   distinct_ips, distinct_24s, spamhaus_asndrop, spamhaus_drop_ranges, uceprotect_score, tor_exits,
+                   distinct_ips, distinct_24s, spamhaus_asndrop, spamhaus_drop_ranges, tor_exits,
                    cf_waf_x, cf_rep_x, cf_waf_bound, cf_rep_bound, cf_traffic_share, cf_bot_share, censored_at)
-               values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+               values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
             [(week_start, method_version, *r) for r in network_rows])
         cur.executemany(
             """insert into net_derived.model_fits values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
@@ -298,6 +301,7 @@ def week_fetch_status(conn, week_start: dt.date) -> tuple[dict[str, tuple[bool, 
     with conn.cursor() as cur:
         cur.execute("""select distinct on (source_id) source_id, fetch_id, ok, error, records, ipv4
                          from net_raw.fetches where week_start = %s and source_id <> 'reference'
+                          and source_id not in (select source_id from net_core.source_manifest where retired_at is not null)
                         order by source_id, ok desc, finished_at desc""", (week_start,))
         rows = cur.fetchall()
         status, volumes = {}, {}
@@ -429,6 +433,7 @@ def week_collection_lag(conn, week_start: dt.date) -> dict[str, float]:
         cur.execute("""select distinct on (source_id) source_id,
                               extract(epoch from requested_at - ((%s::date + 7)::timestamp at time zone 'UTC')) / 3600.0
                          from net_raw.fetches where week_start = %s and ok and source_id <> 'reference'
+                          and source_id not in (select source_id from net_core.source_manifest where retired_at is not null)
                         order by source_id, finished_at desc""", (week_start, week_start))
         return {sid: float(h) for sid, h in cur.fetchall()}
 

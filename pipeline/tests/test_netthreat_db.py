@@ -110,7 +110,6 @@ ROUTES = {
     "api.shodan.io": json.dumps({"facets": {"asn": [{"value": f"as{BAD}", "count": 40}, {"value": f"as{BIG}", "count": 2}]}}).encode(),
     "asndrop.json": b'{"asn":64496,"rir":"ripencc","domain":"x.test","cc":"GB","asname":"BADHOST"}\n',
     "drop_v4.json": b'{"cidr":"192.0.2.0/24","sblid":"SBL1"}\n',
-    "uceprotect": gz("x/AS64496 is UCEPROTECT-Level3 listed because of a spamscore of 12.5. See\n"),
     "torbulkexitlist": b"203.0.113.9\n",
     "radar/http/summary/bot_class": json.dumps({"result": {"summary_0": {"human": "64.0", "bot": "36.0"}}}).encode(),
     "radar/attacks/layer7/summary": json.dumps({"result": {"summary_0": {"WAF": "60", "DDOS": "40"}}}).encode(),
@@ -286,6 +285,35 @@ def test_rescoring_replaces_the_week(db, tmp_path, monkeypatch):
     assert before == after > 0 and before2 == after2 > 0
     # a score-only run never refetches routing: the sizes stored at collect are reused
     assert q(db, "select count(distinct fetch_id) from net_raw.routed_sizes")[0][0] == 1
+
+
+def test_a_retired_source_s_stored_fetch_is_not_scored(db, tmp_path, monkeypatch):
+    """0203: a week collected while a since-retired listing was live keeps that fetch in net_raw, and a
+    rebuild must not bring a network back that only the retired listing named. The same row under a live
+    listing does admit it, which is what shows the retirement is doing the work."""
+    _tiny_week(monkeypatch)
+    assert nrun.main(["--week", WEEK.isoformat()]) == 0
+    in_scores = lambda: q(db, "select count(*) from net_derived.network_scores where week_start = %s and asn = %s", WEEK, OTHER)[0][0]  # noqa: E731
+    assert in_scores() == 0
+    # OTHER is routed but no source named it, so the collect stored no profile; a scored network needs one
+    db.execute("""insert into net_core.networks (asn, name, network_type, type_basis, routed_24s, announced_ipv4, prefixes, updated_week)
+                  values (%s, 'Other Net', 'Hosting & VPS', 'name', 2, 512, 1, %s)""", (OTHER, WEEK))
+    db.commit()
+    run_id = q(db, "select run_id from raw.pipeline_runs where pipeline = 'netthreat' order by started_at desc limit 1")[0][0]
+
+    def stored_listing(source_id, fetch_id):   # stamped after the fixture's fetches, so it is the newest for its source
+        db.execute("""insert into net_raw.fetches (fetch_id, run_id, source_id, week_start, url, requested_at, finished_at, http_status, ok, records, notes)
+                      values (%s, %s, %s, %s, 'https://list.example.test/zone', '2030-01-15', '2030-01-15', 200, true, 1, '{}')""",
+                   (fetch_id, run_id, source_id, WEEK))
+        db.execute("insert into net_raw.asn_counts (fetch_id, asn, ips, slash24s, listed, score) values (%s, %s, 0, 0, true, 12.5)", (fetch_id, OTHER))
+        db.commit()
+
+    stored_listing("uceprotect_l3", "00000000-0000-4000-8000-00000000f203")
+    assert nrun.main(["--week", WEEK.isoformat(), "--score-only"]) == 0
+    assert in_scores() == 0, "a network only the retired listing named is back in the scored week"
+    stored_listing("spamhaus_asndrop", "00000000-0000-4000-8000-00000000f204")
+    assert nrun.main(["--week", WEEK.isoformat(), "--score-only"]) == 0
+    assert in_scores() == 1, "control: the same row under a live listing admits the network"
 
 
 def test_no_write_fits_and_gates_but_stores_nothing(db, tmp_path, monkeypatch):

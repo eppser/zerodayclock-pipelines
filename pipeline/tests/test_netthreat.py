@@ -334,21 +334,6 @@ def test_shadowserver_country_stops_at_the_first_unreachable_request():
     assert r.extra["country_rows"] == []
 
 
-def test_uceprotect_scores():
-    zone = (b"$SOA 3600 x\n192.0.2.0/24 Your ISP Example/AS64496 is UCEPROTECT-Level3 listed because of a spamscore of 395.9. See: x\n")
-    buf = io.BytesIO()
-    with gzip.GzipFile(fileobj=buf, mode="wb") as g:
-        g.write(zone)
-    r = src.uceprotect_l3(FakeHttp({"uceprotect": buf.getvalue()}), CTX)
-    assert r.nets[0].asn == 64496 and r.nets[0].score == 395.9
-
-
-def test_uceprotect_already_decompressed_by_the_client():
-    zone = b"192.0.2.0/24 x/AS64497 is UCEPROTECT-Level3 listed because of a spamscore of 7. See\n"
-    r = src.uceprotect_l3(FakeHttp({"uceprotect": zone}), CTX)
-    assert r.nets[0].asn == 64497 and r.nets[0].score == 7.0
-
-
 def test_spamhaus_drop_charges_the_announcing_network():
     body = b'{"cidr":"192.0.2.0/24","sblid":"SBL1"}\n{"type":"metadata"}\n'
     ctx = src.SourceContext(CTX.week_start, CTX.week_end, {}, asn_of)

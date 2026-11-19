@@ -14,7 +14,7 @@ from zdc_crowdsec.evals import ERROR, INFO, WARN, EvalResult
 #: expired key that returns 200 with an empty list, or a feed that stopped.
 FLOORS = {"crowdsec": 10_000, "dshield": 5_000, "blocklist_de": 5_000, "cins": 5_000,
           "vulncheck": 2_000, "threatfox": 300, "urlhaus": 200, "phishing_db": 1_000,
-          "shodan": 100, "spamhaus_asndrop": 100, "spamhaus_drop": 100, "uceprotect_l3": 100,
+          "shodan": 100, "spamhaus_asndrop": 100, "spamhaus_drop": 100,
           "tor_exits": 300, "cloudflare": 1_000}
 #: Context sources: shown on the atlas, not scored. Below its floor one is a WARNING, not a block: the
 #: Shadowserver dashboard times out from GitHub's runners since 2026-11-03, and the atlas then shows the

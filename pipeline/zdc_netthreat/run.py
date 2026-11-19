@@ -395,7 +395,7 @@ def score(conn, week: dt.date, report: dict, http: Http | None = None, run_id: s
         net_rows.append((a, post[a], [g for g in groups if obs[a][g]], obs[a]["_sensors"],
                          uni.get(a, (0, 0))[0], uni.get(a, (0, 0))[1],
                          bool(lst("spamhaus_asndrop")), (lst("spamhaus_drop") or (0,))[0],
-                         (lst("uceprotect_l3") or (0, 0, {}, False, None))[4], (lst("tor_exits") or (0,))[0],
+                         (lst("tor_exits") or (0,))[0],
                          (c.get("waf12w") or (None,))[0], (c.get("rep12w") or (None,))[0],
                          (c.get("waf12w") or (None, None))[1], (c.get("rep12w") or (None, None))[1],
                          c.get("traffic") if c.get("traffic") is not None else c.get("traffic_est"), c.get("bot"), censored))
@@ -579,6 +579,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     secrets = {k: os.environ.get(k, "") for k in SECRET_ENVS}
     wanted = [s.strip() for s in args.sources.split(",") if s.strip()]
+    unknown = sorted(set(wanted) - set(sources.ALL))
+    if unknown:
+        # an id with no adapter (a typo, or a retired source still registered for its stored rows) would
+        # otherwise be recorded as a failed fetch in insert-only net_raw
+        log.error("--sources names no adapter for: %s", ", ".join(unknown))
+        return 2
     report: dict = {"pipeline": PIPELINE, "week": week.isoformat(), "method": METHOD,
                     "started_at": dt.datetime.now(dt.timezone.utc).isoformat()}
     conn = psycopg.connect(os.environ["DATABASE_URL"], connect_timeout=60)

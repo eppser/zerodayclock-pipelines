@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
-import gzip
 import io
 import json
 import logging
@@ -23,7 +22,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
-from .client import Http, Response, gunzip_capped
+from .client import Http, Response
 
 log = logging.getLogger("zdc_netthreat")
 
@@ -442,32 +441,6 @@ def spamhaus_drop(http: Http, ctx: SourceContext) -> SourceResult:
     return res
 
 
-def _gunzip_capped(data: bytes, cap: int = 512 * 1024 ** 2) -> bytes:
-    """gzip.decompress with an output ceiling: the list is fetched over plain http (the mirror offers no https), so
-    anyone on the path could hand the runner a decompression bomb (security review 2026-10-26)."""
-    out = gunzip_capped(data, cap)
-    if out is None:
-        raise ValueError(f"uceprotect list inflates past {cap:,} bytes")
-    return out
-
-
-def uceprotect_l3(http: Http, ctx: SourceContext) -> SourceResult:
-    r = http.get("http://wget-mirrors.uceprotect.net/rbldnsd-all/dnsbl-3.uceprotect.net.gz")
-    res = SourceResult("uceprotect_l3", [r])
-    if r.ok:
-        scores: dict[int, float] = {}
-        # The server sends Content-Encoding: gzip on some mirrors, so the client may have
-        # decompressed it already (measured 2026-10-12). Accept either.
-        raw = _gunzip_capped(r.body) if r.body[:2] == b"\x1f\x8b" else r.body
-        for line in raw.decode("utf-8", "replace").splitlines():
-            if True:
-                m = re.search(r"/AS(\d+) is UCEPROTECT-Level3 listed because of a spamscore of (\d+(?:\.\d+)?)", line)
-                if m:
-                    scores[int(m.group(1))] = float(m.group(2))
-        res.nets = [NetRow(a, listed=True, score=s) for a, s in scores.items()]
-    return res
-
-
 def tor_exits(http: Http, ctx: SourceContext) -> SourceResult:
     r = http.get("https://check.torproject.org/torbulkexitlist")
     return SourceResult("tor_exits", [r], hits=[Hit(ip) for ip in _lines_ips(r.body)] if r.ok else [])
@@ -579,7 +552,7 @@ def shadowserver_country(http: Http, ctx: SourceContext) -> SourceResult:
 ALL = {"crowdsec": crowdsec, "dshield": dshield, "blocklist_de": blocklist_de, "cins": cins,
        "vulncheck": vulncheck, "threatfox": threatfox, "urlhaus": urlhaus, "phishing_db": phishing_db,
        "shodan": shodan, "spamhaus_asndrop": spamhaus_asndrop, "spamhaus_drop": spamhaus_drop,
-       "uceprotect_l3": uceprotect_l3, "tor_exits": tor_exits, "cloudflare": cloudflare,
+       "tor_exits": tor_exits, "cloudflare": cloudflare,
        "shadowserver_country": shadowserver_country}
 #: Sources whose IP hits are scored, and the feed id their counts carry in net_derived.
 IP_SCORED = ("crowdsec", "dshield", "blocklist_de", "cins", "vulncheck", "threatfox", "urlhaus", "phishing_db")
