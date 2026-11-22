@@ -1,0 +1,91 @@
+name: Prioritisation scorecard (one month)
+
+# Scores ONE month of the patch prioritisation scorecard on request. The scheduled path is the
+# enrichment workflow's `--if-due` step, which scores each month once it is complete; this exists
+# for the two runs that step never makes, so that they happen here, from committed code, with
+# the commit recorded on the row, and not from someone's laptop:
+#
+#   * a month before our own collection (2026-08): `month` alone;
+#   * the running month to date: `month` and `through` (a day at least seven days back; the row
+#     is stored as provisional and the scheduled step replaces it with the full month).
+#
+# Dispatch only. It reads the observations and KEV tables and writes derived.patch_prioritisation.
+# The report carries counts only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      month:
+        description: 'Month to score, YYYY-MM'
+        type: string
+        required: true
+      through:
+        description: 'Month to date: last outcome day, YYYY-MM-DD (blank = the whole month)'
+        type: string
+        default: ''
+      dry_run:
+        description: 'Compute and report, write nothing'
+        type: boolean
+        default: true
+
+concurrency:
+  group: prio-month
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  score:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: staging
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Mask database connection details
+        working-directory: .
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.parse
+          u = urllib.parse.urlsplit(os.environ.get("DATABASE_URL", ""))
+          for v in {u.hostname, u.username, u.password}:
+              if v:
+                  print(f"::add-mask::{v}")
+                  print(f"::add-mask::{urllib.parse.unquote(v)}")
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-run.txt
+      - name: Score the month
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MONTH: ${{ github.event.inputs.month }}
+          THROUGH: ${{ github.event.inputs.through }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          [[ "$MONTH" =~ ^[0-9]{4}-[0-9]{2}$ ]] || { echo "::error::month must be YYYY-MM"; exit 2; }
+          args=(--month "$MONTH" --report prio-month-report.json)
+          if [ -n "$THROUGH" ]; then
+            [[ "$THROUGH" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "::error::through must be YYYY-MM-DD"; exit 2; }
+            args+=(--through "$THROUGH")
+          fi
+          if [ "$DRY_RUN" != false ]; then args+=(--dry-run); fi
+          python -m zdc_prio.run "${args[@]}"
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: prio-month-report-${{ github.run_id }}
+          path: pipeline/prio-month-report.json
+          retention-days: 14
+          if-no-files-found: ignore

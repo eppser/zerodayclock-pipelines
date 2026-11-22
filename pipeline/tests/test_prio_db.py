@@ -203,3 +203,94 @@ def test_an_incomplete_month_waits_then_is_refused_on_record(db):
     assert prio_run.main(["--month", "2034-03", "--today", "2034-04-16"]) == 1   # refused, stored
     s = stored(cx)
     assert len(s) == 12 and "not complete" in s["pick"][-3]
+
+
+def extras(cx, month=M) -> tuple:
+    cur = cx.execute("select distinct outcome_through, kev_basis, kev_collected_from, sensors, method_version "
+                     "from public.patch_prioritisation where month = %s", (month,))
+    rows = cur.fetchall()
+    cx.commit()
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
+def _february_is_stored(cx) -> None:
+    cx.execute("insert into derived.patch_prioritisation (month, rule_key, rule_label, kind, sort_order, added, "
+               "backlog, hit_all, hit_new, new_ci_lo, new_ci_hi, hit_new_clean, cves, attacked_all, attacked_new, "
+               "lookback_days, lanes_urgent, lanes_regular, lanes_turned, method_version) "
+               "select date '2034-02-01', rule_key, rule_label, kind, sort_order, added, backlog, hit_all, hit_new, "
+               "new_ci_lo, new_ci_hi, hit_new_clean, cves, attacked_all, attacked_new, lookback_days, lanes_urgent, "
+               "lanes_regular, lanes_turned, method_version from derived.patch_prioritisation where month = '2026-09-01'")
+    cx.commit()
+
+
+def test_a_standard_month_is_stored_as_one(db):
+    cx, _ = db
+    assert prio_run.main(["--month", "2034-03", "--today", "2034-04-06"]) == 0
+    assert extras(cx) == (None, "listed_and_collected", None, "shadowserver_api,crowdsec", "prio-1.1")
+
+
+def test_a_month_to_date_is_provisional_and_the_full_month_replaces_it(db):
+    cx, files = db
+    files[date(2034, 3, 19)] = dict(files[M], **{"CVE-2034-900001": 0.0001})   # the lists of the day after
+    # not settled yet, or not inside the month: refused before anything is read
+    assert prio_run.main(["--month", "2034-03", "--through", "2034-03-18", "--today", "2034-03-24"]) == 2   # six days: not settled
+    assert prio_run.main(["--month", "2034-03", "--through", "2034-04-02", "--today", "2034-04-20"]) == 2
+    assert prio_run.main(["--month", "2034-03", "--through", "2034-03-31", "--today", "2034-04-20"]) == 2
+    assert prio_run.main(["--month", "2034-03", "--through", "2034-03-06", "--today", "2034-03-20"]) == 2   # under a week
+    assert prio_run.main(["--month", "2034-03", "--through", "2034-03-18", "--today", "2034-04-06"]) == 2   # the month is over
+    assert stored(cx) == {}
+    assert prio_run.main(["--month", "2034-03", "--through", "2034-03-18", "--today", "2034-03-25"]) == 0   # seven: settled
+    s = stored(cx)
+    assert extras(cx)[0] == date(2034, 3, 18)
+    assert s["pick"][5:7] == (400, 100)                     # everything attacked on the 15th is inside
+    assert s["all"][0] == 1                                  # one CVE new in the file of the 19th, not April's 1,000
+    assert s["pick"][-3] is None                             # complete to its own last day: not refused
+    # The full month is still owed: --if-due does not see the to-date row as March.
+    _february_is_stored(cx)
+    assert prio_run.main(["--if-due", "--today", "2034-04-06"]) == 0
+    assert extras(cx)[0] is None
+    assert stored(cx)["all"][0] == 1000                      # April's file now, the month's own additions
+    # and a month scored in full is never put back to a part of itself
+    assert prio_run.main(["--month", "2034-03", "--through", "2034-03-18", "--today", "2034-03-25"]) == 2
+    assert extras(cx)[0] is None
+
+
+def test_a_month_to_date_stops_before_an_attack_after_its_last_day(db):
+    cx, files = db
+    files[date(2034, 3, 11)] = dict(files[M])
+    # the attacks are all on the 15th: to the 10th there is no outcome, and none is invented or stored
+    assert prio_run.main(["--month", "2034-03", "--through", "2034-03-10", "--today", "2034-03-20"]) == 1
+    assert stored(cx) == {}
+    # nor does a month to date wait for a file that should already exist
+    assert prio_run.main(["--month", "2034-03", "--through", "2034-03-12", "--today", "2034-03-20"]) == 1
+    assert stored(cx) == {}
+
+
+def test_a_month_from_before_our_collection_says_so(db):
+    cx, files = db
+    # Our first KEV collection moves to 10 March, and CrowdSec's first day to 4 March. One VulnCheck entry
+    # (NEW[62]) is first seen ten days after that: it was not in the catalogue we first collected.
+    cx.execute("update core.kev_entries set first_seen_at = case when cve_id = %s then timestamptz '2034-03-20' "
+               "else timestamptz '2034-03-10' end where cve_id like 'CVE-2034-%%'", (NEW[62],))
+    cx.execute("delete from obs_core.exploitation_observations where source_id = 'crowdsec' "
+               "and cve_id = %s and observed_at < '2034-03-04'", (HEARTBEAT,))
+    only_crowdsec = "CVE-2034-200000"                        # in the EPSS file, reported by CrowdSec alone
+    cx.execute(OBS, {"src": "crowdsec", "cves": [only_crowdsec], "days": [date(2034, 3, 20)]})
+    cx.commit()
+    assert prio_run.main(["--month", "2034-03", "--today", "2034-04-06"]) == 0
+    through, basis, collected_from, sensors, _ = extras(cx)
+    assert (through, basis, collected_from, sensors) == (None, "first_collection", date(2034, 3, 10), "shadowserver_api")
+    s = stored(cx)
+    assert s["kev"][1] == 3                                  # the three in the first collection, by listing date
+    assert s["kev"][0] == 1                                  # the late one is an addition of the month, not day-1 knowledge
+    assert s["pick"][5:7] == (400, 100)                      # the CrowdSec-only CVE is not an outcome
+    assert s["pick"][-2] is None and s["pick"][-1] is None   # and CrowdSec is not reported as late or missing
+    # With CrowdSec a day earlier than the month it counts again, and so does its CVE.
+    cx.execute(OBS, {"src": "crowdsec", "cves": [HEARTBEAT] * 3, "days": days(date(2034, 2, 26), date(2034, 2, 28))})
+    cx.commit()
+    assert prio_run.main(["--month", "2034-03", "--today", "2034-04-06"]) == 0
+    s = stored(cx)
+    assert s["pick"][5] == 401 and extras(cx)[3] == "shadowserver_api,crowdsec"
+    assert "2034-03-01 CrowdSec" in s["pick"][-1]            # and its three missing days are named again
+

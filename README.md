@@ -15,6 +15,7 @@ repository, so pull requests here cannot be merged. Please open an issue instead
 | `kev-pipeline.yml` | `zdc_kev` | Known-exploited catalogues: CISA KEV, VulnCheck KEV, CIRCL, EUVD |
 | `obs-pipeline.yml` | `zdc_obs` | Exploitation observations, including Shadowserver's public honeypot dashboard |
 | `enrich-pipeline.yml` | `zdc_enrich` | Derived tables, FIRST EPSS scores, and the eval gate over them |
+| `prio-month.yml` | `zdc_prio` | Dispatch only: scores one month of the patch prioritisation scorecard (a month before our collection, or the running month to date) |
 | `patch-pipeline.yml` | `zdc_patch` | Vendor patch-release dates from first-party advisories |
 | `watchdog.yml` | `tools/watchdog.py` | Alerts when any pipeline stops completing on schedule |
 | `site-probe.yml` | `tools/site_probe.py` | Probes the live site daily: HTTPS, headers, admin paths, CSRF refusals, old deployments, anon grants |

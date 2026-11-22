@@ -150,3 +150,79 @@ def test_crowdsec_is_named_only_when_it_shortens_the_lookback():
     days = {lb + timedelta(days=i) for i in range((end - lb).days + 1)}
     c = coverage({'shadowserver_api': days, 'crowdsec': days}, date(2026, 8, 23), lb, m, end)
     assert c['crowdsec_from'] is None and c['gaps'] == []
+
+
+def test_kev_before_our_collection_is_frozen_at_the_first_collection():
+    """A day nothing can have been collected before uses the entries dated before it that were in the
+    catalogue when we first collected it. An entry we first saw later was not in the catalogue then:
+    whatever date it carries, it is provably backdated (V2) and must not count."""
+    from zdc_prio.run import kev_basis, kev_collection_start
+    rows = [
+        ('cisa', 'C1', date(2026, 7, 1), date(2026, 8, 27), False),
+        ('vulncheck', 'V1', date(2026, 7, 1), date(2026, 8, 29), False),    # in VulnCheck's first collection
+        ('vulncheck', 'V2', date(2026, 7, 1), date(2026, 9, 3), False),     # first seen later: backdated
+        ('vulncheck', 'V3', date(2026, 8, 5), date(2026, 8, 29), False),    # listed after the day
+        ('euvd', 'E1', None, date(2026, 8, 27), False),                     # no listing date: never
+    ]
+    assert kev_collection_start(rows) == {'cisa': date(2026, 8, 27), 'vulncheck': date(2026, 8, 29), 'euvd': date(2026, 8, 27)}
+    assert kev_basis(rows, date(2026, 8, 1)) == 'first_collection'
+    assert kev_basis(rows, date(2026, 8, 27)) == 'first_collection'         # nothing collected BEFORE it
+    assert kev_basis(rows, date(2026, 8, 28)) == 'listed_and_collected'
+    assert kev_basis(rows, date(2026, 9, 1)) == 'listed_and_collected'
+    assert kev_basis([], date(2026, 9, 1)) == 'listed_and_collected'        # no catalogue: nothing to relax
+    aug = kev_sets(rows, date(2026, 8, 1), 'first_collection')['all']
+    assert aug == {'C1', 'V1'}                                              # each catalogue's own first day
+    assert kev_sets(rows, date(2026, 8, 1))['all'] == set()                 # the strict basis finds nothing
+    sep = kev_sets(rows, date(2026, 9, 1))['all']
+    assert sep == {'C1', 'V1', 'V3'}                                        # and still refuses V2 in September
+    assert aug <= sep                                                       # so "added in August" is a true difference
+
+
+def test_a_month_long_before_our_collection_is_refused():
+    from zdc_prio.compute import RuleScore, Scorecard
+    from zdc_prio.run import check
+    def r(key, h):
+        return RuleScore(key, key, 'single', 10, 100, h, h, (0, 1), h)
+    card = Scorecard(cves=300_000, attacked_all=1_000, attacked_new=100, rules=[r('pick', 60), r('cvss9', 50)])
+    assert check(card, {'gaps_in_month': 0, 'last': {'shadowserver_api': date(2026, 8, 31)},
+                        'kev_collected_from': date(2026, 8, 27)}, date(2026, 8, 1)) == []          # 26 days: allowed
+    probs = check(card, {'gaps_in_month': 0, 'last': {'shadowserver_api': date(2026, 7, 31)},
+                         'kev_collected_from': date(2026, 8, 27)}, date(2026, 7, 1))               # 57 days
+    assert any('cannot be reconstructed' in p for p in probs)
+
+
+def test_crowdsec_counts_only_for_a_month_it_has_a_day_before():
+    from zdc_prio.run import crowdsec_counts_for
+    first = date(2026, 8, 23)                       # its first day is a backfilled aggregate: counted from the 24th
+    assert not crowdsec_counts_for(date(2026, 8, 1), first)
+    assert crowdsec_counts_for(date(2026, 9, 1), first)
+    assert not crowdsec_counts_for(date(2026, 8, 24), first)                # counted from that very day: no day before
+    assert crowdsec_counts_for(date(2026, 8, 25), first)
+    assert not crowdsec_counts_for(date(2026, 9, 1), None)
+
+
+def test_a_month_without_crowdsec_does_not_report_it_missing():
+    from datetime import timedelta
+    lb, m, end = date(2026, 6, 12), date(2026, 8, 1), date(2026, 8, 31)
+    days = {lb + timedelta(days=i) for i in range((end - lb).days + 1)}
+    cs = {d for d in days if d >= date(2026, 8, 23)}
+    c = coverage({'shadowserver_api': days, 'crowdsec': cs}, date(2026, 8, 23), lb, m, end)
+    assert c['sensors'] == 'shadowserver_api'
+    assert c['crowdsec_from'] is None and c['gaps'] == [] and 'crowdsec' not in c['last']
+    sep = coverage({'shadowserver_api': days, 'crowdsec': cs}, date(2026, 8, 23), lb, date(2026, 8, 25), end)
+    assert sep['sensors'] == 'shadowserver_api,crowdsec'
+
+
+def test_a_month_to_date_is_complete_when_its_last_day_has_arrived():
+    from zdc_prio.compute import RuleScore, Scorecard
+    from zdc_prio.run import check
+    def r(key, h):
+        return RuleScore(key, key, 'single', 10, 100, h, h, (0, 1), h)
+    card = Scorecard(cves=300_000, attacked_all=1_000, attacked_new=100, rules=[r('pick', 60), r('cvss9', 50)])
+    last = {'shadowserver_api': date(2026, 11, 18), 'crowdsec': date(2026, 11, 18)}
+    assert check(card, {'gaps_in_month': 0, 'last': last, 'through': date(2026, 11, 18)}, date(2026, 11, 1)) == []
+    # the same data read as the whole month is not complete, and a to-date run short of its day is not either
+    assert any('not complete' in p for p in check(card, {'gaps_in_month': 0, 'last': last}, date(2026, 11, 1)))
+    assert any('not complete' in p for p in
+               check(card, {'gaps_in_month': 0, 'last': last, 'through': date(2026, 11, 20)}, date(2026, 11, 1)))
+
