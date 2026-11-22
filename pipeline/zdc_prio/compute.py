@@ -24,7 +24,7 @@ SEED = 7
 # key, label, kind. Order is the chart's order AND the bootstrap's draw order: keep 'epss2'
 # last, so adding it did not move the audited ranges of the rules before it.
 RULES: list[tuple[str, str, str]] = [
-    ('all', 'Patch everything', 'reference'),
+    ('all', 'Every CVE', 'reference'),          # was 'Patch everything': the unit is a CVE, not a patch
     ('cvss7', 'CVSS 7 or higher', 'single'),
     ('cvss9', 'CVSS 9 or higher (critical)', 'single'),
     ('epss1', 'EPSS 1% or higher', 'single'),
