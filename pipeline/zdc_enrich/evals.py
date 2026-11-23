@@ -1523,24 +1523,76 @@ def check_explorer_list_fresh(conn) -> EvalResult:
         {"list_censored_at": str(listed), "detail_censored_at": str(detail), "rows": n})
 
 
+#: The sensor arm repeats the rebuild's own filter, censoring date included: the list's
+#: censored_at is the date it was built to.
+#:
+#: `seen` walks the live-observation index one vulnerability at a time. The table holds
+#: 830,000 rows for about 2,200 vulnerabilities, and `select distinct cve_id` reads every
+#: one of them: 31 seconds, measured 2026-11-23, against under a second this way.
+EXPLORER_LIST_DIFF_SQL = """
+    with recursive censor as (select max(censored_at) as d from derived.explorer_list),
+    seen as (
+        (select o.cve_id from obs_core.exploitation_observations o
+          where o.cve_id is not null and o.withdrawn_at is null
+          order by o.cve_id limit 1)
+        union all
+        select (select o.cve_id from obs_core.exploitation_observations o
+                 where o.cve_id > seen.cve_id and o.withdrawn_at is null
+                 order by o.cve_id limit 1)
+          from seen where seen.cve_id is not null
+    ),
+    sensed as (
+        select seen.cve_id
+          from seen, censor
+         where seen.cve_id is not null
+           and exists (select 1 from obs_core.exploitation_observations o
+                        where o.cve_id = seen.cve_id and o.withdrawn_at is null
+                          and o.observation_type = 'attempt_observed'
+                          and (o.observed_at is null or o.observed_at <= censor.d))
+    ),
+    expected as (
+        select d.cve_id
+          from derived.cve_detail d
+         where d.kev_status = 'in_kev' or d.observation_count_total > 0
+        union
+        select d.cve_id from derived.cve_detail d join sensed s on s.cve_id = d.cve_id
+    ),
+    listed as (select cve_id from derived.explorer_list)
+    select (select count(*) from listed),
+           (select count(*) from expected),
+           (select array_agg(cve_id order by cve_id) from
+               (select cve_id from listed except select cve_id from expected) x),
+           (select array_agg(cve_id order by cve_id) from
+               (select cve_id from expected except select cve_id from listed) y)
+"""
+
+
 def check_explorer_list_complete(conn) -> EvalResult:
     """Every row the predicate selects is in the list, and nothing else is.
 
     A partial rebuild is worse than no rebuild: the page looks healthy and is quietly missing
     vulnerabilities. Compared against the predicate rather than a fixed number, so the check
     stays valid as the corpus grows.
+
+    THE PREDICATE HERE IS THE REBUILD'S, ALL THREE ARMS. derived.rebuild_explorer_list also
+    admits a vulnerability a sensor has seen whose count is zero, and since 0090 only
+    Shadowserver's API feed and CrowdSec carry a count. A vulnerability the canary alone has
+    seen, not yet in a catalogue, is therefore in the list with observation_count_total = 0.
+    The check knew two arms and failed four runs on a correct list: CVE-2026-124004 on
+    16 November 2026 and CVE-2023-6019 on 21 November, each from the canary sighting until
+    the catalogue listed it the next morning. Compared as sets, so a failure names the rows.
     """
     with conn.cursor() as cur:
-        cur.execute("""select count(*) from derived.cve_detail
-                        where kev_status = 'in_kev' or observation_count_total > 0""")
-        expect = cur.fetchone()[0]
-        cur.execute("select count(*) from derived.explorer_list")
-        got = cur.fetchone()[0]
+        cur.execute(EXPLORER_LIST_DIFF_SQL)
+        got, expect, extra, missing = cur.fetchone()
+    extra, missing = list(extra or []), list(missing or [])
+    ok = not extra and not missing
     return EvalResult(
-        "explorer_list_complete", ERROR, got == expect,
-        f"{got:,} rows, matching the predicate exactly" if got == expect
-        else f"explorer_list holds {got:,} rows but the predicate selects {expect:,}",
-        {"in_list": got, "expected": expect})
+        "explorer_list_complete", ERROR, ok,
+        f"{got:,} rows, matching the predicate exactly" if ok
+        else f"explorer_list holds {got:,} rows but the predicate selects {expect:,}"
+             f" (not selected: {', '.join(extra[:5]) or 'none'}; missing: {', '.join(missing[:5]) or 'none'})",
+        {"in_list": got, "expected": expect, "not_selected": extra[:50], "missing": missing[:50]})
 
 
 def check_explorer_breach_count_from_links(conn) -> EvalResult:
@@ -1708,6 +1760,21 @@ def check_patch_dates_not_backdated(conn, max_share_pct: float = 2.0) -> EvalRes
          "max_share_pct": max_share_pct})
 
 
+#: ONE PASS OVER THE (source_id, observation_type) INDEX. The first spelling was
+#: ``source_id not in (select source_id ... where observation_type = 'attempt_observed')``,
+#: which Postgres runs as a rescan of every sensor row for every vendor row: 199 x 832,000
+#: comparisons, 43 seconds on an idle database (measured 2026-11-23) and past the ten-minute
+#: statement timeout when another pipeline was writing. It crashed three enrichment runs
+#: between 15 and 17 November 2026, after every table had been rebuilt.
+VENDOR_ONLY_SOURCES_SQL = """
+    select source_id
+      from obs_core.exploitation_observations
+     where observation_type in ('vendor_reports_exploitation', 'attempt_observed')
+     group by source_id
+    having count(*) filter (where observation_type = 'attempt_observed') = 0
+"""
+
+
 def check_sensors_are_not_vendor_reports(conn) -> EvalResult:
     """A vendor statement must never be published as a sensor sighting.
 
@@ -1722,11 +1789,7 @@ def check_sensors_are_not_vendor_reports(conn) -> EvalResult:
     observation source.
     """
     with conn.cursor() as cur:
-        cur.execute("""select distinct source_id from obs_core.exploitation_observations
-                        where observation_type = 'vendor_reports_exploitation'
-                          and source_id not in (
-                              select source_id from obs_core.exploitation_observations
-                               where observation_type = 'attempt_observed')""")
+        cur.execute(VENDOR_ONLY_SOURCES_SQL)
         vendor_only = {r[0] for r in cur.fetchall()}
         cur.execute("""select count(*) from derived.explorer_list
                         where sensor_sources && %s""", (list(vendor_only) or [""],))

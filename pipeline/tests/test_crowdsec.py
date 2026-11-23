@@ -167,6 +167,15 @@ class TestEvals:
         assert not evals.check_catalogue_fetched(0, None).passed
         assert not evals.check_catalogue_fetched(500, "HTTP 403").passed
 
+    def test_a_refused_key_is_named_as_the_key(self):
+        """21 November 2026: the tracker answered 403 Forbidden to a key it had accepted the day
+        before. With no key it answers 401, so a 403 is the key and re-running cannot fix it."""
+        r = evals.check_catalogue_fetched(None, 'HTTP 403: {"message":"Forbidden"}')
+        assert not r.passed and "CROWDSEC_TRACKER_API_KEY" in r.summary
+        assert "CROWDSEC_TRACKER_API_KEY" not in evals.check_catalogue_fetched(None, "HTTP 500: oops").summary
+        assert "CROWDSEC_TRACKER_API_KEY" not in evals.check_catalogue_fetched(
+            None, "HTTP 403: <html>Attention Required! | Cloudflare").summary
+
     def test_timelines_tolerates_a_transient_but_not_an_outage(self):
         """One failure in 500 must not discard 499 good rows; a tenth failing is a rate
         limit wearing a success badge."""

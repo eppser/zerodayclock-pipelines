@@ -62,14 +62,20 @@ class TestNoSilentEmpty:
 
 class TestSourceYield:
     def test_passes_at_the_floor(self):
-        results = [CollectResult(source_id="cisa", observations=[obs()] * 10)]
+        results = [CollectResult(source_id="cisa", observations=[obs()] * 10, complete_snapshot=True)]
         assert evals.check_source_yield(results, {"cisa": 10}).passed
 
     def test_FAILS_below_the_floor(self):
-        results = [CollectResult(source_id="cisa", observations=[obs()] * 9)]
+        results = [CollectResult(source_id="cisa", observations=[obs()] * 9, complete_snapshot=True)]
         result = evals.check_source_yield(results, {"cisa": 10})
         assert not result.passed and result.blocking
         assert result.detail["cisa"] == {"got": 9, "expected_min": 10}
+
+    def test_a_delta_is_not_held_to_the_catalogue_floor(self):
+        """19 November 2026: VulnCheck's incremental pull returned 1,116 touched records, under its
+        1,200-record paging cap, and was failed against the 4,500 floor of the full catalogue."""
+        results = [CollectResult(source_id="vulncheck", observations=[obs()] * 1116)]
+        assert evals.check_source_yield(results, {"vulncheck": 4500}).passed
 
     def test_unchanged_source_is_exempt(self):
         results = [CollectResult(source_id="cisa", unchanged=True)]

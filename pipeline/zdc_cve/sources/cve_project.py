@@ -60,7 +60,19 @@ class CveProject(CveSource):
     rate_per_minute = 30
 
     def headers(self) -> dict[str, str]:
-        return {"Accept": "application/vnd.github+json"}
+        """The release list is read from the GitHub API, and an anonymous caller shares 60
+        requests an hour with everything else behind the runner's address: the run of
+        15 November 2026 got "API rate limit exceeded" on its first request. The workflow's
+        own token lifts that to 1,000 an hour. It is sent to the API only; the bundle
+        downloads pass ``no_auth``, because they redirect to a signed storage URL.
+        """
+        import os
+
+        headers = {"Accept": "application/vnd.github+json"}
+        token = os.environ.get("GITHUB_TOKEN", "").strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
 
     def collect(self, client, state: CveSourceState, mode: str,
                 *, today: date | None = None) -> CveCollectResult:
@@ -162,7 +174,7 @@ class CveProject(CveSource):
             result.error = "no baseline bundle found in the latest releases"
             return result
 
-        fetch = client.get(url, request_mode="full", expect_json=False)
+        fetch = client.get(url, request_mode="full", expect_json=False, no_auth=True)
         result.fetches.append(fetch)
         if not fetch.ok:
             result.error = fetch.error
@@ -223,7 +235,7 @@ class CveProject(CveSource):
         seen: dict[str, CveRecord] = {}
         bad_total = 0
         for tag, name, url in pending:
-            fetch = client.get(url, request_mode="incremental", expect_json=False)
+            fetch = client.get(url, request_mode="incremental", expect_json=False, no_auth=True)
             result.fetches.append(fetch)
             if not fetch.ok:
                 result.error = f"{name}: {fetch.error}"

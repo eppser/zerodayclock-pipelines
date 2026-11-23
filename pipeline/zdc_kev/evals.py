@@ -162,11 +162,20 @@ def check_no_future_dates(observations, censored_at: date) -> EvalResult:
 
 
 def check_source_yield(collect_results, expected: dict[str, int | None]) -> EvalResult:
-    """Freshness floor. A source that suddenly halves is a broken source, not news."""
+    """Freshness floor. A source that suddenly halves is a broken source, not news.
+
+    THE FLOOR IS THE SIZE OF A WHOLE CATALOGUE, so it is held against a complete snapshot only.
+    VulnCheck's incremental pull returns the records touched since the last success, and a
+    window under its six-page cap (1,200 records) is a delta, not the catalogue: 1,116 records
+    against a floor of 4,500 failed sixteen scheduled runs between 15 and 19 November 2026
+    while every record was stored correctly. A delta that comes back empty is
+    ``no_silent_empty``'s to catch, and a catalogue that shrinks in the database is
+    ``coverage_not_dropped``'s.
+    """
     short = {}
     for r in collect_results:
         floor = expected.get(r.source_id)
-        if floor and not r.unchanged and len(r.observations) < floor:
+        if floor and r.complete_snapshot and not r.unchanged and len(r.observations) < floor:
             short[r.source_id] = {"got": len(r.observations), "expected_min": floor}
     return EvalResult(
         name="source_yield",

@@ -27,10 +27,16 @@ class EvalResult:
 def check_catalogue_fetched(total, error) -> EvalResult:
     """An empty corpus must say why. v1 recorded a WAF block as 220 successful rows."""
     ok = error is None and bool(total)
+    # The API answers 401 Unauthorized with no key and 403 Forbidden with a key it no longer
+    # accepts (measured 2026-11-23). A 403 is therefore the key, not the code: say so, because
+    # the fix is a new key in the console and no amount of re-running will produce one.
+    hint = (" — the API refused CROWDSEC_TRACKER_API_KEY (expired or revoked): issue a new key"
+            " in the CrowdSec console and update the repository secret"
+            if error and error.startswith("HTTP 403") and "Forbidden" in error else "")
     return EvalResult(
         "catalogue_fetched", ERROR, ok,
         f"tracker listed {total:,} CVEs" if ok
-        else f"could not read the CVE catalogue: {error or 'zero CVEs returned'}",
+        else f"could not read the CVE catalogue: {error or 'zero CVEs returned'}{hint}",
         {"total": total, "error": error})
 
 

@@ -117,6 +117,21 @@ class TestCveProjectCollect:
         # The anchor itself is already consumed, so only the two newer releases.
         assert len(result.covered) == 2
 
+    def test_token_goes_to_the_api_and_never_to_a_download(self, monkeypatch):
+        """15 November 2026: the anonymous release-list call hit GitHub's shared 60-an-hour limit.
+        The job's token authenticates the API call; a bundle download redirects to signed storage
+        and must not carry it."""
+        monkeypatch.setenv("GITHUB_TOKEN", "t0ken")
+        assert CveProject().headers()["Authorization"] == "Bearer t0ken"
+        monkeypatch.delenv("GITHUB_TOKEN")
+        assert "Authorization" not in CveProject().headers()
+        _, client = self.collect()
+        assert [c["no_auth"] for c in client.calls] == [False, True, True]
+        _, client = self.collect(mode="full", index=releases(
+            ("cve_2026-08-27_at_end_of_day", "2026-08-27_all_CVEs_at_midnight.zip.zip")),
+            assets=[load_bytes("cve_baseline_nested.zip")])
+        assert [c["no_auth"] for c in client.calls] == [False, True]
+
     def test_cursor_stops_the_walk(self):
         """Resumption is by release tag, so already-consumed releases are not refetched."""
         state = CveSourceState(cursor="cve_2026-08-26_2300Z")
