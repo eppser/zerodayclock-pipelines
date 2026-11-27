@@ -1,0 +1,133 @@
+name: Agentic C2 pipeline
+
+# Internet-exposed consoles of agentic offensive frameworks (ARTEX, CyberStrikeAI, PentAGI, ...),
+# daily, from two sources: offensive.agency (free API, CC BY 4.0) and Shodan host/count with the
+# rules in pipeline/zdc_aof/shodan_queries.toml. See supabase/migrations/0205_agentic_c2.sql and
+# docs/decisions/0011-agentic-c2.md.
+#
+# THIS REPOSITORY IS PUBLIC, so the log, the summary and anything uploaded are too. The run
+# prints per-framework totals and check results only: no address, no network, no network name.
+# No report artifact is uploaded. Shodan takes its key only as a URL parameter; the pipeline
+# never logs or stores a URL that carries it, and a check fails the run if one reaches the report.
+#
+# 03:10 UTC, NOT THE EVENING. offensive.agency collects around 17:40 UTC. Scheduled runs here start
+# up to 7 hours late (measured), and Shodan's rows are filed under the run's UTC date: an evening
+# slot could slip past midnight, skip one day and write the next twice. From 03:10 a late run still
+# lands on the same date and reads the previous evening's collection.
+#
+# DELIBERATELY NO LOCAL-HOUR GUARD, for the reason honeypot-pipeline.yml records. A second run on
+# the same day replaces that day's rows.
+
+on:
+  schedule:
+    - cron: '10 3 * * *'
+  workflow_dispatch:
+    inputs:
+      sources:
+        description: 'offensive_agency, shodan, or both (blank for both)'
+        type: string
+        default: ''
+      environment:
+        description: 'Target environment'
+        type: choice
+        options: [staging, production]
+        default: staging
+
+# One run at a time: two would race on the same day's rows and double the load on a free service.
+concurrency:
+  group: aof-pipeline-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Tests run in their own job with no environment, so neither the test tooling nor anything it
+  # installs can reach the Shodan key or the database.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-ci.txt
+      - name: Unit tests
+        run: python -m pytest -q tests/test_aof.py
+
+  ingest:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    defaults:
+      run:
+        working-directory: pipeline
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Mask database connection details
+        working-directory: .
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python3 - <<'PY'
+          import os, urllib.parse
+          u = urllib.parse.urlsplit(os.environ.get("DATABASE_URL", ""))
+          for v in {u.hostname, u.username, u.password}:
+              if v:
+                  print(f"::add-mask::{v}")
+                  print(f"::add-mask::{urllib.parse.unquote(v)}")
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install --only-binary ':all:' --require-hashes -r requirements-run.txt
+
+      - name: Run pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SHODAN_API_KEY: ${{ secrets.SHODAN_API_KEY }}
+          SOURCES: ${{ github.event.inputs.sources }}
+        run: |
+          python -m zdc_aof.run \
+            ${SOURCES:+--sources "$SOURCES"} \
+            --trigger "${{ github.event_name }}" \
+            --report "$RUNNER_TEMP/aof-report.json"
+
+      # Totals and checks only (see the header). The report stays on the runner.
+      - name: Summary
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/aof-report.json" ]; then
+            python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os
+          r = json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "aof-report.json")))
+          oa, sh = r.get("offensive_agency", {}), r.get("shodan", {})
+          print(f"### Agentic C2 pipeline — {'OK' if r.get('ok') else 'BLOCKED'}\n")
+          print(f"- run time: `{r.get('seconds')}s` · rules config: `{str(r.get('config_sha256'))[:12]}`")
+          print(f"- offensive.agency: data to `{oa.get('day')}`, stored `{oa.get('stored_day')}`, "
+                f"`{oa.get('addresses')}` addresses, `{oa.get('rules')}` detection rules")
+          print(f"- Shodan: day `{sh.get('day')}`, stored `{sh.get('stored_day')}`, plan `{sh.get('plan')}`\n")
+          active, services, prev = oa.get("active", {}), sh.get("services", {}), sh.get("previous", {})
+          print("| framework | offensive.agency addresses (7 d) | Shodan services (7 d) | Shodan, previous day |")
+          print("|---|---|---|---|")
+          for f in sorted(set(active) | set(services), key=lambda k: -(active.get(k, 0) or 0)):
+              print(f"| {f} | {active.get(f, '')} | {services.get(f, '')} | {prev.get(f, '')} |")
+          print("\n| check | severity | result |")
+          print("|---|---|---|")
+          for c in r.get("checks", []):
+              print(f"| {c['name']} | {c['severity']} | {'PASS' if c['passed'] else 'FAIL'} — {c['summary']} |")
+          PY
+          else
+            echo "No report produced — the run failed before evaluation." >> "$GITHUB_STEP_SUMMARY"
+          fi

@@ -22,6 +22,7 @@ repository, so pull requests here cannot be merged. Please open an issue instead
 | `honeypot-pipeline.yml` | `zdc_honeypot` | Shadowserver honeypot exploitation counts per CVE (licensed API) |
 | `crowdsec-pipeline.yml` | `zdc_crowdsec` | CrowdSec tracker exploitation counts per CVE (licensed API) |
 | `osm-pipeline.yml` | `zdc_osm` | OpenSourceMalware's latest verified malicious packages (token-gated) |
+| `aof-pipeline.yml` | `zdc_aof` | Internet-exposed consoles of agentic attack frameworks: offensive.agency (CC BY 4.0) and Shodan counts. Totals only in logs; no address is stored |
 | `netthreat-pipeline.yml` | `zdc_netthreat` | Weekly per-network threat scores from nine licensed and public sources |
 | `aicap-pipeline.yml` | `zdc_aicap` | Weekly AI cyber capability results from independent evaluators, and new-benchmark discovery |
 

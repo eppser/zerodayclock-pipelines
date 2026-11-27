@@ -1,0 +1,137 @@
+# Shodan search rules for internet-exposed consoles of agentic offensive frameworks.
+#
+# THIS FILE IS THE CONFIG: edit it to add, change or retire a rule. Nothing else needs to change.
+# Every run stores the rules it used (aof_core.detection_rules, source 'shodan_config') and this
+# file's hash (run notes), so a published number can be traced to the exact queries behind it.
+#
+# HOW A FRAMEWORK IS COUNTED. Shodan has no OR, so a framework is an ORDERED list of rules. Rule k
+# is sent as  `match -exclude_1 ... -exclude_(k-1)`: each rule only counts what the earlier ones
+# did not, and the parts are added up. `exclude` is the term later rules subtract; it defaults to
+# `match`. It differs when `match` carries a refinement that must not be part of the subtraction
+# (see cyberstrikeai: the title rule drops honeypots, later rules must still skip the whole title).
+# A rule with  exclude = false  cannot be negated (free text) and so MUST be the last one.
+#
+# `slug` is offensive.agency's slug for the same framework, so the two sources line up.
+# `anchor = true` marks the rule the run checks is not zero: if Shodan stops answering for the
+# best-known product label, the queries or the plan changed, not the internet.
+#
+# Each rule was measured on 2026-11-25 (docs/decisions/0011-agentic-c2.md lists what each one adds
+# and the candidates that were rejected: header, server and most page-structure hashes match tens
+# of thousands of unrelated sites).
+
+window_days = 7          # "active" = seen in the last 7 days, the same window offensive.agency uses
+min_interval_seconds = 1.1
+
+[[framework]]
+slug = "artex"
+name = "ARTEX"
+rules = [
+  { match = 'product:ARTEX', anchor = true },
+  { match = 'http.title:"自主渗透测试控制台"' },
+  { match = 'http.title:"Autonomous Penetration Testing Console"' },
+  { match = 'http.favicon.hash:-1898746557' },
+  { match = 'http.favicon.hash:-1356779733' },
+  { match = 'http.favicon.hash:-576220750' },
+  { match = 'http.html:"Authorized operations console"' },
+  { match = 'http.html:"LLM 驱动的自主渗透测试系统控制台"' },
+  { match = 'http.html:"AI 驱动的自主渗透测试平台"' },
+  { match = 'http.dom_hash:-2025233738' },
+  { match = 'http.dom_hash:-747520487' },
+  { match = 'http.dom_hash:241241215' },
+  { match = 'http.dom_hash:97115985' },
+  { match = 'http.title:"자율 침투 테스트 콘솔"' },
+  { match = 'http.title:"Autonomous Security Control Node"' },
+  { match = 'http.title:"自主安全检测控制台"' },
+  # consoles behind a password prompt: free text, so it cannot be negated and goes last
+  { match = '"realm=\"ARTEX\""', exclude = false },
+]
+
+[[framework]]
+slug = "cyberstrikeai"
+name = "CyberStrikeAI"
+rules = [
+  { match = 'product:CyberStrikeAI' },
+  # about half of the pages titled CyberStrikeAI are tagged as honeypots by Shodan
+  { match = 'http.title:"CyberStrikeAI" -tag:honeypot', exclude = 'http.title:"CyberStrikeAI"' },
+  { match = 'http.html:"brand-wordmark__core"' },
+  { match = 'http.html:"cyberstrike-theme"' },
+  { match = 'http.headers_hash:1988570408' },
+]
+
+[[framework]]
+slug = "pentagi"
+name = "PentAGI"
+rules = [
+  { match = 'product:PentAGI' },
+  { match = 'http.title:"PentAGI"' },
+  { match = 'ssl.cert.issuer.cn:"PentAGI CA"' },
+]
+
+[[framework]]
+slug = "autocve"
+name = "AutoCVE"
+rules = [ { match = 'http.title:"AutoCVE"' } ]
+
+[[framework]]
+slug = "cairn"
+name = "Cairn"
+rules = [
+  { match = 'product:Cairn' },
+  { match = 'http.html:"reasonBeaconPulse"' },
+]
+
+[[framework]]
+slug = "redamon"
+name = "RedAmon"
+rules = [
+  { match = 'product:RedAmon' },
+  { match = 'http.title:"RedAmon"' },
+]
+
+[[framework]]
+slug = "strix"
+name = "Strix"
+rules = [ { match = 'product:Strix' } ]
+
+[[framework]]
+slug = "hexstrike"
+name = "HexStrike AI"
+rules = [ { match = 'product:"HexStrike AI"' } ]
+
+[[framework]]
+slug = "vulnerator-ai"
+name = "Vulnerator AI"
+rules = [ { match = 'http.title:"Vulnerator Console"' } ]
+
+[[framework]]
+slug = "xalgorix"
+name = "Xalgorix"
+rules = [ { match = 'http.title:"Xalgorix"' } ]
+
+[[framework]]
+slug = "decepticon"
+name = "Decepticon"
+rules = [ { match = 'http.title:"Decepticon"' } ]
+
+[[framework]]
+slug = "cyberstrike"
+name = "CyberStrike"
+rules = [ { match = 'http.html:"Autonomous offensive security agent"' } ]
+
+[[framework]]
+slug = "aida"
+name = "AIDA"
+rules = [ { match = 'http.title:"AIDA - AI-Driven Security Assessment"' } ]
+
+[[framework]]
+slug = "z3r0"
+name = "Z3r0"
+rules = [ { match = 'http.title:"Z3r0 Console"' } ]
+
+[[framework]]
+slug = "bugtraceai"
+name = "BugTraceAI"
+rules = [
+  { match = 'http.title:"BugTraceAI"' },
+  { match = 'http.html:"BugTraceAI API"' },
+]
